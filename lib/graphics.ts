@@ -6,26 +6,35 @@ import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import {
   ASSETS,
   FFMPEG,
   FONT_FAMILIES,
+  FONTS,
+  drawText,
   hasProgram,
   inOut,
   loadBrand,
+  measureText,
   numberFlag,
   optionalNumberFlag,
   requireFile,
   round,
   run,
   runCli,
+  saveCanvas,
+  setFont,
+  skia,
   stringFlag,
   videoEncoder,
+  withTempDir,
+  writeVideo,
   type Args,
   type Brand,
   type Command,
+  type TextStyle,
 } from "./shared.ts";
 import * as listen from "./listen.ts";
 
@@ -123,15 +132,12 @@ async function openChrome(profile: string): Promise<Connection> {
 }
 
 // Script added to every page before it loads. It replaces the page's clock with one joEdit controls,
-// and adds the fonts from `install fonts`.
+// and adds the fonts that come with joEdit.
 function clockScript(info: object): string {
-  const fontsFolder = join(ASSETS, "fonts");
-  const fontFaces = existsSync(fontsFolder)
-    ? Object.entries(FONT_FAMILIES)
-        .filter(([file]) => existsSync(join(fontsFolder, file)))
-        .map(([file, family]) => `@font-face{font-family:'${family}';src:url('${pathToFileURL(join(fontsFolder, file))}')}`)
-        .join("")
-    : "";
+  const fontFaces = Object.entries(FONT_FAMILIES)
+    .filter(([file]) => existsSync(join(FONTS, file)))
+    .map(([file, family]) => `@font-face{font-family:'${family}';src:url('${pathToFileURL(join(FONTS, file))}')}`)
+    .join("");
   return `(() => {
     let now = 0, queue = [], nextId = 1;
     const start = 1700000000000;
@@ -292,24 +298,49 @@ export async function still(file: string, output: string, time: number, options:
   });
 }
 
-// Write HTML to a temporary file, use it, then delete it.
-async function withHtmlFile<T>(html: string, work: (file: string) => Promise<T>): Promise<T> {
-  const folder = mkdtempSync(join(tmpdir(), "joedit-page-"));
-  try {
-    const file = join(folder, "page.html");
-    writeFileSync(file, html);
-    return await work(file);
-  } finally {
-    rmSync(folder, { recursive: true, force: true });
+// ---------- Skia frames: titles, captions and the agent's own canvas code (no browser) ----------
+
+const clamp01 = (x: number) => Math.min(1, Math.max(0, x));
+// Fast start and a gentle stop (like CSS cubic-bezier(.2,.8,.2,1)).
+const easeOut = (x: number) => 1 - Math.pow(1 - clamp01(x), 4);
+
+type Drawing = (ctx: any, time: number) => void | Promise<void>;
+
+// Draw every frame of a video with Skia, or one picture (at stillTime) when the output is .png/.jpg/.webp.
+export async function drawFrames(
+  output: string,
+  o: { width: number; height: number; fps: number; duration: number; transparent?: boolean; audio?: string },
+  draw: Drawing,
+  stillTime = 0,
+): Promise<{ frames: number }> {
+  const { createCanvas } = await skia();
+  const width = Math.round(o.width / 2) * 2; // video needs an even size
+  const height = Math.round(o.height / 2) * 2;
+  const canvas = createCanvas(width, height);
+  const ctx = canvas.getContext("2d");
+  const paint = async (time: number) => {
+    ctx.save();
+    ctx.clearRect(0, 0, width, height);
+    await draw(ctx, time);
+    ctx.restore();
+  };
+  if (/\.(png|jpe?g|webp)$/i.test(output)) {
+    await paint(stillTime);
+    await saveCanvas(canvas, output);
+    return { frames: 1 };
   }
+  const writer = writeVideo(output, { width, height, fps: o.fps, audio: o.audio, transparent: o.transparent });
+  const frames = Math.max(1, Math.round(o.duration * o.fps));
+  for (let n = 0; n < frames; n++) {
+    await paint(n / o.fps);
+    const data = ctx.getImageData(0, 0, width, height).data;
+    await writer.write(Buffer.from(data.buffer, data.byteOffset, data.length));
+  }
+  await writer.finish();
+  return { frames };
 }
 
 // ---------- Built-in templates ----------
-
-// Make text safe to put inside HTML.
-export function escapeHtml(text: string): string {
-  return text.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c] ?? c);
-}
 
 export type TemplateOptions = {
   text: string;
@@ -322,67 +353,129 @@ export type TemplateOptions = {
   brand?: Brand;
 };
 
-// Big animated title: the words rise into place, a colored bar grows, the subtitle fades in, then all fade out.
-export function titleHtml(o: Required<Omit<TemplateOptions, "subtitle">> & { subtitle?: string }): string {
-  const { colors, fonts } = o.brand;
-  const unit = Math.min(o.width, o.height * 1.78) / 100; // 1% of the width of a 16:9 frame
-  const words = escapeHtml(o.text)
-    .split(" ")
-    .map((word, n) => `<span style="animation-delay:${round(n * 0.12)}s">${word}</span>`)
-    .join(" ");
-  return `<!doctype html><html><head><style>
-  html,body{margin:0;width:100%;height:100%;overflow:hidden;background:${o.transparent ? "transparent" : colors.background}}
-  .wrap{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;
-    animation:out .6s ease-in ${Math.max(0, o.duration - 0.6)}s forwards}
-  h1{font-family:'${fonts.heading}',Helvetica,Arial,sans-serif;font-weight:800;font-size:${unit * 7.5}px;line-height:1.05;color:${colors.text};margin:0 ${unit * 6}px;letter-spacing:.01em}
-  h1 span{display:inline-block;animation:rise .9s cubic-bezier(.2,.8,.2,1) both}
-  .bar{height:${unit * 0.5}px;width:0;background:${colors.primary};margin:${unit * 2}px 0;border-radius:${unit}px;animation:grow .7s .35s cubic-bezier(.2,.8,.2,1) forwards}
-  p{font-family:'${fonts.body}',Helvetica,Arial,sans-serif;font-size:${unit * 2.6}px;color:${colors.text};opacity:0;margin:0;animation:fade .8s .6s forwards}
-  @keyframes rise{from{opacity:0;transform:translateY(${unit * 3}px);filter:blur(${unit * 0.6}px)}to{opacity:1;transform:none;filter:none}}
-  @keyframes grow{to{width:${unit * 12}px}}
-  @keyframes fade{from{opacity:0;transform:translateY(${unit}px)}to{opacity:.85;transform:none}}
-  @keyframes out{to{opacity:0;transform:scale(1.03)}}
-  </style></head><body><div class="wrap"><h1>${words}</h1><div class="bar"></div>${o.subtitle ? `<p>${escapeHtml(o.subtitle)}</p>` : ""}</div></body></html>`;
+type Template = ReturnType<typeof templateDefaults>;
+
+// 1% of the width of a 16:9 frame: sizes scale with the frame.
+const unitOf = (o: Template) => Math.min(o.width, o.height * 1.78) / 100;
+
+function background(ctx: any, o: Template): void {
+  if (o.transparent) return;
+  ctx.fillStyle = o.brand.colors.background;
+  ctx.fillRect(0, 0, o.width, o.height);
 }
 
-// Lower third: a name and a role that slide in at the bottom left (transparent, for putting over video).
-export function lowerThirdHtml(o: Required<Omit<TemplateOptions, "subtitle">> & { subtitle?: string }): string {
+// Big animated title: the words rise into place (each a little later), a colored bar grows,
+// the subtitle fades in, then everything fades out.
+function drawTitle(ctx: any, t: number, o: Template): void {
   const { colors, fonts } = o.brand;
-  const unit = Math.min(o.width, o.height * 1.78) / 100;
-  return `<!doctype html><html><head><style>
-  html,body{margin:0;width:100%;height:100%;overflow:hidden;background:${o.transparent ? "transparent" : colors.background}}
-  .box{position:absolute;left:${unit * 5}px;bottom:${o.height * 0.24}px;display:flex;align-items:stretch;
-    animation:out .5s ease-in ${Math.max(0, o.duration - 0.5)}s forwards}
-  .accent{width:${unit * 0.6}px;background:${colors.primary};transform-origin:bottom;animation:grow .4s cubic-bezier(.2,.8,.2,1) both}
-  .text{background:rgba(10,10,15,.72);padding:${unit * 1}px ${unit * 1.8}px;clip-path:inset(0 100% 0 0);animation:reveal .7s .15s cubic-bezier(.2,.8,.2,1) forwards}
-  .name{font-family:'${fonts.heading}',Helvetica,Arial,sans-serif;font-weight:700;font-size:${unit * 2.6}px;color:${colors.text}}
-  .role{font-family:'${fonts.body}',Helvetica,Arial,sans-serif;font-size:${unit * 1.6}px;color:${colors.accent};margin-top:${unit * 0.3}px}
-  @keyframes grow{from{transform:scaleY(0)}to{transform:scaleY(1)}}
-  @keyframes reveal{to{clip-path:inset(0 0 0 0)}}
-  @keyframes out{to{opacity:0;transform:translateX(-${unit * 2}px)}}
-  </style></head><body><div class="box"><div class="accent"></div><div class="text">
-  <div class="name">${escapeHtml(o.text)}</div>${o.subtitle ? `<div class="role">${escapeHtml(o.subtitle)}</div>` : ""}</div></div></body></html>`;
+  const unit = unitOf(o);
+  background(ctx, o);
+  const out = clamp01((t - Math.max(0, o.duration - 0.6)) / 0.6) ** 2;
+  ctx.globalAlpha = 1 - out;
+  ctx.translate(o.width / 2, o.height / 2);
+  ctx.scale(1 + 0.03 * out, 1 + 0.03 * out);
+  ctx.translate(-o.width / 2, -o.height / 2);
+  // The words in centred lines.
+  const heading: TextStyle = { size: unit * 7.5, font: fonts.heading, weight: 800, color: colors.text };
+  setFont(ctx, heading);
+  const space = ctx.measureText(" ").width;
+  const lines: string[][] = [[]];
+  let lineWidth = 0;
+  for (const word of o.text.split(/\s+/).filter(Boolean)) {
+    const width = ctx.measureText(word).width;
+    if (lines.at(-1)!.length && lineWidth + space + width > o.width - unit * 12) {
+      lines.push([]);
+      lineWidth = 0;
+    }
+    lineWidth += (lines.at(-1)!.length ? space : 0) + width;
+    lines.at(-1)!.push(word);
+  }
+  const lineHeight = heading.size! * 1.05;
+  const subtitle: TextStyle = { size: unit * 2.6, font: fonts.body, weight: 400, color: colors.text, align: "center", maxWidth: o.width - unit * 12 };
+  const subtitleHeight = o.subtitle ? measureText(ctx, o.subtitle, subtitle).height : 0;
+  let y = (o.height - (lines.length * lineHeight + unit * 4.5 + subtitleHeight)) / 2;
+  let index = 0;
+  for (const line of lines) {
+    setFont(ctx, heading);
+    const widths = line.map((word) => ctx.measureText(word).width);
+    let x = (o.width - widths.reduce((a, b) => a + b, 0) - space * (line.length - 1)) / 2;
+    line.forEach((word, i) => {
+      const p = easeOut((t - index++ * 0.12) / 0.9);
+      ctx.save();
+      ctx.globalAlpha *= p;
+      if (p < 1) ctx.filter = `blur(${(unit * 0.6 * (1 - p)).toFixed(2)}px)`;
+      drawText(ctx, word, x, y + unit * 3 * (1 - p), heading);
+      ctx.restore();
+      x += widths[i] + space;
+    });
+    y += lineHeight;
+  }
+  y += unit * 2;
+  const bar = unit * 12 * easeOut((t - 0.35) / 0.7);
+  if (bar > 0) {
+    ctx.fillStyle = colors.primary;
+    ctx.beginPath();
+    ctx.roundRect((o.width - bar) / 2, y, bar, unit * 0.5, unit * 0.25);
+    ctx.fill();
+  }
+  y += unit * 2.5;
+  if (o.subtitle) {
+    const p = easeOut((t - 0.6) / 0.8);
+    ctx.save();
+    ctx.globalAlpha *= 0.85 * p;
+    drawText(ctx, o.subtitle, o.width / 2, y + unit * (1 - p), subtitle);
+    ctx.restore();
+  }
+}
+
+// Lower third: a name and a role at the bottom left. A colored bar grows, the box slides open, and at the end it all slides away.
+function drawLowerThird(ctx: any, t: number, o: Template): void {
+  const { colors, fonts } = o.brand;
+  const unit = unitOf(o);
+  background(ctx, o);
+  const out = clamp01((t - Math.max(0, o.duration - 0.5)) / 0.5) ** 2;
+  ctx.globalAlpha = 1 - out;
+  ctx.translate(-unit * 2 * out, 0);
+  const name: TextStyle = { size: unit * 2.6, font: fonts.heading, weight: 700, color: colors.text };
+  const role: TextStyle = { size: unit * 1.6, font: fonts.body, weight: 400, color: colors.accent };
+  const nameSize = measureText(ctx, o.text, name);
+  const roleSize = o.subtitle ? measureText(ctx, o.subtitle, role) : { width: 0, height: 0 };
+  const [padX, padY, accent] = [unit * 1.8, unit, unit * 0.6];
+  const boxWidth = Math.max(nameSize.width, roleSize.width) + padX * 2;
+  const boxHeight = nameSize.height + (o.subtitle ? unit * 0.3 + roleSize.height : 0) + padY * 2;
+  const [x, top] = [unit * 5, o.height * 0.76 - boxHeight];
+  const grow = easeOut(t / 0.4);
+  ctx.fillStyle = colors.primary;
+  ctx.fillRect(x, top + boxHeight * (1 - grow), accent, boxHeight * grow);
+  const reveal = easeOut((t - 0.15) / 0.7);
+  if (reveal <= 0) return;
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(x + accent, top, boxWidth * reveal, boxHeight);
+  ctx.clip();
+  ctx.fillStyle = "rgba(10,10,15,0.72)";
+  ctx.fillRect(x + accent, top, boxWidth, boxHeight);
+  drawText(ctx, o.text, x + accent + padX, top + padY, name);
+  if (o.subtitle) drawText(ctx, o.subtitle, x + accent + padX, top + padY + nameSize.height + unit * 0.3, role);
+  ctx.restore();
 }
 
 // Counter: a number that counts up (great for stats), with a label underneath.
-export function counterHtml(o: Required<Omit<TemplateOptions, "subtitle">> & { subtitle?: string; from: number; to: number; prefix: string; suffix: string }): string {
+function drawCounter(ctx: any, t: number, o: Template & { from: number; to: number; prefix: string; suffix: string }): void {
   const { colors, fonts } = o.brand;
-  const unit = Math.min(o.width, o.height * 1.78) / 100;
+  const unit = unitOf(o);
+  background(ctx, o);
+  const run = Math.max(0.5, o.duration * 0.7);
+  const value = o.from + (o.to - o.from) * (1 - (1 - clamp01(t / run)) ** 3);
   const decimals = Number.isInteger(o.to) && Number.isInteger(o.from) ? 0 : 1;
-  return `<!doctype html><html><head><style>
-  html,body{margin:0;width:100%;height:100%;overflow:hidden;background:${o.transparent ? "transparent" : colors.background}}
-  .wrap{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center}
-  .n{font-family:'${fonts.heading}',Helvetica,Arial,sans-serif;font-weight:800;font-size:${unit * 11}px;color:${colors.text};font-variant-numeric:tabular-nums}
-  .label{font-family:'${fonts.body}',Helvetica,Arial,sans-serif;font-size:${unit * 2.6}px;color:${colors.accent};text-transform:uppercase;letter-spacing:.2em}
-  </style></head><body><div class="wrap"><div class="n" id="n"></div><div class="label">${escapeHtml(o.text)}</div></div>
-  <script>
-    const from = ${o.from}, to = ${o.to}, run = Math.max(0.5, ${o.duration} * 0.7);
-    const ease = (x) => 1 - Math.pow(1 - x, 3);
-    window.joedit.render = (t) => {
-      const value = from + (to - from) * ease(Math.min(1, t / run));
-      document.getElementById('n').textContent = ${JSON.stringify(o.prefix)} + value.toLocaleString('en-US', { minimumFractionDigits: ${decimals}, maximumFractionDigits: ${decimals} }) + ${JSON.stringify(o.suffix)};
-    };
-  </script></body></html>`;
+  const text = o.prefix + value.toLocaleString("en-US", { minimumFractionDigits: decimals, maximumFractionDigits: decimals }) + o.suffix;
+  const number: TextStyle = { size: unit * 11, font: fonts.heading, weight: 800, color: colors.text, align: "center" };
+  const label: TextStyle = { size: unit * 2.6, font: fonts.body, weight: 400, color: colors.accent, align: "center", letterSpacing: unit * 0.52 };
+  const numberHeight = measureText(ctx, text, number).height;
+  const labelHeight = o.text ? measureText(ctx, o.text.toUpperCase(), label).height : 0;
+  const y = (o.height - numberHeight - labelHeight) / 2;
+  drawText(ctx, text, o.width / 2, y, number);
+  if (o.text) drawText(ctx, o.text.toUpperCase(), o.width / 2, y + numberHeight, label);
 }
 
 // Fill in template defaults from the options and the brand kit.
@@ -399,37 +492,74 @@ function templateDefaults(o: TemplateOptions) {
   };
 }
 
-// Render a template's HTML to a video (or a still picture if the output is .png/.jpg).
-// stillTime: the moment shown when the output is a picture (when everything is fully on screen).
-async function renderTemplate(html: string, output: string, o: ReturnType<typeof templateDefaults>, stillTime?: number): Promise<{ frames: number }> {
-  return withHtmlFile(html, async (file) => {
-    if (/\.(png|jpe?g)$/i.test(output)) {
-      await still(file, output, stillTime ?? Math.min(1.6, o.duration / 2), { ...o, duration: o.duration });
-      return { frames: 1 };
-    }
-    return render(file, output, o);
-  });
-}
-
+// A template becomes a video, or a picture (.png/.jpg) of the moment when everything is on screen.
 export async function title(output: string, options: TemplateOptions) {
   const o = templateDefaults(options);
-  return renderTemplate(titleHtml(o), output, o);
+  return drawFrames(output, o, (ctx, t) => drawTitle(ctx, t, o), Math.min(1.6, o.duration / 2));
 }
 
 export async function lowerThird(output: string, options: TemplateOptions) {
   const o = templateDefaults({ transparent: true, ...options });
-  return renderTemplate(lowerThirdHtml(o), output, o);
+  return drawFrames(output, o, (ctx, t) => drawLowerThird(ctx, t, o), Math.min(1.6, o.duration / 2));
 }
 
 export async function counter(output: string, options: TemplateOptions & { from?: number; to: number; prefix?: string; suffix?: string }) {
-  const o = templateDefaults(options);
-  return renderTemplate(counterHtml({ ...o, from: options.from ?? 0, to: options.to, prefix: options.prefix ?? "", suffix: options.suffix ?? "" }), output, o, o.duration * 0.8);
+  const o = { ...templateDefaults(options), from: options.from ?? 0, to: options.to, prefix: options.prefix ?? "", suffix: options.suffix ?? "" };
+  return drawFrames(output, o, (ctx, t) => drawCounter(ctx, t, o), o.duration * 0.8);
+}
+
+// ---------- Canvas: the agent's own drawing code ----------
+// A JavaScript module (.mjs) whose default export draws one frame with the Skia canvas API:
+//   export default function draw(ctx, t, info) { ctx.fillStyle = "#123"; ctx.fillRect(0, 0, info.width, info.height); ... }
+// info: width, height, fps, duration, frame, data (--data), brand, audio ({ bpm, beats, levels }) and level (loudness now, 0..1),
+// plus helpers: text(ctx, text, x, y, style) and measure(ctx, text, style) (style like picture text), image(path) (a picture to drawImage),
+// ease(x) (0..1, gentle stop) and clamp(x). draw may be async.
+export async function canvas(
+  script: string,
+  output: string,
+  o: { width: number; height: number; fps: number; duration: number; transparent?: boolean; data?: unknown; audio?: string; time?: number; brand?: Brand },
+) {
+  const module = await import(pathToFileURL(resolve(requireFile(script))).href);
+  const draw = module.default ?? module.draw;
+  if (typeof draw !== "function") throw new Error(`${script} must export its drawing: export default function draw(ctx, t, info) { ... }`);
+  let audio: { bpm: number; beats: number[]; levels: number[] } | undefined;
+  if (o.audio) {
+    const beat = listen.beats(o.audio);
+    audio = { bpm: beat.bpm, beats: beat.beats, levels: listen.levels(o.audio, o.fps) };
+  }
+  const { loadImage } = await skia();
+  const images = new Map<string, any>();
+  const info = {
+    width: o.width,
+    height: o.height,
+    fps: o.fps,
+    duration: o.duration,
+    data: o.data,
+    brand: o.brand ?? loadBrand(),
+    audio,
+    text: drawText,
+    measure: measureText,
+    ease: easeOut,
+    clamp: clamp01,
+    image: async (path: string) => {
+      const file = resolve(dirname(resolve(script)), path);
+      if (!images.has(file)) images.set(file, await loadImage(readFileSync(requireFile(file))));
+      return images.get(file);
+    },
+  };
+  return drawFrames(output, o, async (ctx, t) => {
+    const frame = Math.round(t * o.fps);
+    await draw(ctx, t, { ...info, frame, level: audio?.levels[frame] ?? 0 });
+  }, o.time ?? 0);
 }
 
 // ---------- Captions ----------
 
 export type CaptionStyle = "karaoke" | "pop" | "bold" | "minimal";
-export type CaptionWord = { word: string; start: number; end: number };
+export type CaptionWord = { word: string; start: number; end: number; speaker?: string };
+
+// Word colors for different speakers (with speakerColors on): the first speaker stays white.
+const SPEAKER_COLORS = ["#FFFFFF", "#7FDBFF", "#FFD166", "#FF8FAB", "#B5F44A", "#C9A7FF"];
 
 // Split words into short groups that fit on screen, breaking at pauses.
 function captionGroups(words: CaptionWord[], maxChars: number): CaptionWord[][] {
@@ -450,40 +580,94 @@ function captionGroups(words: CaptionWord[], maxChars: number): CaptionWord[][] 
   return groups;
 }
 
-// The page that draws one caption state: show(group, activeWord).
-function captionHtml(groups: CaptionWord[][], width: number, height: number, style: CaptionStyle, position: string, brand: Brand): string {
-  const size = Math.round(Math.min(height * 0.07, width * 0.085));
-  const place = position === "top" ? `top:${height * 0.1}px` : position === "center" ? "top:50%;transform:translateY(-50%)" : `bottom:${height * 0.12}px`;
-  const styles: Record<CaptionStyle, string> = {
-    karaoke: `.w{color:#fff}.w.past,.w.on{color:${brand.colors.accent}}`,
-    pop: `.line{text-transform:uppercase;font-weight:900}.w{color:#fff;display:inline-block}.w.on{color:#111;background:${brand.colors.accent};border-radius:${size * 0.18}px;padding:0 ${size * 0.15}px;transform:scale(1.12);margin:0 .3em}`,
-    bold: `.line{text-transform:uppercase;font-weight:900;font-size:${size * 1.25}px;-webkit-text-stroke:${size * 0.08}px #000;paint-order:stroke fill}.w{color:#fff}.w.on{color:${brand.colors.accent}}`,
-    minimal: `.line{background:rgba(0,0,0,.6);padding:${size * 0.2}px ${size * 0.45}px;border-radius:${size * 0.15}px;font-weight:500}.w{color:#fff}`,
-  };
-  return `<!doctype html><html><head><style>
-  html,body{margin:0;width:100%;height:100%;background:transparent;overflow:hidden}
-  .holder{position:absolute;left:0;right:0;${place};display:flex;justify-content:center;padding:0 ${width * 0.06}px}
-  .line{font-family:'${brand.fonts.heading}',Helvetica,Arial,sans-serif;font-weight:800;font-size:${size}px;line-height:1.25;text-align:center;
-    text-shadow:0 ${size * 0.05}px ${size * 0.25}px rgba(0,0,0,.75)}
-  ${styles[style]}
-  </style></head><body><div class="holder"><div class="line" id="line"></div></div><script>
-    const groups = ${JSON.stringify(groups.map((g) => g.map((w) => w.word)))};
-    const esc = (s) => s.replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' })[c]);
-    window.show = (g, a) => {
-      const line = document.getElementById('line');
-      line.style.visibility = g < 0 ? 'hidden' : 'visible';
-      if (g < 0) return;
-      line.innerHTML = groups[g].map((w, i) => '<span class="w ' + (i < a ? 'past' : i === a ? 'on' : '') + '">' + esc(w) + '</span>').join(' ');
-    };
-  </script></body></html>`;
+type CaptionLook = { width: number; height: number; style: CaptionStyle; position: string; brand: Brand; speakers: string[] };
+
+// Draw one caption: the words of a group, with word `active` highlighted (-1: none).
+// Styles: karaoke (words light up as they are said), pop (the word being said jumps out on a colored tag),
+// bold (big outlined capitals), minimal (plain words on a dark box).
+function drawCaption(ctx: any, group: CaptionWord[], active: number, o: CaptionLook): void {
+  const base = Math.round(Math.min(o.height * 0.07, o.width * 0.085));
+  const size = o.style === "bold" ? base * 1.25 : base;
+  const capitals = o.style === "pop" || o.style === "bold";
+  const font: TextStyle = { size, font: o.brand.fonts.heading, weight: capitals ? 900 : o.style === "minimal" ? 500 : 800 };
+  setFont(ctx, font);
+  const words = group.map((w) => (capitals ? w.word.toUpperCase() : w.word));
+  const space = ctx.measureText(" ").width;
+  const extra = (i: number) => (o.style === "pop" && i === active ? size * 0.3 : 0); // the tagged word gets room around it
+  const widths = words.map((w, i) => ctx.measureText(w).width + 2 * extra(i));
+  // Lines that fit in the middle 88% of the frame.
+  const lines: number[][] = [[]];
+  let lineWidth = 0;
+  words.forEach((_, i) => {
+    if (lines.at(-1)!.length && lineWidth + space + widths[i] > o.width * 0.88) {
+      lines.push([]);
+      lineWidth = 0;
+    }
+    lineWidth += (lines.at(-1)!.length ? space : 0) + widths[i];
+    lines.at(-1)!.push(i);
+  });
+  const lineHeight = size * 1.25;
+  const blockHeight = lines.length * lineHeight;
+  const top = o.position === "top" ? o.height * 0.1 : o.position === "center" ? (o.height - blockHeight) / 2 : o.height * 0.88 - blockHeight;
+  const widthOf = (line: number[]) => line.reduce((sum, i) => sum + widths[i], 0) + space * (line.length - 1);
+  if (o.style === "minimal") {
+    const boxWidth = Math.max(...lines.map(widthOf)) + base * 0.9;
+    ctx.fillStyle = "rgba(0,0,0,0.6)";
+    ctx.beginPath();
+    ctx.roundRect((o.width - boxWidth) / 2, top - base * 0.2, boxWidth, blockHeight + base * 0.4, base * 0.15);
+    ctx.fill();
+  }
+  ctx.textBaseline = "middle";
+  ctx.textAlign = "center";
+  ctx.lineJoin = "round";
+  lines.forEach((line, row) => {
+    let x = (o.width - widthOf(line)) / 2;
+    const y = top + row * lineHeight + lineHeight / 2;
+    for (const i of line) {
+      const on = i === active;
+      const said = active >= 0 && i < active;
+      const speaker = group[i].speaker;
+      let color = o.speakers.length > 1 && speaker ? SPEAKER_COLORS[o.speakers.indexOf(speaker) % SPEAKER_COLORS.length] : "#FFFFFF";
+      if ((o.style === "karaoke" && (on || said)) || (o.style === "bold" && on)) color = o.brand.colors.accent;
+      const centre = x + widths[i] / 2;
+      ctx.save();
+      setFont(ctx, font);
+      if (o.style === "pop" && on) {
+        ctx.translate(centre, y);
+        ctx.scale(1.12, 1.12);
+        ctx.translate(-centre, -y);
+        const tag = widths[i] - 2 * extra(i) + size * 0.3;
+        ctx.fillStyle = o.brand.colors.accent;
+        ctx.beginPath();
+        ctx.roundRect(centre - tag / 2, y - lineHeight * 0.42, tag, lineHeight * 0.84, base * 0.18);
+        ctx.fill();
+        color = "#111111";
+      } else {
+        ctx.shadowColor = "rgba(0,0,0,0.75)";
+        ctx.shadowBlur = size * 0.25;
+        ctx.shadowOffsetY = size * 0.05;
+      }
+      if (o.style === "bold") {
+        ctx.strokeStyle = "#000000";
+        ctx.lineWidth = size * 0.12;
+        ctx.strokeText(words[i], centre, y);
+        ctx.shadowColor = "transparent";
+      }
+      ctx.fillStyle = color;
+      ctx.fillText(words[i], centre, y);
+      ctx.restore();
+      x += widths[i] + space;
+    }
+  });
 }
 
-// Render a see-through caption video (.mov) from word timings.
+// Render a see-through caption video (.mov) from word timings, drawn by Skia.
 // Only one picture per caption state is drawn (not one per frame), so long videos are quick.
+// speakerColors: words that carry a "speaker" (from listen speakers) get a color per speaker.
 export async function captionsOverlay(
   words: CaptionWord[],
   output: string,
-  options: { width: number; height: number; fps: number; duration: number; style?: CaptionStyle; position?: string; brand?: Brand },
+  options: { width: number; height: number; fps: number; duration: number; style?: CaptionStyle; position?: string; brand?: Brand; speakerColors?: boolean },
 ): Promise<{ groups: number }> {
   const style = options.style ?? "karaoke";
   if (!["karaoke", "pop", "bold", "minimal"].includes(style)) throw new Error("--style must be karaoke, pop, bold or minimal.");
@@ -508,34 +692,35 @@ export async function captionsOverlay(
   });
   if (time < options.duration) states.push({ start: time, end: options.duration, group: -1, active: -1 });
 
-  return withHtmlFile(captionHtml(groups, options.width, options.height, style, options.position ?? "bottom", brand), async (page) => {
-    const folder = mkdtempSync(join(tmpdir(), "joedit-captions-"));
-    try {
-      const pictures = new Map<string, string>();
-      await withPage(page, { ...options, transparent: true }, async (p) => {
-        for (const state of states) {
-          const key = `${state.group}_${state.active}`;
-          if (pictures.has(key)) continue;
-          await p.evaluate(`window.show(${state.group}, ${state.active})`);
-          const file = join(folder, `${key}.png`);
-          writeFileSync(file, await p.screenshot("png"));
-          pictures.set(key, file);
-        }
-      });
-      // An ffmpeg "concat" list: each picture with how long it stays on screen.
-      const list = states.map((s) => `file '${pictures.get(`${s.group}_${s.active}`)}'\nduration ${round(s.end - s.start, 3)}`);
-      list.push(`file '${pictures.get(`${states[states.length - 1].group}_${states[states.length - 1].active}`)}'`);
-      writeFileSync(join(folder, "list.txt"), list.join("\n"));
-      run("ffmpeg", [
-        "-hide_banner", "-loglevel", "error", "-y",
-        "-f", "concat", "-safe", "0", "-i", join(folder, "list.txt"),
-        "-r", String(options.fps), "-t", String(options.duration),
-        "-c:v", "png", "-pix_fmt", "rgba", output,
-      ]);
-      return { groups: groups.length };
-    } finally {
-      rmSync(folder, { recursive: true, force: true });
+  const speakers = options.speakerColors ? [...new Set(words.map((w) => w.speaker).filter((s): s is string => Boolean(s)))] : [];
+  const look: CaptionLook = { width: options.width, height: options.height, style, position: options.position ?? "bottom", brand, speakers };
+  const { createCanvas } = await skia();
+  const canvas = createCanvas(options.width, options.height);
+  const ctx = canvas.getContext("2d");
+  return withTempDir(async (folder) => {
+    // One picture per distinct caption state.
+    const pictures = new Map<string, string>();
+    for (const state of states) {
+      const key = `${state.group}_${state.active}`;
+      if (pictures.has(key)) continue;
+      ctx.clearRect(0, 0, options.width, options.height);
+      if (state.group >= 0) drawCaption(ctx, groups[state.group], state.active, look);
+      const file = join(folder, `${key}.png`);
+      writeFileSync(file, await canvas.encode("png"));
+      pictures.set(key, file);
     }
+    // An ffmpeg "concat" list: each picture with how long it stays on screen.
+    const pictureOf = (s: State) => pictures.get(`${s.group}_${s.active}`);
+    const list = states.map((s) => `file '${pictureOf(s)}'\nduration ${round(s.end - s.start, 3)}`);
+    list.push(`file '${pictureOf(states[states.length - 1])}'`);
+    writeFileSync(join(folder, "list.txt"), list.join("\n"));
+    run("ffmpeg", [
+      "-hide_banner", "-loglevel", "error", "-y",
+      "-f", "concat", "-safe", "0", "-i", join(folder, "list.txt"),
+      "-r", String(options.fps), "-t", String(options.duration),
+      "-c:v", "png", "-pix_fmt", "rgba", output,
+    ]);
+    return { groups: groups.length };
   });
 }
 
@@ -577,6 +762,13 @@ export const commands: Record<string, Command> = {
     usage: "still <page.html> <output.png> --time S [--width 1920] [--height 1080] [--transparent] [--data file.json]",    run: async (a) => {
       const { input, output } = inOut(a);
       await still(input, output, numberFlag(a, "time"), { ...sizeFlags(a), data: dataFlag(a) });
+    },
+  },
+  canvas: {
+    usage: `canvas <draw.mjs> <output.mp4|.mov|.png> --duration S ${SIZE} [--transparent] [--data file.json] [--audio sound] [--time S] [--brand brand.json]  (your own Skia drawing code, no browser; --time: the moment for a .png)`,
+    run: async (a) => {
+      const { input, output } = inOut(a);
+      return canvas(input, output, { ...sizeFlags(a), duration: optionalNumberFlag(a, "duration", 1), data: dataFlag(a), audio: a.flags.audio, time: optionalNumberFlag(a, "time", 0) });
     },
   },
   title: {

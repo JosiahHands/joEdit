@@ -21,6 +21,8 @@ export const MODELS = join(LIB, ".models");
 // They are loaded only when a command needs them, so a missing one only breaks its own commands.
 export const LIBS = join(LIB, "libs");
 const requireLibrary = createRequire(join(LIBS, "package.json"));
+// Free fonts that come with joEdit (SIL Open Font License, see libs/fonts/OFL-*.txt).
+export const FONTS = join(LIBS, "fonts");
 
 // Load a library from libs/ by name, with a clear message if it is missing.
 export function need(name: string): any {
@@ -42,14 +44,8 @@ export const FFMPEG: string = (() => {
   }
 })();
 
-// Font file used when ImageMagick draws text: a system font if there is one, else a downloaded one.
-export const DEFAULT_FONT =
-  [
-    "/System/Library/Fonts/Supplemental/Arial.ttf", // macOS
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", // Debian / Ubuntu
-    "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf", // Fedora
-    join(ASSETS, "fonts", "Inter.ttf"), // node joedit.ts install fonts
-  ].find((path) => existsSync(path)) ?? "";
+// The default font file (Inter, included with joEdit).
+export const DEFAULT_FONT = join(FONTS, "Inter.ttf");
 
 // Parsed command line: plain values go in `positional`, `--name value` pairs go in `flags`.
 export type Args = {
@@ -195,19 +191,21 @@ export function probe(input: string): { streams: any[]; format: any } {
 export type Frame = { time: number; pixels: Buffer; width: number; height: number };
 
 // Read a video's frames as RGBA pixels, one at a time (memory stays small for long videos).
-// fps: take this many frames per second (default: every frame). width: scale down to this width.
+// fps: take this many frames per second (default: every frame). width: scale to this width.
+// width + height: exactly this size, filling the frame (the middle is kept, extra edges are cut).
 // start / duration / count: only part of the video (count = at most this many frames).
 export async function* readFrames(
   input: string,
-  options: { fps?: number; width?: number; start?: number; duration?: number; count?: number } = {},
+  options: { fps?: number; width?: number; height?: number; start?: number; duration?: number; count?: number } = {},
 ): AsyncGenerator<Frame> {
   const video = probe(input).streams.find((s) => s.codec_type === "video");
   if (!video) throw new Error(`"${input}" has no picture.`);
   const width = options.width ? Math.round(options.width / 2) * 2 : video.width;
-  const height = options.width ? Math.round((video.height * width) / video.width / 2) * 2 : video.height;
+  const height = options.height ?? (options.width ? Math.round((video.height * width) / video.width / 2) * 2 : video.height);
   const [num, den] = video.r_frame_rate.split("/").map(Number);
   const fps = options.fps ?? (den ? num / den : 30);
-  const filters = [...(options.fps ? [`fps=${options.fps}`] : []), `scale=${width}:${height}`, "format=rgba"];
+  const scale = options.height ? `scale=${width}:${height}:force_original_aspect_ratio=increase,crop=${width}:${height}` : `scale=${width}:${height}`;
+  const filters = [...(options.fps ? [`fps=${options.fps}`] : []), scale, "format=rgba"];
   const child = spawn(FFMPEG, [
     "-hide_banner", "-loglevel", "error",
     ...(options.start ? ["-ss", String(options.start)] : []), "-i", input,
@@ -327,7 +325,7 @@ export async function skia(): Promise<any> {
   if (canvasLibrary) return canvasLibrary;
   canvasLibrary = need("@napi-rs/canvas");
   for (const [file, family] of Object.entries(FONT_FAMILIES)) {
-    const path = join(ASSETS, "fonts", file);
+    const path = join(FONTS, file);
     if (existsSync(path)) canvasLibrary.GlobalFonts.registerFromPath(path, family);
   }
   return canvasLibrary;
@@ -450,7 +448,7 @@ export function drawText(ctx: any, text: string, x: number, y: number, style: Te
 // A canvas holding a picture file (any format sharp reads).
 export async function pictureCanvas(input: string): Promise<{ canvas: any; ctx: any; width: number; height: number }> {
   const { createCanvas, ImageData } = await skia();
-  const { data, info } = await (await openPicture(input)).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+  const { data, info } = await (await openPicture(input)).toColourspace("srgb").ensureAlpha().raw().toBuffer({ resolveWithObject: true }); // always RGBA, even for grey pictures
   const canvas = createCanvas(info.width, info.height);
   const ctx = canvas.getContext("2d");
   ctx.putImageData(new ImageData(new Uint8ClampedArray(data.buffer, data.byteOffset, data.length), info.width, info.height), 0, 0);
@@ -874,38 +872,13 @@ export type Asset = {
   command?: string[]; // or: a command that installs it into .assets/<name>
 };
 
-const GOOGLE_FONTS = "https://github.com/google/fonts/raw/main/ofl";
-const THREE = "https://cdn.jsdelivr.net/npm/three@0.180.0";
-
+// Optional downloads, added only by `node joedit.ts install <name>`. (Fonts and Three.js come with joEdit in libs/.)
 export const ASSET_LIST: Asset[] = [
-  {
-    name: "fonts",
-    description: "Free fonts for titles and captions: Inter, Montserrat, Bebas Neue, Playfair Display, JetBrains Mono.",
-    license: "SIL Open Font License",
-    files: [
-      { url: `${GOOGLE_FONTS}/inter/Inter%5Bopsz,wght%5D.ttf`, path: "Inter.ttf" },
-      { url: `${GOOGLE_FONTS}/montserrat/Montserrat%5Bwght%5D.ttf`, path: "Montserrat.ttf" },
-      { url: `${GOOGLE_FONTS}/bebasneue/BebasNeue-Regular.ttf`, path: "BebasNeue.ttf" },
-      { url: `${GOOGLE_FONTS}/playfairdisplay/PlayfairDisplay%5Bwght%5D.ttf`, path: "PlayfairDisplay.ttf" },
-      { url: `${GOOGLE_FONTS}/jetbrainsmono/JetBrainsMono%5Bwght%5D.ttf`, path: "JetBrainsMono.ttf" },
-    ],
-  },
   {
     name: "instruments",
     description: "GeneralUser GS: 259 instrument sounds (piano, strings, drums, synths …) for music compose. 32 MB.",
     license: "GeneralUser GS License v2.0 (free for any use)",
     files: [{ url: "https://raw.githubusercontent.com/mrbumpy409/GeneralUser-GS/main/GeneralUser-GS.sf2", path: "GeneralUser-GS.sf2" }],
-  },
-  {
-    name: "three",
-    description: "Three.js 0.180 (real-time 3D for graphics pages) with the glTF model loader. 2 MB.",
-    license: "MIT",
-    files: [
-      { url: `${THREE}/build/three.module.js`, path: "three.module.js" },
-      { url: `${THREE}/build/three.core.js`, path: "three.core.js" },
-      { url: `${THREE}/examples/jsm/loaders/GLTFLoader.js`, path: "addons/loaders/GLTFLoader.js" },
-      { url: `${THREE}/examples/jsm/utils/BufferGeometryUtils.js`, path: "addons/utils/BufferGeometryUtils.js" },
-    ],
   },
   {
     name: "upscaler",

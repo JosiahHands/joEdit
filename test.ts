@@ -14,7 +14,10 @@ import * as graphics from "./lib/graphics.ts";
 import * as threeD from "./lib/3d.ts";
 import { FFMPEG, isModelInstalled, need, probe, readFrames, writeVideo } from "./lib/shared.ts";
 
-type Tool = "picture" | "video" | "sound" | "look" | "listen" | "graphics" | "movie" | "voice" | "music" | "3d" | "joedit";
+type Tool = "picture" | "video" | "sound" | "look" | "listen" | "graphics" | "fx" | "movie" | "voice" | "music" | "3d" | "joedit";
+
+// GPU effects need raylib (included for macOS in lib/libs/raylib).
+const hasRaylib = existsSync(join("lib", "libs", "raylib", process.platform === "darwin" ? "libraylib.dylib" : "libraylib.so"));
 
 // Graphics tests need Chrome; they are skipped on machines without it.
 const hasChrome = (() => {
@@ -305,7 +308,7 @@ describe("picture", () => {
   });
 
   test("parallax moves near parts more than far parts", async (t) => {
-    if (!hasChrome) return t.skip("Chrome not found");
+    if (!hasRaylib) return t.skip("raylib not found");
     // A hand-made depth map: the top half is near (white), the bottom half far (black).
     await paint(file("halves-depth.png"), 400, 300, (_, y) => (y < 150 ? WHITE : BLACK));
     await paint(file("checks.png"), 400, 300, (x, y) => ((Math.floor(x / 32) + Math.floor(y / 32)) % 2 ? WHITE : [128, 128, 128, 255]));
@@ -574,8 +577,7 @@ describe("video", () => {
     assert.equal(video.info(file("smooth.mp4")).fps, 60);
   });
 
-  test("captions from a transcript appear at the bottom (needs Chrome)", (t) => {
-    if (!hasChrome) return t.skip("Chrome not found");
+  test("captions from a transcript appear at the bottom", () => {
     const words = [
       { word: "Hello", start: 0.2, end: 0.7 },
       { word: "there", start: 0.8, end: 1.3 },
@@ -590,6 +592,36 @@ describe("video", () => {
     // The top half is untouched, the bottom third has the words.
     assert.ok(regionDiff(file("cap-before.png"), file("cap-after.png"), "320x100+0+0") < 0.03);
     assert.ok(regionDiff(file("cap-before.png"), file("cap-after.png"), "320x80+0+160") > 0.03);
+  });
+
+  test("captions --speakers colors each speaker's words", async () => {
+    // Two speakers, one word each, on a black clip; minimal style so no word is highlighted.
+    writeFileSync(file("speakers.json"), JSON.stringify({ words: [
+      { word: "HELLO.", start: 0, end: 1, speaker: "A" }, // the full stop ends the caption
+      { word: "HELLO", start: 1.5, end: 2.5, speaker: "B" },
+    ] }));
+    execFileSync(FFMPEG, ["-loglevel", "error", "-y", "-f", "lavfi", "-i", "color=black:size=320x240:rate=30", "-t", "3", "-pix_fmt", "yuv420p", file("black.mp4")]);
+    ok("video", ["captions", file("black.mp4"), file("spk.mp4"), "--transcript", file("speakers.json"), "--style", "minimal", "--speakers"]);
+    frameAt(file("spk.mp4"), 0.5, file("spk-a.png"));
+    frameAt(file("spk.mp4"), 2, file("spk-b.png"));
+    // The average color of the bright (letter) pixels in the bottom part.
+    const colorOf = (path: string) => {
+      const pixels = rgba(path, "320x80+0+160");
+      let r = 0, b = 0, count = 0;
+      for (let i = 0; i < pixels.length; i += 4) {
+        if (pixels[i + 1] < 150) continue; // not a letter
+        r += pixels[i];
+        b += pixels[i + 2];
+        count++;
+      }
+      assert.ok(count > 50, "no caption letters found");
+      return { r: r / count, b: b / count };
+    };
+    // Speaker A is white (red and blue alike); speaker B is light blue (much more blue than red).
+    const a = colorOf(file("spk-a.png"));
+    const b = colorOf(file("spk-b.png"));
+    assert.ok(Math.abs(a.r - a.b) < 10, `speaker A not white: ${JSON.stringify(a)}`);
+    assert.ok(b.b > b.r + 15, `speaker B not blue: ${JSON.stringify(b)}`);
   });
 
   test("errors: missing file and help", () => {
@@ -759,8 +791,8 @@ describe("voice", () => {
     assert.ok(loudness(join(file("stems"), "vocals.wav"), 1.8) < loudness(join(file("stems"), "vocals.wav")) - 10);
   });
 
-  test("a movie voice-over is spoken, mixed and captioned (needs the kokoro and whisper models, and Chrome)", (t) => {
-    if (!hasModel("kokoro") || !hasWhisper() || !hasChrome) return t.skip("kokoro/whisper model or Chrome missing");
+  test("a movie voice-over is spoken, mixed and captioned (needs the kokoro and whisper models)", (t) => {
+    if (!hasModel("kokoro") || !hasWhisper()) return t.skip("kokoro/whisper model missing");
     writeFileSync(file("vo.json"), JSON.stringify({
       size: "320x180",
       scenes: [{ color: "#203040", duration: 4 }],
@@ -899,8 +931,7 @@ describe("graphics", () => {
     assert.ok(g > 200 && r < 50, `canvas not green: ${r},${g}`);
   });
 
-  test("title, lower-third (see-through) and counter templates", (t) => {
-    if (!hasChrome) return t.skip("Chrome not found");
+  test("title, lower-third (see-through) and counter templates", () => {
     const size = ["--width", "640", "--height", "360"];
     ok("graphics", ["title", file("title.png"), "--text", "Hello joEdit", "--subtitle", "test", ...size]);
     assert.deepEqual(picture.info(file("title.png")), { width: 640, height: 360, format: "PNG" });
@@ -910,6 +941,28 @@ describe("graphics", () => {
     ok("graphics", ["counter", file("counter.mp4"), "--to", "100", "--duration", "1", ...size]);
     near(video.info(file("counter.mp4")).duration, 1, 0.15);
     assert.equal(cli("graphics", ["title", file("x.png")]).code, 1);
+  });
+
+  test("canvas runs the agent's draw code for each frame", () => {
+    // A box that moves 100 px per second and is colored from --data.
+    writeFileSync(file("draw.mjs"), `export default function draw(ctx, t, info) {
+      ctx.fillStyle = "#ffffff";
+      ctx.fillRect(0, 0, info.width, info.height);
+      ctx.fillStyle = info.data.color;
+      ctx.fillRect(t * 100, 0, 40, 40);
+    }`);
+    writeFileSync(file("box.json"), JSON.stringify({ color: "#ff0000" }));
+    const size = ["--width", "320", "--height", "120", "--data", file("box.json")];
+    ok("graphics", ["canvas", file("draw.mjs"), file("box0.png"), "--time", "0", ...size]);
+    ok("graphics", ["canvas", file("draw.mjs"), file("box1.png"), "--time", "1", ...size]);
+    assert.equal(pixel(file("box0.png"), 20, 20), "srgb(255,0,0)");
+    assert.equal(pixel(file("box1.png"), 20, 20), "srgb(255,255,255)");
+    assert.equal(pixel(file("box1.png"), 120, 20), "srgb(255,0,0)");
+    const result = JSON.parse(ok("graphics", ["canvas", file("draw.mjs"), file("box.mp4"), "--duration", "1", "--fps", "10", ...size]));
+    assert.equal(result.frames, 10);
+    // A draw file with a mistake gives a clear error.
+    writeFileSync(file("bad.mjs"), "export default function draw(ctx) { ctx.nope(); }");
+    assert.match(cli("graphics", ["canvas", file("bad.mjs"), file("bad.png"), "--time", "0"]).stderr, /nope/);
   });
 });
 
@@ -1416,6 +1469,83 @@ describe("listen", () => {
   });
 });
 
+describe("fx", () => {
+  // A 2 s clip of one color with a tone, to check colors exactly.
+  before(() => {
+    execFileSync(FFMPEG, ["-loglevel", "error", "-y", "-f", "lavfi", "-i", "color=c=0x204080:s=320x180:r=30:d=2", "-f", "lavfi", "-i", "sine=f=440:d=2",
+      "-shortest", "-pix_fmt", "yuv420p", file("fx-a.mp4")]);
+    execFileSync(FFMPEG, ["-loglevel", "error", "-y", "-f", "lavfi", "-i", "color=c=0xE0C020:s=320x180:r=30:d=2", "-pix_fmt", "yuv420p", file("fx-b.mp4")]);
+    execFileSync(FFMPEG, ["-loglevel", "error", "-y", "-f", "lavfi", "-i", "color=c=0x204080:s=64x64", "-frames:v", "1", file("fx-still.png")]);
+  });
+  const near = (actual: string, r: number, g: number, b: number) => {
+    const [ar, ag, ab] = actual.match(/\d+/g)!.map(Number);
+    assert.ok(Math.abs(ar - r) <= 6 && Math.abs(ag - g) <= 6 && Math.abs(ab - b) <= 6, `${actual} is not near ${r},${g},${b}`);
+  };
+
+  test("list names the effects and about 80 transitions", (t) => {
+    if (!hasRaylib) return t.skip("raylib not included for this system");
+    const all = JSON.parse(ok("fx", ["list"]));
+    assert.ok(all.count.effects >= 40 && all.count.transitions >= 70, JSON.stringify(all.count));
+    assert.ok(all.looks.bloom && all.particles.snow && all.transitions["cross-zoom"] !== undefined && all.transitions["whip-left"] !== undefined);
+  });
+
+  test("apply changes every frame and keeps the length and sound", (t) => {
+    if (!hasRaylib) return t.skip("raylib not included for this system");
+    const result = JSON.parse(ok("fx", ["apply", file("fx-a.mp4"), file("fx-inverted.mp4"), "--effect", "invert"]));
+    assert.equal(result.frames, 60);
+    assert.ok(Math.abs(result.made.duration - 2) < 0.1 && result.made.hasAudio);
+    ok("video", ["frame", file("fx-inverted.mp4"), file("fx-inverted.png"), "--time", "1"]);
+    near(pixel(file("fx-inverted.png"), 100, 100), 0xdf, 0xbf, 0x7f);
+    // amount 0.5 is halfway between the original and the effect
+    ok("fx", ["apply", file("fx-still.png"), file("fx-half.png"), "--effect", "invert", "--amount", "0.5"]);
+    near(pixel(file("fx-half.png"), 10, 10), 128, 128, 128);
+  });
+
+  test("apply chains effects, takes settings and turns a picture into a clip", (t) => {
+    if (!hasRaylib) return t.skip("raylib not included for this system");
+    ok("fx", ["apply", file("fx-still.png"), file("fx-tinted.png"), "--effect", "bw,duotone", "--set", "dark=#000000,light=#FF0000"]);
+    const [r, g, b] = pixel(file("fx-tinted.png"), 10, 10).match(/\d+/g)!.map(Number);
+    assert.ok(r > 20 && r < 40 && g < 5 && b < 5, `${r},${g},${b}`); // dark blue -> gray 0.21 -> red 0.11
+    const clip = JSON.parse(ok("fx", ["apply", file("fx-still.png"), file("fx-snow.mp4"), "--effect", "snow", "--duration", "1.5"]));
+    assert.ok(Math.abs(clip.made.duration - 1.5) < 0.1);
+    assert.match(cli("fx", ["apply", file("fx-still.png"), file("x.png"), "--effect", "bloom", "--set", "speed=2"]).stderr, /bloom.radius/);
+    assert.match(cli("fx", ["apply", file("fx-still.png"), file("x.png"), "--effect", "sparkle"]).stderr, /Unknown effect/);
+  });
+
+  test("apply runs a .cube LUT and the agent's own GLSL, with line numbers on errors", (t) => {
+    if (!hasRaylib) return t.skip("raylib not included for this system");
+    // A 2x2x2 LUT that swaps red and blue.
+    writeFileSync(file("swap.cube"), "LUT_3D_SIZE 2\n0 0 0\n0 0 1\n0 1 0\n0 1 1\n1 0 0\n1 0 1\n1 1 0\n1 1 1\n");
+    ok("fx", ["apply", file("fx-still.png"), file("fx-lut.png"), "--effect", "lut", "--lut", file("swap.cube")]);
+    near(pixel(file("fx-lut.png"), 10, 10), 0x80, 0x40, 0x20);
+    writeFileSync(file("green.glsl"), "vec4 effect(vec2 uv) {\n  return vec4(0.0, 1.0, 0.0, 1.0);\n}\n");
+    ok("fx", ["apply", file("fx-still.png"), file("fx-green.png"), "--effect", file("green.glsl")]);
+    near(pixel(file("fx-green.png"), 10, 10), 0, 255, 0);
+    writeFileSync(file("broken.glsl"), "vec4 effect(vec2 uv) {\n  return pixel(uv) * nope;\n}\n");
+    assert.match(cli("fx", ["apply", file("fx-still.png"), file("x.png"), "--effect", file("broken.glsl")]).stderr, /line 2.*nope/);
+  });
+
+  test("transition overlaps two clips and crossfades the sound", (t) => {
+    if (!hasRaylib) return t.skip("raylib not included for this system");
+    const result = JSON.parse(ok("fx", ["transition", file("fx-a.mp4"), file("fx-b.mp4"), file("fx-ab.mp4"), "--name", "fade", "--duration", "1"]));
+    assert.ok(Math.abs(result.made.duration - 3) < 0.1 && result.made.hasAudio);
+    for (const [time, [r, g, b]] of [[0.5, [0x20, 0x40, 0x80]], [2.5, [0xe0, 0xc0, 0x20]]] as const) {
+      ok("video", ["frame", file("fx-ab.mp4"), file("fx-ab.png"), "--time", String(time)]);
+      near(pixel(file("fx-ab.png"), 100, 100), r, g, b);
+    }
+    ok("video", ["frame", file("fx-ab.mp4"), file("fx-ab.png"), "--time", "1.5"]); // halfway: a blend of both
+    near(pixel(file("fx-ab.png"), 100, 100), 0x80, 0x80, 0x50);
+    assert.match(cli("fx", ["transition", file("fx-a.mp4"), file("fx-b.mp4"), file("x.mp4"), "--name", "fade", "--set", "nope=1"]).stderr, /no setting nope/);
+  });
+
+  test("gallery shows every effect and every transition", (t) => {
+    if (!hasRaylib) return t.skip("raylib not included for this system");
+    assert.ok(JSON.parse(ok("fx", ["gallery", file("fx-effects.png")])).count >= 40);
+    const transitions = JSON.parse(ok("fx", ["gallery", file("fx-transitions.png"), "--kind", "transitions", "--input", file("fx-a.mp4")]));
+    assert.ok(transitions.count >= 70 && transitions.made.width > 1000);
+  });
+});
+
 describe("engine", () => {
   test("joEdit uses its own full ffmpeg (no system install needed)", () => {
     assert.match(FFMPEG, /node-av-ffmpeg/);
@@ -1536,7 +1666,7 @@ describe("joedit", () => {
 
   test("every command of every area is reachable through joedit.ts", async () => {
     const help = ok("joedit", []);
-    for (const area of ["picture", "video", "sound", "look", "listen", "graphics", "movie", "voice", "music", "3d"]) {
+    for (const area of ["picture", "video", "sound", "look", "listen", "graphics", "fx", "movie", "voice", "music", "3d"]) {
       const { commands } = await import(`./lib/${area}.ts`);
       for (const [name, command] of Object.entries(commands) as [string, { usage: string }][]) {
         assert.ok(help.includes(`  ${area} ${command.usage}`), `${area} ${name} is missing from node joedit.ts`);

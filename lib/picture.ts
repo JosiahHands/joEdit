@@ -1,7 +1,7 @@
 // Picture editing, built on sharp (libvips: fast, any format) and Skia (text and design).
 // CLI:     node joedit.ts picture <command> <input> <output> [--flags]
 // Library: import { resize } from "./joEdit/picture.ts"
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync } from "node:fs";
 import { dirname, join, parse, resolve } from "node:path";
 import {
   AI_MODELS,
@@ -32,11 +32,12 @@ import {
   TEXT_FLAGS,
   textStyle,
   withTempDir,
+  writeVideo,
   type Brand,
   type Command,
   type TextStyle,
 } from "./shared.ts";
-import * as graphics from "./graphics.ts";
+import * as fx from "./fx.ts";
 import * as video from "./video.ts";
 
 export type PictureInfo = { width: number; height: number; format: string };
@@ -485,90 +486,59 @@ export async function parallax(
       map = join(folder, "depth.png");
       await depth(input, map);
     }
-    // Pictures go into the page as data URLs: WebGL may not read pictures from local files.
-    const asDataUrl = async (file: string, format: string) => {
+    // The picture and its depth map on the GPU (at most 2560 px), drawn by the parallax shader for every frame.
+    const load = async (file: string) => {
       const image = (await openPicture(file)).resize(2560, 2560, { fit: "inside", withoutEnlargement: true });
-      const bytes = format === "jpg" ? await image.flatten().jpeg({ quality: 92 }).toBuffer() : await image.grayscale().png().toBuffer();
-      return `data:image/${format === "jpg" ? "jpeg" : "png"};base64,${bytes.toString("base64")}`;
+      const { data, info } = await image.toColourspace("srgb").ensureAlpha().raw().toBuffer({ resolveWithObject: true }); // always RGBA
+      return { pixels: data, width: info.width, height: info.height };
     };
-    const page = join(folder, "parallax.html");
-    writeFileSync(page, parallaxHtml(await asDataUrl(input, "jpg"), await asDataUrl(map, "png"), motion, amount));
-    const result = await graphics.render(page, output, { duration, width, height, fps });
-    return { ...result, motion };
+    const picture = await load(input);
+    const depthPicture = await load(map); // grey: the shader reads its red
+    // "cover": show the middle of the picture at the frame's shape.
+    const frameShape = width / height;
+    const pictureShape = picture.width / picture.height;
+    const cover = frameShape > pictureShape ? [1, pictureShape / frameShape] : [frameShape / pictureShape, 1];
+    const writer = writeVideo(output, { width, height, fps });
+    const frames = Math.max(1, Math.round(duration * fps));
+    for (let n = 0; n < frames; n++) {
+      const t = Math.min(1, n / fps / duration);
+      const ease = 0.5 - 0.5 * Math.cos(Math.PI * t);
+      let [ox, oy, zoom, focus] = [0, 0, 0.06 * amount, 0.5]; // a little zoom hides the picture's edges
+      if (motion === "dolly") [zoom, focus] = [0.06 * amount + 0.16 * amount * ease, 0.2];
+      if (motion === "orbit") [ox, oy] = [0.03 * amount * Math.sin(2 * Math.PI * t), 0.015 * amount * Math.cos(2 * Math.PI * t)];
+      if (motion === "pan-left") ox = 0.035 * amount * (1 - 2 * ease);
+      if (motion === "pan-right") ox = -0.035 * amount * (1 - 2 * ease);
+      if (motion === "rise") oy = 0.03 * amount * (1 - 2 * ease);
+      if (motion === "fall") oy = -0.03 * amount * (1 - 2 * ease);
+      await writer.write(fx.shaderFrame(PARALLAX_SHADER, width, height, { offset: [ox, oy], cover, zoom, focus }, { image: picture, depth: depthPicture }));
+    }
+    await writer.finish();
+    return { frames, motion };
   });
 }
 
-// The WebGL page for parallax. For every pixel it finds which part of the picture lands there
-// after the camera moves (a few refinement steps), so near and far parts move by different amounts.
-function parallaxHtml(image: string, depthImage: string, motion: string, amount: number): string {
-  return `<!doctype html><html><body style="margin:0;background:#000;overflow:hidden">
-<img id="image" src="${image}" style="display:none"><img id="depth" src="${depthImage}" style="display:none">
-<canvas id="c"></canvas>
-<script>
-const canvas = document.getElementById("c");
-const W = window.joedit.width, H = window.joedit.height;
-canvas.width = W; canvas.height = H;
-const gl = canvas.getContext("webgl", { preserveDrawingBuffer: true });
-const vertex = "attribute vec2 p; varying vec2 uv; void main(){ uv = p * 0.5 + 0.5; uv.y = 1.0 - uv.y; gl_Position = vec4(p, 0.0, 1.0); }";
-const fragment = \`precision highp float;
-varying vec2 uv;
-uniform sampler2D image, depth;
-uniform vec2 offset, cover;
-uniform float zoom, focus;
+// For every pixel, find which part of the picture lands there after the camera moves
+// (a few refinement steps), so near and far parts move by different amounts.
+const PARALLAX_SHADER = `#version 330
+out vec4 finalColor;
+uniform sampler2D image;
+uniform sampler2D depth;
+uniform vec2 resolution;
+uniform vec2 offset;
+uniform vec2 cover;
+uniform float zoom;
+uniform float focus;
 void main() {
-  vec2 screen = 0.5 + (uv - 0.5) * cover;      // fill the frame, keeping the picture's shape
+  vec2 uv = gl_FragCoord.xy / resolution;
+  vec2 screen = 0.5 + (uv - 0.5) * cover;       // fill the frame, keeping the picture's shape
   vec2 s = screen;
   for (int k = 0; k < 8; k++) {
-    float d = texture2D(depth, s).r;             // 1 = near, 0 = far
+    float d = texture(depth, s).r;               // 1 = near, 0 = far
     float z = 1.0 + zoom * (0.25 + 0.75 * d);    // near things grow more when the camera moves in
     s = 0.5 + (screen - 0.5) / z - offset * (d - focus);
   }
-  gl_FragColor = texture2D(image, clamp(s, 0.001, 0.999));
-}\`;
-function shader(type, source) { const s = gl.createShader(type); gl.shaderSource(s, source); gl.compileShader(s); return s; }
-const program = gl.createProgram();
-gl.attachShader(program, shader(gl.VERTEX_SHADER, vertex));
-gl.attachShader(program, shader(gl.FRAGMENT_SHADER, fragment));
-gl.linkProgram(program); gl.useProgram(program);
-gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
-gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW);
-const p = gl.getAttribLocation(program, "p");
-gl.enableVertexAttribArray(p); gl.vertexAttribPointer(p, 2, gl.FLOAT, false, 0, 0);
-function texture(unit, element, name) {
-  gl.activeTexture(gl.TEXTURE0 + unit);
-  gl.bindTexture(gl.TEXTURE_2D, gl.createTexture());
-  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, element);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-  gl.uniform1i(gl.getUniformLocation(program, name), unit);
-}
-const img = document.getElementById("image");
-texture(0, img, "image");
-texture(1, document.getElementById("depth"), "depth");
-// "cover": show the middle of the picture at the frame's shape.
-const frame = W / H, picture = img.naturalWidth / img.naturalHeight;
-gl.uniform2f(gl.getUniformLocation(program, "cover"), frame > picture ? 1 : frame / picture, frame > picture ? picture / frame : 1);
-const motion = ${JSON.stringify(motion)}, amount = ${amount};
-window.joedit.render = (time) => {
-  const t = Math.min(1, time / window.joedit.duration);
-  const ease = 0.5 - 0.5 * Math.cos(Math.PI * t);
-  let ox = 0, oy = 0, zoom = 0.06 * amount, focus = 0.5;   // a little zoom hides the picture's edges
-  if (motion === "dolly") { zoom = 0.06 * amount + 0.16 * amount * ease; focus = 0.2; }
-  if (motion === "orbit") { ox = 0.03 * amount * Math.sin(2 * Math.PI * t); oy = 0.015 * amount * Math.cos(2 * Math.PI * t); }
-  if (motion === "pan-left") ox = 0.035 * amount * (1 - 2 * ease);
-  if (motion === "pan-right") ox = -0.035 * amount * (1 - 2 * ease);
-  if (motion === "rise") oy = 0.03 * amount * (1 - 2 * ease);
-  if (motion === "fall") oy = -0.03 * amount * (1 - 2 * ease);
-  gl.uniform2f(gl.getUniformLocation(program, "offset"), ox, oy);
-  gl.uniform1f(gl.getUniformLocation(program, "zoom"), zoom);
-  gl.uniform1f(gl.getUniformLocation(program, "focus"), focus);
-  gl.viewport(0, 0, W, H);
-  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-};
-</script></body></html>`;
-}
+  finalColor = vec4(texture(image, clamp(s, 0.001, 0.999)).rgb, 1.0);
+}`;
 
 // Change format based on the output file extension (e.g. .png -> .jpg, .webp, .avif).
 export async function convert(input: string, output: string, quality?: number): Promise<void> {
@@ -725,7 +695,7 @@ export const commands: Record<string, Command> = {
     },
   },
   parallax: {
-    usage: `parallax <picture> <output.mp4> [--motion ${PARALLAX_MOTIONS.join("|")}] [--duration 5] [--amount 1] [--depth depth.png] [--width 1920] [--height 1080] [--fps 30]  (needs: install depth, Chrome)`,
+    usage: `parallax <picture> <output.mp4> [--motion ${PARALLAX_MOTIONS.join("|")}] [--duration 5] [--amount 1] [--depth depth.png] [--width 1920] [--height 1080] [--fps 30]  (3D camera move from a depth map, on the GPU; needs: install depth)`,
     run: (a) => {
       const { input, output } = inOut(a);
       return parallax(input, output, {

@@ -37,10 +37,10 @@ import * as listen from "./listen.ts";
 import * as video from "./video.ts";
 
 // A picture to put on a board: RGBA pixels and a label.
-type Tile = { pixels: Buffer; width: number; height: number; label: string };
+export type Tile = { pixels: Buffer; width: number; height: number; label: string };
 
 // Lay tiles out in a grid on a dark background, each labelled underneath, with a title on top.
-async function board(tiles: Tile[], columns: number, output: string, title?: string): Promise<void> {
+export async function board(tiles: Tile[], columns: number, output: string, title?: string): Promise<void> {
   const { createCanvas, ImageData } = await skia();
   const gap = 8;
   const labelHeight = 22;
@@ -68,7 +68,7 @@ async function board(tiles: Tile[], columns: number, output: string, title?: str
 
 // A picture file as a tile, scaled to `width`.
 async function pictureTile(file: string, width: number, label: string): Promise<Tile> {
-  const { data, info } = await (await openPicture(file)).resize(width).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+  const { data, info } = await (await openPicture(file)).resize(width).toColourspace("srgb").ensureAlpha().raw().toBuffer({ resolveWithObject: true });
   return { pixels: data, width: info.width, height: info.height, label };
 }
 
@@ -133,9 +133,9 @@ export function scenes(input: string, threshold = 0.3): { cuts: number[]; count:
 // difference: 0 = identical, 1 = completely different.
 export async function compare(first: string, second: string, output: string): Promise<{ difference: number; same: boolean }> {
   // Both as RGBA pixels at the first picture's size (so pictures of different sizes can be compared).
-  const a = await (await openPicture(first)).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+  const a = await (await openPicture(first)).toColourspace("srgb").ensureAlpha().raw().toBuffer({ resolveWithObject: true });
   const { width, height } = a.info;
-  const b = await (await openPicture(second)).resize(width, height, { fit: "fill" }).ensureAlpha().raw().toBuffer();
+  const b = await (await openPicture(second)).resize(width, height, { fit: "fill" }).toColourspace("srgb").ensureAlpha().raw().toBuffer();
 
   // Root-mean-square difference of red, green and blue, from 0 to 1.
   // The differences panel is the first picture faded out, with changed pixels in red.
@@ -322,7 +322,7 @@ export async function colors(input: string, count = 6, swatch?: string) {
   // The pixels to read: a small copy of the picture, or 6 frames from across a video.
   let pixels: Buffer[] = [];
   if (PICTURE_FILE.test(input)) {
-    pixels.push(await (await openPicture(input)).resize(200, 200, { fit: "inside" }).removeAlpha().ensureAlpha().raw().toBuffer());
+    pixels.push(await (await openPicture(input)).resize(200, 200, { fit: "inside" }).removeAlpha().toColourspace("srgb").ensureAlpha().raw().toBuffer());
   } else {
     const length = requireVideo(input).duration;
     const times = Array.from({ length: 6 }, (_, n) => ((n + 0.5) * length) / 6);

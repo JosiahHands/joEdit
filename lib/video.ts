@@ -258,7 +258,7 @@ export function effects(input: string, output: string, chosen: Effects): void {
 export async function captions(
   input: string,
   output: string,
-  options: { transcript?: string; style?: graphics.CaptionStyle; position?: string; model?: string; brand?: string } = {},
+  options: { transcript?: string; style?: graphics.CaptionStyle; position?: string; model?: string; brand?: string; speakers?: boolean } = {},
 ): Promise<{ words: number; groups: number }> {
   const details = info(input);
   if (!details.width) throw new Error("This file has no picture to put captions on.");
@@ -279,6 +279,7 @@ export async function captions(
       style: options.style,
       position: options.position,
       brand: loadBrand(options.brand),
+      speakerColors: options.speakers,
     });
     ffmpeg([
       "-i", input, "-i", overlay,
@@ -674,7 +675,7 @@ export const commands: Record<string, Command> = {
     },
   },
   captions: {
-    usage: "captions <input> <output> [--transcript words.json] [--style karaoke|pop|bold|minimal] [--position bottom|center|top] [--brand brand.json] [--model base]",
+    usage: "captions <input> <output> [--transcript words.json] [--style karaoke|pop|bold|minimal] [--position bottom|center|top] [--speakers] [--brand brand.json] [--model base]  (--speakers: a color per speaker; use a transcript from listen speakers)",
     run: (a) => {
       const { input, output } = inOut(a);
       return captions(input, output, {
@@ -683,6 +684,7 @@ export const commands: Record<string, Command> = {
         position: a.flags.position,
         model: a.flags.model,
         brand: a.flags.brand,
+        speakers: a.flags.speakers === "true",
       });
     },
   },

@@ -6,7 +6,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, readdirSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import {
-  ASSETS,
+  FONTS,
   LIB,
   ffmpeg,
   inOut,
@@ -75,7 +75,7 @@ export function render(script: string, output: string, options: RenderOptions = 
     const frameFolder = join(folder, "frames");
     writeFileSync(settings, JSON.stringify({
       script: resolve(script), folder: frameFolder, width, height, fps, frames, engine, samples,
-      transparent: options.transparent ?? false, fonts: join(ASSETS, "fonts"), still: still ? frames : 0,
+      transparent: options.transparent ?? false, fonts: FONTS, still: still ? frames : 0,
     }));
     const blender = spawnSync(
       findBlender(),

@@ -1,5 +1,5 @@
 // joEdit: one entry point for every tool.
-// Usage: node joedit.ts <area> <command> ...   (areas: picture, video, sound, look, listen, graphics, movie, voice, music, 3d)
+// Usage: node joedit.ts <area> <command> ...   (areas: picture, video, sound, look, listen, graphics, fx, movie, voice, music, 3d)
 //        node joedit.ts doctor | check <file> | packs | install <pack or asset>
 //        node joedit.ts            (lists every command)
 // This file also holds the top-level commands: doctor and check.
@@ -24,6 +24,7 @@ import {
   runCli,
   type Command,
 } from "./shared.ts";
+import * as fx from "./fx.ts";
 import * as graphics from "./graphics.ts";
 import * as listen from "./listen.ts";
 import * as threeD from "./3d.ts";
@@ -43,6 +44,7 @@ const areas: Record<string, Record<string, Command>> = {
   look: look.commands,
   listen: listen.commands,
   graphics: graphics.commands,
+  fx: fx.commands,
   movie: movie.commands,
   voice: voice.commands,
   music: music.commands,
@@ -69,12 +71,13 @@ function gpu(): string {
   return nvidia ? `NVIDIA ${nvidia}` : "none found (AI packs will run on the CPU, slower)";
 }
 
-// Chrome draws graphics, titles and captions.
+// Chrome renders HTML pages (graphics render/still, movie scenes with "html"). Titles, captions and canvas use Skia.
 function chrome(): Tool {
+  const neededFor = "HTML pages: graphics render and still, movie scenes with \"html\"";
   try {
-    return { name: "chrome", found: true, version: graphics.findChrome(), neededFor: "graphics, titles, captions, movie" };
+    return { name: "chrome", found: true, version: graphics.findChrome(), neededFor, optional: true };
   } catch {
-    return { name: "chrome", found: false, neededFor: "graphics, titles, captions, movie", fix: "install Google Chrome, or: node joedit.ts install browser" };
+    return { name: "chrome", found: false, neededFor, optional: true, fix: "install Google Chrome, or: node joedit.ts install browser" };
   }
 }
 
@@ -88,7 +91,8 @@ const LIBRARIES = [
   { name: "@huggingface/transformers", does: "local AI models: speech to text, depth, search by meaning" },
   { name: "onnxruntime-node", does: "runs AI models (cutout and more)" },
   { name: "kokoro-js", does: "natural voices" },
-  { name: "koffi", does: "loads raylib for GPU effects, transitions and shaders" },
+  { name: "koffi", does: "loads raylib (libs/raylib) for GPU effects, transitions and shaders" },
+  { name: "gl-transitions", does: "transition shaders for fx and movies" },
   { name: "spessasynth_core", does: "plays MIDI scores with the instruments SoundFont (music compose)" },
 ];
 
@@ -126,12 +130,19 @@ export function doctor() {
       found: existsSync(DEFAULT_FONT),
       version: DEFAULT_FONT,
       neededFor: "text and labels",
-      fix: existsSync(DEFAULT_FONT) ? undefined : "node joedit.ts install fonts",
+      fix: existsSync(DEFAULT_FONT) ? undefined : `the fonts come with joEdit in ${join(LIBS, "fonts")}: restore that folder`,
     },
-    chrome(),
+    {
+      name: "raylib",
+      found: existsSync(fx.raylibFile()),
+      version: fx.raylibFile(),
+      neededFor: "fx (GPU effects, particles, transitions, LUTs)",
+      fix: existsSync(fx.raylibFile()) ? undefined : `joEdit includes raylib for macOS; on this system place raylib 6 at ${fx.raylibFile()}`,
+    },
   ];
   // Outside programs that unlock extra areas. Install one only when a task needs it.
   const optional: Tool[] = [
+    chrome(),
     tool("blender", ["--version"], "3d (Blender scenes, 3D titles, turntables)", mac ? "brew install --cask blender" : "install Blender: https://www.blender.org/download/"),
     tool("uv", ["--version"], "Python AI packs: song, image, clone, stems, videogen", mac ? "brew install uv" : "curl -LsSf https://astral.sh/uv/install.sh | sh"),
   ];

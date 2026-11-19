@@ -8,13 +8,15 @@
     "@napi-rs/canvas": "^1.1.1",
     "@seydx/node-av-ffmpeg": "^7.1.0",
     "espeak-ng": "1.0.2",
+    "gl-transitions": "1.43.0",
     "koffi": "^3.3.8",
     "kokoro-js": "^1.2.1",
     "node-av": "^7.1.0",
     "node-web-audio-api": "^2.2.0",
     "onnxruntime-node": "1.30.0",
     "sharp": "^0.35.5",
-    "spessasynth_core": "^4.4.10"
+    "spessasynth_core": "^4.4.10",
+    "three": "0.180.0"
   },
   "overrides": {
     "kokoro-js": {
