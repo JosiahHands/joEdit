@@ -11,8 +11,9 @@ import * as picture from "./lib/picture.ts";
 import * as video from "./lib/video.ts";
 import * as sound from "./lib/sound.ts";
 import * as graphics from "./lib/graphics.ts";
+import * as threeD from "./lib/3d.ts";
 
-type Tool = "picture" | "video" | "sound" | "look" | "listen" | "graphics" | "movie" | "voice" | "music" | "joedit";
+type Tool = "picture" | "video" | "sound" | "look" | "listen" | "graphics" | "movie" | "voice" | "music" | "3d" | "joedit";
 
 // Graphics tests need Chrome; they are skipped on machines without it.
 const hasChrome = (() => {
@@ -30,6 +31,15 @@ function hasPack(name: string): boolean {
 }
 const hasWhisper = () => hasPack("whisper");
 const hasAsset = (name: string) => existsSync(join("lib", ".assets", name));
+
+// 3D tests need Blender; they are skipped on machines without it.
+const hasBlender = (() => {
+  try {
+    return Boolean(threeD.findBlender());
+  } catch {
+    return false;
+  }
+})();
 
 const dir = mkdtempSync(join(tmpdir(), "editor-test-"));
 const file = (name: string) => join(dir, name);
@@ -811,6 +821,52 @@ describe("graphics", () => {
   });
 });
 
+describe("3d", () => {
+  test("title renders 3D letters at the asked size", (t) => {
+    if (!hasBlender) return t.skip("Blender not found");
+    const result = JSON.parse(ok("3d", ["title", file("title3d.png"), "--text", "HELLO", "--width", "320", "--height", "180"]));
+    assert.equal(result.output, file("title3d.png"));
+    assert.deepEqual(picture.info(file("title3d.png")), { width: 320, height: 180, format: "PNG" });
+    // The letters in the middle are brighter than the dark background in the corner.
+    const brightness = (region: string) => Number(execFileSync("magick", [file("title3d.png"), "-crop", region, "+repage", "-format", "%[fx:mean]", "info:"], { encoding: "utf8" }));
+    assert.ok(brightness("120x40+100+50") > brightness("40x30+0+0") + 0.05);
+    assert.equal(cli("3d", ["title", file("x.png")]).code, 1); // no --text
+  });
+
+  test("render runs a scene script and animates it", (t) => {
+    if (!hasBlender) return t.skip("Blender not found");
+    writeFileSync(file("scene.py"), [
+      'ball = shape("sphere", size=1, material=material("#FF3B30"))',
+      "keyframe(ball, \"location\", {1: (-2, 0, 0.5), FRAMES: (2, 0, 0.5)})",
+    ].join("\n"));
+    const result = JSON.parse(ok("3d", ["render", file("scene.py"), file("scene.mp4"), "--duration", "0.5", "--width", "320", "--height", "180", "--draft"]));
+    assert.equal(result.frames, 15);
+    const details = video.info(file("scene.mp4"));
+    assert.deepEqual([details.width, details.height], [160, 90]); // draft = half size
+    frameAt(file("scene.mp4"), 0, file("scene-start.png"));
+    frameAt(file("scene.mp4"), 0.45, file("scene-end.png"));
+    assert.ok(regionDiff(file("scene-start.png"), file("scene-end.png"), "160x90+0+0") > 0.02);
+  });
+
+  test("a broken scene script reports its own line", (t) => {
+    if (!hasBlender) return t.skip("Blender not found");
+    writeFileSync(file("broken.py"), 'shape("pyramid")\n');
+    const result = cli("3d", ["render", file("broken.py"), file("x.png")]);
+    assert.equal(result.code, 1);
+    assert.match(result.stderr, /broken\.py", line 1/);
+    assert.match(result.stderr, /Unknown shape 'pyramid'/);
+  });
+
+  test("turntable spins a model", (t) => {
+    if (!hasBlender) return t.skip("Blender not found");
+    // A small pyramid written by hand as an .obj model.
+    writeFileSync(file("pyramid.obj"), ["v -1 -1 0", "v 1 -1 0", "v 1 1 0", "v -1 1 0", "v 0 0 1.5", "f 1 2 5", "f 2 3 5", "f 3 4 5", "f 4 1 5", "f 1 4 3 2"].join("\n"));
+    const result = JSON.parse(ok("3d", ["turntable", file("pyramid.obj"), file("turn.mp4"), "--duration", "1", "--width", "320", "--height", "180", "--draft"]));
+    assert.equal(result.frames, 30);
+    near(video.info(file("turn.mp4")).duration, 1, 0.1);
+  });
+});
+
 describe("sound", () => {
   test("tone creates a sound", () => {
     ok("sound", ["tone", file("tone.wav"), "--frequency", "440", "--duration", "2"]);
@@ -1128,5 +1184,15 @@ describe("joedit", () => {
     const result = cli("joedit", ["install", "nope"]);
     assert.equal(result.code, 1);
     assert.match(result.stderr, /Available packs: .*whisper/);
+  });
+
+  test("every command of every area is reachable through joedit.ts", async () => {
+    const help = ok("joedit", []);
+    for (const area of ["picture", "video", "sound", "look", "listen", "graphics", "movie", "voice", "music", "3d"]) {
+      const { commands } = await import(`./lib/${area}.ts`);
+      for (const [name, command] of Object.entries(commands) as [string, { usage: string }][]) {
+        assert.ok(help.includes(`  ${area} ${command.usage}`), `${area} ${name} is missing from node joedit.ts`);
+      }
+    }
   });
 });

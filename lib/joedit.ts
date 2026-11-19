@@ -1,5 +1,5 @@
 // joEdit: one entry point for every tool.
-// Usage: node joedit.ts <area> <command> ...   (areas: picture, video, sound, look, listen, graphics, movie, voice, music)
+// Usage: node joedit.ts <area> <command> ...   (areas: picture, video, sound, look, listen, graphics, movie, voice, music, 3d)
 //        node joedit.ts doctor | check <file> | packs | install <pack or asset>
 //        node joedit.ts            (lists every command)
 // This file also holds the top-level commands: doctor and check.
@@ -21,6 +21,7 @@ import {
 } from "./shared.ts";
 import * as graphics from "./graphics.ts";
 import * as listen from "./listen.ts";
+import * as threeD from "./3d.ts";
 import * as look from "./look.ts";
 import * as movie from "./movie.ts";
 import * as music from "./music.ts";
@@ -40,6 +41,7 @@ const areas: Record<string, Record<string, Command>> = {
   movie: movie.commands,
   voice: voice.commands,
   music: music.commands,
+  "3d": threeD.commands,
 };
 
 // ---------- doctor: is this computer ready? ----------
@@ -117,7 +119,11 @@ export function doctor() {
     },
     packs: listPacks(),
     assets: listAssets(),
-    next: ready ? "Everything needed is installed. Read AGENTS.md to start." : "Install the missing tools (see 'fix'), then run doctor again.",
+    next: [
+      ready ? "Everything needed is installed. Read AGENTS.md to start." : "Install the missing tools (see 'fix'), then run doctor again.",
+      "Optional tools (marked optional) unlock more areas, e.g. Blender for 3d.",
+      "AI packs and assets that are not installed yet: node joedit.ts install <name> (each lists what it is for).",
+    ].join(" "),
   };
 }
 

@@ -221,7 +221,7 @@ export async function withPage<T>(file: string, options: PageOptions, work: (pag
 // ---------- Rendering ----------
 
 // ffmpeg settings for the output type. Transparent video needs .mov or .webm.
-function encoderArgs(output: string, transparent: boolean): string[] {
+export function encoderArgs(output: string, transparent: boolean): string[] {
   const type = output.toLowerCase().split(".").pop();
   if (type === "mov") return transparent ? ["-c:v", "prores_ks", "-profile:v", "4444", "-pix_fmt", "yuva444p10le"] : ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18"];
   if (type === "webm") return ["-c:v", "libvpx-vp9", "-b:v", "0", "-crf", "30", "-pix_fmt", transparent ? "yuva420p" : "yuv420p"];

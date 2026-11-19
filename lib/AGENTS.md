@@ -3,7 +3,7 @@
 joEdit is a toolkit for editing pictures, video and sound, making motion graphics, and **seeing and hearing the results**. It runs entirely on this computer: no API keys, no cost per edit. Use it however suits the job: one command at a time, chained in a script, or imported as TypeScript functions. When joEdit doesn't do something, `ffmpeg`, `ffprobe` and `magick` are installed too, so call them directly or extend joEdit.
 
 ```
-node joedit.ts <area> <command> ...      areas: picture, video, sound, look, listen, graphics, movie, voice, music
+node joedit.ts <area> <command> ...      areas: picture, video, sound, look, listen, graphics, movie, voice, music, 3d
 node joedit.ts                           prints every command
 node joedit.ts doctor                    shows what this computer has installed
 ```
@@ -119,6 +119,9 @@ Anything a web page can draw can become video: CSS animations and transitions, t
 - Fonts: Inter, Montserrat, Bebas Neue, Playfair Display and JetBrains Mono are available by name once `install fonts` has run.
 - `--transparent` with a `.mov` (ProRes 4444) or `.webm` output keeps a see-through background, ready to lay over video (`ffmpeg ... overlay`).
 - `still` at a few times is a fast way to check a design before rendering the whole thing.
+- Real-time 3D in a page: `install three`, copy it next to the page (`cp -r joEdit/.assets/three .`), then
+  `<script type="importmap">{"imports": {"three": "./three/three.module.js", "three/addons/": "./three/addons/"}}</script>` and
+  `import * as THREE from "three"` / `import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js"` in a `<script type="module">`. Create the renderer with `preserveDrawingBuffer: true` and draw in `window.joedit.render`. Top-level `await` (loading models) finishes before the first frame.
 
 **look**: pictures of video, to read
 ```
@@ -180,6 +183,43 @@ A score is JSON. You decide every note, so the music fits the film exactly (leng
 - Ideas: start sparse and add parts every 8 bars to build energy; set `tempo` so that 1 bar = a scene length; make the score exactly as long as the film (`bars` = seconds × tempo / 60 / 4). `.mid` output opens in any music app.
 - `song` (`install song`, ACE-Step 1.5, ~10 GB of models) makes a full produced song: describe genre, mood, instruments and voice in `--prompt`; lyrics use section tags like `[verse]`, `[chorus]`, `[bridge]`. Without lyrics it is instrumental. Same `--seed` = same song. Takes a minute or two on Apple Silicon or an NVIDIA GPU. To check the singing (or time lyric captions), split it first: `voice stems song.wav stems --only vocals`, then `listen transcribe stems/vocals.wav words.json`; speech-to-text hears sung words much better without the band.
 
+**3d**: real 3D scenes rendered by Blender (free; `doctor` shows how to install it)
+```
+render <scene.py> <out.mp4|.mov|.webm|.png> [--duration 4] [--frame 1] [--width 1920] [--height 1080] [--fps 30]
+       [--engine eevee|cycles] [--samples N] [--draft] [--transparent]
+title <out.mp4|.png> --text "TITLE" [--subtitle "..."] [--color "#hex"] [--background "#hex"] [--font BebasNeue] [--brand brand.json] [--duration 4]
+turntable <model.glb|.gltf|.obj|.fbx|.stl|.ply> <out.mp4> [--duration 6] [--turns 1] [--background "#hex"]
+```
+A scene is a short Python script. It starts with a dark sky, a camera looking at the middle and soft studio lights (each replaced as soon as your script makes its own), and has these ready to use:
+```python
+shape(kind, location=(0,0,0), size=1, rotation=(0,0,0), material=None, bevel=0)   # cube sphere cylinder cone torus plane monkey
+text3d(text, size=1, depth=0.15, bevel=0.02, font="BebasNeue", material=None, location=(0,0,0), rotation=(90,0,0))
+load(path, size=2.0, location=(0,0,0))     # import a model, scaled to `size` meters and standing on the ground
+material(color="#FFFFFF", metal=0, rough=0.4, glow=0, glass=False)
+ground(color, reflect=0, shadow_only=False)   sky(color, top=None, strength=1)
+studio_light(style="soft")                 # soft bright dramatic sunset cool
+camera(location=(0,-8,2), target=(0,0,0.5), lens=50)
+orbit_camera(target, radius=8, height=2, turns=1)
+keyframe(obj, "location" | "rotation_euler" | "scale", {1: value, seconds(2): value}, ease=True)
+FPS, FRAMES, WIDTH, HEIGHT, seconds(s), hex_color("#hex"), bpy   # bpy = all of Blender's Python API
+```
+Example scene, a gold ball dropping next to a slowly turning glass cube:
+```python
+sky("#0E1A2B", top="#2B4C7E")
+ground("#0E1A2B", reflect=0.4)
+ball = shape("sphere", location=(-1.2, 0, 0.5), material=material("#E8B04A", metal=1, rough=0.2))
+cube = shape("cube", location=(1.2, 0, 0.5), material=material("#9AD1FF", glass=True), bevel=0.05)
+keyframe(ball, "location", {1: (-1.2, 0, 3), seconds(1): (-1.2, 0, 0.5)})
+keyframe(cube, "rotation_euler", {1: (0, 0, 0), FRAMES: (0, 0, 180)}, ease=False)
+studio_light("sunset")
+orbit_camera(radius=7, height=2.5, turns=0.25)
+```
+- Units are meters (things about 1–3 m across look right with the default camera), angles are degrees, Z is up, the camera looks toward +Y.
+- `eevee` renders in seconds and looks great. `cycles` traces real light (glass, caustics, soft shadows); its first render on a machine compiles GPU code for a few minutes, after that it is quick. `--draft` (half size, few samples) is for checking motion; `render` to a `.png` with `--frame N` checks one moment.
+- An error in the script comes back with the script's own line number.
+- `--transparent` with `.mov`, `.webm` or `.png` keeps only the objects, ready to lay over video (with `--engine cycles`, `ground(shadow_only=True)` keeps their shadows too).
+- Ideas: 3D logo reveals (`title`), product spins from a model (`turntable`), charts as 3D bars (`shape("cube")` scaled by data), a generated picture on a `plane` as a backdrop, exporting what you build (`bpy.ops.export_scene.gltf(filepath=...)`) for Three.js pages.
+
 **movie**: a whole film from one JSON file
 ```
 render <movie.json> <out.mp4> [--draft]     → duration, scenes rendered/cached, time taken, and a quality check
@@ -232,9 +272,9 @@ A movie file describes the film; joEdit does the cutting, transitions, text, sou
 doctor                                      installed tools, machine, packs
 check <file>                                quality report with fix commands
 packs                                       available AI packs and assets, and whether they are installed
-install <name>                              a pack (needs uv) or an asset (fonts, browser)
+install <name>                              a pack (needs uv) or an asset (fonts, instruments, upscaler, three, browser)
 ```
-Packs: `whisper` (speech to text), `tts` (speak), `clone` (voice cloning), `stems` (music separation), `song` (AI songs), `image` (picture generate), `cutout` (backgrounds, follow), `depth` (depth maps, parallax), `vision` (look find), `videogen` (video generate, big GPU). Assets: `fonts`, `instruments` (sounds for music compose), `upscaler`, `browser`. Each installs once (a few minutes, mostly downloading) and then runs offline; the first use of each also downloads its model.
+Packs: `whisper` (speech to text), `tts` (speak), `clone` (voice cloning), `stems` (music separation), `song` (AI songs), `image` (picture generate), `cutout` (backgrounds, follow), `depth` (depth maps, parallax), `vision` (look find), `videogen` (video generate, big GPU). Assets: `fonts`, `instruments` (sounds for music compose), `upscaler`, `three` (Three.js for 3D pages), `browser`. Each installs once (a few minutes, mostly downloading) and then runs offline; the first use of each also downloads its model.
 
 ## Examples
 Ideas for combining commands, not fixed recipes.

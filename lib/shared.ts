@@ -277,6 +277,7 @@ export type Asset = {
 };
 
 const GOOGLE_FONTS = "https://github.com/google/fonts/raw/main/ofl";
+const THREE = "https://cdn.jsdelivr.net/npm/three@0.180.0";
 
 export const ASSET_LIST: Asset[] = [
   {
@@ -296,6 +297,17 @@ export const ASSET_LIST: Asset[] = [
     description: "GeneralUser GS: 259 instrument sounds (piano, strings, drums, synths …) for music compose. 32 MB.",
     license: "GeneralUser GS License v2.0 (free for any use)",
     files: [{ url: "https://raw.githubusercontent.com/mrbumpy409/GeneralUser-GS/main/GeneralUser-GS.sf2", path: "GeneralUser-GS.sf2" }],
+  },
+  {
+    name: "three",
+    description: "Three.js 0.180 (real-time 3D for graphics pages) with the glTF model loader. 2 MB.",
+    license: "MIT",
+    files: [
+      { url: `${THREE}/build/three.module.js`, path: "three.module.js" },
+      { url: `${THREE}/build/three.core.js`, path: "three.core.js" },
+      { url: `${THREE}/examples/jsm/loaders/GLTFLoader.js`, path: "addons/loaders/GLTFLoader.js" },
+      { url: `${THREE}/examples/jsm/utils/BufferGeometryUtils.js`, path: "addons/utils/BufferGeometryUtils.js" },
+    ],
   },
   {
     name: "upscaler",
@@ -349,6 +361,7 @@ export async function installAsset(name: string): Promise<{ asset: string; insta
     const response = await fetch(file.url);
     if (!response.ok) throw new Error(`Download failed (${response.status}): ${file.url}`);
     const target = join(folder, file.path);
+    mkdirSync(dirname(target), { recursive: true }); // paths may include sub-folders
     writeFileSync(target, Buffer.from(await response.arrayBuffer()));
     if (file.unzip) {
       run("unzip", ["-o", "-q", target, "-d", folder]);
