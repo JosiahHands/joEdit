@@ -12,6 +12,7 @@ import {
   stringFlag,
   type Command,
 } from "./shared.ts";
+import * as video from "./video.ts";
 
 export type PictureInfo = { width: number; height: number; format: string };
 
@@ -168,6 +169,21 @@ export const commands: Record<string, Command> = {
         optionalNumberFlag(a, "size", 32),
         a.flags.color ?? "white",
       );
+    },
+  },
+  // Looks and effects are shared with video.ts (ffmpeg works on single pictures too).
+  grade: {
+    usage: "grade <input> <output> --look cinematic|teal-orange|noir|vintage|warm|cool|bleach|vivid [--strength 0..1]",
+    run: (a) => {
+      const { input, output } = inOut(a);
+      video.grade(input, output, stringFlag(a, "look"), optionalNumberFlag(a, "strength", 1));
+    },
+  },
+  effects: {
+    usage: "effects <input> <output> [--grain 0..1] [--vignette 0..1] [--letterbox 2.39] [--glow 0..1] [--chromatic PX] [--sharpen 0..1]",
+    run: (a) => {
+      const { input, output } = inOut(a);
+      video.effects(input, output, video.effectFlags(a));
     },
   },
   convert: {

@@ -1,6 +1,6 @@
 // joEdit: one entry point for every tool.
-// Usage: node joedit.ts <area> <command> ...   (areas: picture, video, sound, look, listen)
-//        node joedit.ts doctor | check <file> | packs | install <pack>
+// Usage: node joedit.ts <area> <command> ...   (areas: picture, video, sound, look, listen, graphics)
+//        node joedit.ts doctor | check <file> | packs | install <pack or asset>
 //        node joedit.ts            (lists every command)
 // This file also holds the top-level commands: doctor and check.
 import { cpus, totalmem } from "node:os";
@@ -9,7 +9,8 @@ import {
   DEFAULT_FONT,
   analyze,
   formatTime,
-  installPack,
+  install,
+  listAssets,
   listPacks,
   probe,
   requireFile,
@@ -18,6 +19,7 @@ import {
   runCli,
   type Command,
 } from "./shared.ts";
+import * as graphics from "./graphics.ts";
 import * as listen from "./listen.ts";
 import * as look from "./look.ts";
 import * as picture from "./picture.ts";
@@ -31,11 +33,12 @@ const areas: Record<string, Record<string, Command>> = {
   sound: sound.commands,
   look: look.commands,
   listen: listen.commands,
+  graphics: graphics.commands,
 };
 
 // ---------- doctor: is this computer ready? ----------
 
-type Tool = { name: string; found: boolean; version?: string; neededFor: string; fix?: string };
+type Tool = { name: string; found: boolean; version?: string; neededFor: string; optional?: boolean; fix?: string };
 
 // First line of a program's version text, or "" if the program is missing.
 function versionOf(program: string, args: string[]): string {
@@ -47,10 +50,19 @@ function versionOf(program: string, args: string[]): string {
 }
 
 // Describe the graphics chip, which decides how fast AI packs can run.
-function graphics(): string {
+function gpu(): string {
   if (process.platform === "darwin" && process.arch === "arm64") return "Apple Silicon (fast for AI packs)";
   const nvidia = versionOf("nvidia-smi", ["--query-gpu=name", "--format=csv,noheader"]);
   return nvidia ? `NVIDIA ${nvidia}` : "none found (AI packs will run on the CPU, slower)";
+}
+
+// Chrome draws graphics, titles and captions.
+function chrome(): Tool {
+  try {
+    return { name: "chrome", found: true, version: graphics.findChrome(), neededFor: "graphics, titles, captions, movie" };
+  } catch {
+    return { name: "chrome", found: false, neededFor: "graphics, titles, captions, movie", fix: "install Google Chrome, or: node joedit.ts install browser" };
+  }
 }
 
 // Check everything joEdit needs and say exactly how to install what is missing.
@@ -78,12 +90,15 @@ export function doctor() {
       found: existsSync(DEFAULT_FONT),
       version: DEFAULT_FONT,
       neededFor: "text and labels",
-      fix: existsSync(DEFAULT_FONT) ? undefined : "change DEFAULT_FONT in shared.ts to a .ttf font on this computer",
+      fix: existsSync(DEFAULT_FONT) ? undefined : "node joedit.ts install fonts",
     },
-    tool("uv", ["--version"], "AI packs (optional)", mac ? "brew install uv" : "curl -LsSf https://astral.sh/uv/install.sh | sh"),
+    chrome(),
+    { ...tool("uv", ["--version"], "AI packs", mac ? "brew install uv" : "curl -LsSf https://astral.sh/uv/install.sh | sh"), optional: true },
+    { ...tool("fluidsynth", ["--version"], "music compose", mac ? "brew install fluid-synth" : "sudo apt install fluidsynth"), optional: true },
+    { ...tool("blender", ["--version"], "3d", mac ? "brew install --cask blender" : "install Blender: https://www.blender.org/download/"), optional: true },
   ];
 
-  const ready = tools.filter((t) => t.name !== "uv").every((t) => t.found);
+  const ready = tools.filter((t) => !t.optional).every((t) => t.found);
   return {
     ready,
     tools,
@@ -92,9 +107,10 @@ export function doctor() {
       cpu: cpus()[0]?.model ?? "unknown",
       cores: cpus().length,
       memoryGB: round(totalmem() / 1024 ** 3, 1),
-      graphics: graphics(),
+      gpu: gpu(),
     },
     packs: listPacks(),
+    assets: listAssets(),
     next: ready ? "Everything needed is installed. Read AGENTS.md to start." : "Install the missing tools (see 'fix'), then run doctor again.",
   };
 }
@@ -176,8 +192,8 @@ export function check(file: string): Report {
 const tools: Record<string, Command> = {
   doctor: { usage: "doctor", run: () => doctor() },
   check: { usage: "check <file>", run: (a) => check(requireFile(a.positional[0])) },
-  packs: { usage: "packs", run: () => ({ packs: listPacks() }) },
-  install: { usage: "install <pack>", run: (a) => installPack(a.positional[0] ?? "") },
+  packs: { usage: "packs", run: () => ({ packs: listPacks(), assets: listAssets() }) },
+  install: { usage: "install <pack or asset>", run: (a) => install(a.positional[0] ?? "") },
 };
 
 // The full command list, one line each.

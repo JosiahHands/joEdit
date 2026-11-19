@@ -2,7 +2,7 @@
 // Tests for every joEdit CLI: picture, video, sound, look, listen and joedit (doctor, check, packs).
 // Run with: node --test test.ts   (run `npm install` in lib/ first, for editor types)
 import { spawnSync, execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test, before, after, describe } from "node:test";
@@ -10,8 +10,24 @@ import assert from "node:assert/strict";
 import * as picture from "./lib/picture.ts";
 import * as video from "./lib/video.ts";
 import * as sound from "./lib/sound.ts";
+import * as graphics from "./lib/graphics.ts";
 
-type Tool = "picture" | "video" | "sound" | "look" | "listen" | "joedit";
+type Tool = "picture" | "video" | "sound" | "look" | "listen" | "graphics" | "joedit";
+
+// Graphics tests need Chrome; they are skipped on machines without it.
+const hasChrome = (() => {
+  try {
+    return Boolean(graphics.findChrome());
+  } catch {
+    return false;
+  }
+})();
+
+// Captions need the whisper pack (to find word times) and Chrome.
+function hasWhisper(): boolean {
+  const packs = JSON.parse(ok("joedit", ["packs"])).packs;
+  return Boolean(packs.find((p: any) => p.name === "whisper")?.installed);
+}
 
 const dir = mkdtempSync(join(tmpdir(), "editor-test-"));
 const file = (name: string) => join(dir, name);
@@ -38,6 +54,22 @@ function pixel(path: string, x: number, y: number): string {
 // Average brightness from 0 to 1.
 function mean(path: string): number {
   return Number(execFileSync("magick", [path, "-format", "%[fx:mean]", "info:"], { encoding: "utf8" }));
+}
+
+// Durations are checked with a small tolerance because of how video frames and audio samples line up.
+function near(actual: number, expected: number, tolerance = 0.15): void {
+  assert.ok(Math.abs(actual - expected) <= tolerance, `expected ~${expected}, got ${actual}`);
+}
+
+// Save the video frame at `time` seconds as a picture.
+function frameAt(path: string, time: number, output: string): void {
+  execFileSync("ffmpeg", ["-loglevel", "error", "-y", "-ss", String(time), "-i", path, "-frames:v", "1", output]);
+}
+
+// How different the same region (e.g. "320x100+0+0") is in two pictures: 0 = same, 1 = opposite.
+function regionDiff(a: string, b: string, region: string): number {
+  const result = spawnSync("magick", ["compare", "-metric", "RMSE", "(", a, "-crop", region, ")", "(", b, "-crop", region, ")", "null:"], { encoding: "utf8" });
+  return Number(result.stderr.match(/\(([\d.e-]+)\)/)?.[1] ?? NaN);
 }
 
 // Average loudness in dB (closer to 0 = louder). `seconds` limits it to the start of the file.
@@ -171,6 +203,23 @@ describe("picture", () => {
     assert.equal(picture.info(file("out.jpg")).format, "JPEG");
   });
 
+  test("grade noir makes a red picture gray", () => {
+    ok("picture", ["grade", file("in.png"), file("noir.png"), "--look", "noir"]);
+    const [r, g, b] = pixel(file("noir.png"), 10, 290).match(/[\d.]+/g)!.map(Number);
+    assert.ok(Math.abs(r - g) < 3 && Math.abs(g - b) < 3, `not gray: ${r},${g},${b}`);
+    assert.equal(cli("picture", ["grade", file("in.png"), file("x.png"), "--look", "disco"]).code, 1);
+  });
+
+  test("effects: letterbox bars and vignette corners", () => {
+    ok("picture", ["effects", file("in.png"), file("fx.png"), "--letterbox", "2.39", "--vignette", "0.8"]);
+    assert.deepEqual(picture.info(file("fx.png")), { width: 400, height: 300, format: "PNG" });
+    // 400 wide at 2.39:1 is 167 tall, so the bars are about 66 pixels each.
+    assert.equal(pixel(file("fx.png"), 200, 10), "srgb(0,0,0)");
+    assert.equal(pixel(file("fx.png"), 200, 290), "srgb(0,0,0)");
+    assert.ok(mean(file("fx.png")) < mean(file("in.png")));
+    assert.equal(cli("picture", ["effects", file("in.png"), file("x.png")]).code, 1);
+  });
+
   test("errors: missing file, missing flag, unknown command", () => {
     assert.equal(cli("picture", ["resize", file("nope.png"), file("x.png"), "--width", "10"]).code, 1);
     assert.equal(cli("picture", ["crop", file("in.png"), file("x.png"), "--x", "1"]).code, 1);
@@ -180,10 +229,6 @@ describe("picture", () => {
 });
 
 describe("video", () => {
-  // Durations are checked with a small tolerance because of how video frames line up.
-  const near = (actual: number, expected: number, tolerance = 0.15) =>
-    assert.ok(Math.abs(actual - expected) <= tolerance, `expected ~${expected}, got ${actual}`);
-
   test("info", () => {
     const result = JSON.parse(ok("video", ["info", file("in.mp4")]));
     assert.equal(result.width, 320);
@@ -303,6 +348,40 @@ describe("video", () => {
     near(video.info(file("out.webm")).duration, 3, 0.2);
   });
 
+  test("grade keeps length and sound, half strength mixes with the original", () => {
+    ok("video", ["grade", file("in.mp4"), file("graded.mp4"), "--look", "teal-orange"]);
+    ok("video", ["grade", file("in.mp4"), file("graded-half.mp4"), "--look", "noir", "--strength", "0.5"]);
+    near(video.info(file("graded.mp4")).duration, 3, 0.1);
+    assert.ok(video.info(file("graded.mp4")).hasAudio);
+    near(video.info(file("graded-half.mp4")).duration, 3, 0.1);
+  });
+
+  test("effects letterbox puts black bars on every frame", () => {
+    ok("video", ["effects", file("in.mp4"), file("bars.mp4"), "--letterbox", "2.39", "--grain", "0.3"]);
+    frameAt(file("bars.mp4"), 2, file("bars.png"));
+    assert.ok(mean(file("bars.png")) > 0.1);
+    const [r, g, b] = pixel(file("bars.png"), 160, 5).match(/[\d.]+/g)!.map(Number);
+    assert.ok(r < 30 && g < 30 && b < 30, `top bar not black: ${r},${g},${b}`);
+  });
+
+  test("captions from a transcript appear at the bottom (needs Chrome)", (t) => {
+    if (!hasChrome) return t.skip("Chrome not found");
+    const words = [
+      { word: "Hello", start: 0.2, end: 0.7 },
+      { word: "there", start: 0.8, end: 1.3 },
+      { word: "friends.", start: 1.4, end: 2.2 },
+    ];
+    writeFileSync(file("words.json"), JSON.stringify({ words }));
+    const result = JSON.parse(ok("video", ["captions", file("in.mp4"), file("captioned.mp4"), "--transcript", file("words.json"), "--style", "bold"]));
+    assert.equal(result.words, 3);
+    near(video.info(file("captioned.mp4")).duration, 3, 0.1);
+    frameAt(file("in.mp4"), 1, file("cap-before.png"));
+    frameAt(file("captioned.mp4"), 1, file("cap-after.png"));
+    // The top half is untouched, the bottom third has the words.
+    assert.ok(regionDiff(file("cap-before.png"), file("cap-after.png"), "320x100+0+0") < 0.03);
+    assert.ok(regionDiff(file("cap-before.png"), file("cap-after.png"), "320x80+0+160") > 0.03);
+  });
+
   test("errors: missing file and help", () => {
     assert.equal(cli("video", ["trim", file("nope.mp4"), file("x.mp4"), "--start", "0", "--end", "1"]).code, 1);
     assert.equal(cli("video", ["trim", file("in.mp4"), file("x.mp4"), "--start", "2", "--end", "1"]).code, 1);
@@ -310,10 +389,75 @@ describe("video", () => {
   });
 });
 
-describe("sound", () => {
-  const near = (actual: number, expected: number, tolerance = 0.15) =>
-    assert.ok(Math.abs(actual - expected) <= tolerance, `expected ~${expected}, got ${actual}`);
+describe("graphics", () => {
+  // A page with a box that slides right by 100px per second (CSS animation) and a canvas
+  // that is drawn from window.joedit (time, data and audio).
+  const page = `<!doctype html><html><body style="margin:0;background:#000">
+<div id="box" style="position:absolute;top:0;left:0;width:40px;height:40px;background:#fff;animation:go 2s linear forwards"></div>
+<canvas id="c" width="160" height="40" style="position:absolute;top:50px;left:0"></canvas>
+<style>@keyframes go{from{transform:translateX(0)}to{transform:translateX(200px)}}</style>
+<script>
+  window.joedit.render = () => {
+    const c = document.getElementById("c").getContext("2d");
+    const data = window.joedit.data || {};
+    const fast = (window.joedit.audio || {}).bpm > 100;
+    c.fillStyle = data.color || (fast ? "#0f0" : "#f00");
+    c.fillRect(0, 0, 160, 40);
+  };
+</script></body></html>`;
 
+  before(() => writeFileSync(file("page.html"), page));
+
+  test("still is frozen in time: same time = same picture", (t) => {
+    if (!hasChrome) return t.skip("Chrome not found");
+    const size = ["--width", "320", "--height", "120"];
+    ok("graphics", ["still", file("page.html"), file("t0.png"), "--time", "0", ...size]);
+    ok("graphics", ["still", file("page.html"), file("t1.png"), "--time", "1", ...size]);
+    ok("graphics", ["still", file("page.html"), file("t1-again.png"), "--time", "1", ...size]);
+    // At 1 second the box has moved 100px.
+    assert.equal(pixel(file("t0.png"), 20, 20), "srgb(255,255,255)");
+    assert.equal(pixel(file("t1.png"), 20, 20), "srgb(0,0,0)");
+    assert.equal(pixel(file("t1.png"), 120, 20), "srgb(255,255,255)");
+    assert.equal(regionDiff(file("t1.png"), file("t1-again.png"), "320x120+0+0"), 0);
+  });
+
+  test("render makes a video with the right length and frames", (t) => {
+    if (!hasChrome) return t.skip("Chrome not found");
+    const result = JSON.parse(ok("graphics", ["render", file("page.html"), file("page.mp4"), "--duration", "1", "--fps", "10", "--width", "320", "--height", "120"]));
+    assert.equal(result.frames, 10);
+    const details = video.info(file("page.mp4"));
+    assert.equal(details.width, 320);
+    near(details.duration, 1, 0.15);
+  });
+
+  test("render passes --data and --audio to the page", (t) => {
+    if (!hasChrome) return t.skip("Chrome not found");
+    writeFileSync(file("data.json"), JSON.stringify({ color: "#00f" }));
+    ok("graphics", ["still", file("page.html"), file("data.png"), "--time", "0", "--width", "320", "--height", "120", "--data", file("data.json")]);
+    assert.equal(pixel(file("data.png"), 80, 70), "srgb(0,0,255)");
+    // The click track is 120 BPM, so the page draws green, and the sound is in the video.
+    ok("graphics", ["render", file("page.html"), file("beat.mp4"), "--duration", "1", "--fps", "10", "--width", "320", "--height", "120", "--audio", file("click120.wav")]);
+    assert.ok(video.info(file("beat.mp4")).hasAudio);
+    frameAt(file("beat.mp4"), 0.5, file("beat.png"));
+    const [r, g] = pixel(file("beat.png"), 80, 70).match(/[\d.]+/g)!.map(Number);
+    assert.ok(g > 200 && r < 50, `canvas not green: ${r},${g}`);
+  });
+
+  test("title, lower-third (see-through) and counter templates", (t) => {
+    if (!hasChrome) return t.skip("Chrome not found");
+    const size = ["--width", "640", "--height", "360"];
+    ok("graphics", ["title", file("title.png"), "--text", "Hello joEdit", "--subtitle", "test", ...size]);
+    assert.deepEqual(picture.info(file("title.png")), { width: 640, height: 360, format: "PNG" });
+    ok("graphics", ["lower-third", file("lt.mov"), "--text", "Ada Lovelace", "--subtitle", "Engineer", "--duration", "1", ...size]);
+    const stream = JSON.parse(execFileSync("ffprobe", ["-v", "error", "-show_streams", "-of", "json", file("lt.mov")], { encoding: "utf8" })).streams[0];
+    assert.match(stream.pix_fmt, /a/, `no alpha: ${stream.pix_fmt}`);
+    ok("graphics", ["counter", file("counter.mp4"), "--to", "100", "--duration", "1", ...size]);
+    near(video.info(file("counter.mp4")).duration, 1, 0.15);
+    assert.equal(cli("graphics", ["title", file("x.png")]).code, 1);
+  });
+});
+
+describe("sound", () => {
   test("tone creates a sound", () => {
     ok("sound", ["tone", file("tone.wav"), "--frequency", "440", "--duration", "2"]);
     near(sound.info(file("tone.wav")).duration, 2);
@@ -399,6 +543,55 @@ describe("sound", () => {
   test("convert to wav", () => {
     ok("sound", ["convert", file("sound.mp3"), file("out.wav")]);
     assert.equal(sound.info(file("out.wav")).codec, "pcm_s16le");
+  });
+
+  test("sfx makes every effect type at an even level", () => {
+    for (const type of sound.SFX_TYPES) {
+      const result = JSON.parse(ok("sound", ["sfx", file(`sfx-${type}.wav`), "--type", type]));
+      near(sound.info(file(`sfx-${type}.wav`)).duration, result.duration, 0.05);
+      // Every effect is leveled so its loudest moment is -3 dB.
+      const log = spawnSync("ffmpeg", ["-hide_banner", "-i", file(`sfx-${type}.wav`), "-af", "volumedetect", "-f", "null", "-"], { encoding: "utf8" }).stderr;
+      const peak = Number(log.match(/max_volume: (-?[\d.]+) dB/)?.[1]);
+      assert.ok(Math.abs(peak + 3) < 0.6, `${type} peaks at ${peak} dB`);
+    }
+    ok("sound", ["sfx", file("long-riser.wav"), "--type", "riser", "--duration", "5"]);
+    near(sound.info(file("long-riser.wav")).duration, 5, 0.05);
+    assert.equal(cli("sound", ["sfx", file("x.wav"), "--type", "kazoo"]).code, 1);
+  });
+
+  test("duck turns the music down while the voice speaks", () => {
+    // Music: a 6s tone. Voice: a 2s tone from 2s to 4s.
+    ok("sound", ["tone", file("duck-music.wav"), "--frequency", "220", "--duration", "6"]);
+    execFileSync("ffmpeg", ["-loglevel", "error", "-y", "-f", "lavfi", "-i", "sine=frequency=1000:duration=2", "-af", "adelay=2000|2000,apad=whole_dur=6", file("duck-voice.wav")]);
+    ok("sound", ["duck", file("duck-music.wav"), file("duck-voice.wav"), file("ducked.wav"), "--amount", "12"]);
+    // Measure just the music (low tone) before and during the voice.
+    const music = (from: number) => {
+      const log = spawnSync("ffmpeg", ["-hide_banner", "-ss", String(from), "-t", "1", "-i", file("ducked.wav"), "-af", "lowpass=f=400,volumedetect", "-f", "null", "-"], { encoding: "utf8" }).stderr;
+      return Number(log.match(/mean_volume: (-?[\d.]+) dB/)?.[1]);
+    };
+    assert.ok(music(0.5) - music(2.7) > 6, `music before ${music(0.5)} dB, under voice ${music(2.7)} dB`);
+  });
+
+  test("denoise removes hiss and keeps the tone", () => {
+    execFileSync("ffmpeg", [
+      "-loglevel", "error", "-y",
+      "-f", "lavfi", "-i", "anoisesrc=d=3:c=white:a=0.05",
+      "-f", "lavfi", "-i", "sine=frequency=440:duration=3",
+      "-filter_complex", "[0][1]amix=inputs=2:normalize=0", file("hiss.wav"),
+    ]);
+    ok("sound", ["denoise", file("hiss.wav"), file("no-hiss.wav")]);
+    const band = (path: string, filter: string) => {
+      const log = spawnSync("ffmpeg", ["-hide_banner", "-i", path, "-af", `${filter},volumedetect`, "-f", "null", "-"], { encoding: "utf8" }).stderr;
+      return Number(log.match(/mean_volume: (-?[\d.]+) dB/)?.[1]);
+    };
+    assert.ok(band(file("hiss.wav"), "highpass=f=2000") - band(file("no-hiss.wav"), "highpass=f=2000") > 6, "hiss not reduced");
+    assert.ok(Math.abs(band(file("hiss.wav"), "bandpass=f=440:w=50") - band(file("no-hiss.wav"), "bandpass=f=440:w=50")) < 2, "tone changed");
+  });
+
+  test("eq boosts bass and cuts treble", () => {
+    ok("sound", ["eq", file("hiss.wav"), file("eq.wav"), "--bass", "8", "--treble", "-8"]);
+    assert.ok(loudness(file("eq.wav")) !== loudness(file("hiss.wav")));
+    assert.equal(cli("sound", ["eq", file("hiss.wav"), file("x.wav")]).code, 1);
   });
 
   test("errors: missing file and help", () => {
@@ -495,8 +688,7 @@ describe("listen", () => {
   });
 
   test("transcribe gives words with times (needs the whisper pack)", (t) => {
-    const packs = JSON.parse(ok("joedit", ["packs"])).packs;
-    if (!packs.find((p: any) => p.name === "whisper")?.installed) return t.skip("whisper pack not installed");
+    if (!hasWhisper()) return t.skip("whisper pack not installed");
     execFileSync("say", ["-o", file("speech.aiff"), "Hello world. This is a test."]);
     const result = JSON.parse(ok("listen", ["transcribe", file("speech.aiff"), file("speech.json"), "--model", "tiny"]));
     assert.match(result.text.toLowerCase(), /hello/);

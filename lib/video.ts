@@ -1,6 +1,7 @@
 // Video editing, built on ffmpeg / ffprobe.
 // CLI:     node video.ts <command> <input> <output> [--flags]
 // Library: import { trim } from "./joEdit/video.ts"
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   DEFAULT_FONT,
@@ -14,8 +15,12 @@ import {
   runCli,
   stringFlag,
   withTempDir,
+  loadBrand,
+  type Args,
   type Command,
 } from "./shared.ts";
+import * as graphics from "./graphics.ts";
+import * as listen from "./listen.ts";
 
 export type VideoInfo = {
   duration: number; // seconds
@@ -168,9 +173,133 @@ export function text(
   });
 }
 
+// ---------- Looks and film effects (these also work on pictures) ----------
+
+// Color grades. Each is a chain of ffmpeg color filters.
+export const LOOKS: Record<string, string> = {
+  cinematic: "curves=preset=medium_contrast,colorbalance=rs=-0.05:bs=0.08:rh=0.08:gh=0.02:bh=-0.06,eq=saturation=0.9",
+  "teal-orange": "colorbalance=rs=-0.15:gs=-0.02:bs=0.15:rh=0.15:gh=0.03:bh=-0.15,eq=saturation=1.15:contrast=1.08",
+  noir: "hue=s=0,curves=preset=strong_contrast,eq=brightness=-0.03",
+  vintage: "curves=preset=vintage,eq=saturation=0.8",
+  warm: "colorbalance=rm=0.08:gm=0.02:bm=-0.08,eq=saturation=1.05",
+  cool: "colorbalance=rm=-0.06:bm=0.1",
+  bleach: "eq=saturation=0.45:contrast=1.25",
+  vivid: "eq=saturation=1.4:contrast=1.08",
+};
+
+const PICTURE_TYPES = /\.(png|jpe?g|webp|bmp|tiff?)$/i;
+
+// Run a filter graph that starts at [0:v] and ends at [out]. Works for videos and pictures.
+function applyGraph(input: string, output: string, graph: string): void {
+  requireFile(input);
+  const picture = PICTURE_TYPES.test(output);
+  const extra = picture
+    ? ["-frames:v", "1", "-update", "1"]
+    : ["-map", "0:a?", "-c:a", "copy", "-pix_fmt", "yuv420p"];
+  ffmpeg(["-i", input, "-filter_complex", graph, "-map", "[out]", ...extra, output]);
+}
+
+// Apply a color grade. strength 0..1 mixes it with the original.
+export function grade(input: string, output: string, look: string, strength = 1): void {
+  const filter = LOOKS[look];
+  if (!filter) throw new Error(`Unknown look "${look}". Looks: ${Object.keys(LOOKS).join(", ")}`);
+  const amount = Math.min(1, Math.max(0, strength));
+  const graph =
+    amount >= 1
+      ? `[0:v]${filter}[out]`
+      : `[0:v]format=gbrp,split[a][b];[b]${filter},format=gbrp[g];[a][g]blend=all_mode=normal:all_opacity=${amount}[out]`;
+  applyGraph(input, output, graph);
+}
+
+export type Effects = {
+  grain?: number; // 0..1 film grain
+  vignette?: number; // 0..1 darker corners
+  letterbox?: number; // e.g. 2.39 for black cinema bars
+  glow?: number; // 0..1 soft bloom on bright parts
+  chromatic?: number; // pixels of red/blue color split
+  sharpen?: number; // 0..1
+};
+
+// Add film effects. Each effect is only applied if given.
+export function effects(input: string, output: string, chosen: Effects): void {
+  const steps: string[] = [];
+  let label = "0:v";
+  let n = 0;
+  const add = (filter: string) => {
+    steps.push(`[${label}]${filter}[e${n}]`);
+    label = `e${n++}`;
+  };
+  if (chosen.glow) {
+    steps.push(`[${label}]format=gbrp,split[ga${n}][gb${n}];[gb${n}]gblur=sigma=18[gc${n}];[ga${n}][gc${n}]blend=all_mode=screen:all_opacity=${chosen.glow}[e${n}]`);
+    label = `e${n++}`;
+  }
+  if (chosen.chromatic) add(`format=gbrp,rgbashift=rh=-${Math.round(chosen.chromatic)}:bh=${Math.round(chosen.chromatic)}`);
+  if (chosen.sharpen) add(`unsharp=5:5:${chosen.sharpen * 2}`);
+  if (chosen.vignette) add(`vignette=angle=${0.2 + chosen.vignette * 0.8}`);
+  if (chosen.grain) add(`noise=alls=${Math.round(chosen.grain * 40)}:allf=t+u`);
+  if (chosen.letterbox) {
+    const bar = `max(0\\,(ih-iw/${chosen.letterbox})/2)`;
+    add(`drawbox=x=0:y=0:w=iw:h=${bar}:color=black:t=fill,drawbox=x=0:y=ih-${bar}:w=iw:h=${bar}:color=black:t=fill`);
+  }
+  if (!steps.length) throw new Error("Give at least one effect: --grain, --vignette, --letterbox, --glow, --chromatic, --sharpen");
+  steps.push(`[${label}]null[out]`);
+  applyGraph(input, output, steps.join(";"));
+}
+
+// ---------- Captions ----------
+
+// Burn animated captions into a video. Uses a transcript from `listen transcribe`, or makes one (whisper pack).
+export async function captions(
+  input: string,
+  output: string,
+  options: { transcript?: string; style?: graphics.CaptionStyle; position?: string; model?: string; brand?: string } = {},
+): Promise<{ words: number; groups: number }> {
+  const details = info(input);
+  if (!details.width) throw new Error("This file has no picture to put captions on.");
+  return withTempDir(async (folder) => {
+    let transcript = options.transcript;
+    if (!transcript) {
+      transcript = join(folder, "words.json");
+      listen.transcribe(input, transcript, options.model ?? "base");
+    }
+    const words = JSON.parse(readFileSync(requireFile(transcript), "utf8")).words ?? [];
+    if (!words.length) throw new Error("The transcript has no words.");
+    const overlay = join(folder, "captions.mov");
+    const made = await graphics.captionsOverlay(words, overlay, {
+      width: details.width,
+      height: details.height,
+      fps: details.fps || 30,
+      duration: details.duration,
+      style: options.style,
+      position: options.position,
+      brand: loadBrand(options.brand),
+    });
+    ffmpeg([
+      "-i", input, "-i", overlay,
+      "-filter_complex", "[0:v][1:v]overlay=0:0:eof_action=pass[v]",
+      "-map", "[v]", "-map", "0:a?", "-c:a", "copy", "-pix_fmt", "yuv420p",
+      output,
+    ]);
+    return { words: words.length, groups: made.groups };
+  });
+}
+
 // Change format based on the output file extension (e.g. .mov -> .mp4).
 export function convert(input: string, output: string): void {
   ffmpeg(["-i", input, output]);
+}
+
+// Read the effect flags (used by video effects and picture effects).
+export function effectFlags(a: Args): Effects {
+  const value = (name: string) => (a.flags[name] === undefined ? undefined : numberFlag(a, name));
+  return {
+    grain: value("grain"),
+    vignette: value("vignette"),
+    letterbox: value("letterbox"),
+    glow: value("glow"),
+    chromatic: value("chromatic"),
+    sharpen: value("sharpen"),
+  };
 }
 
 export const commands: Record<string, Command> = {
@@ -276,6 +405,33 @@ export const commands: Record<string, Command> = {
         optionalNumberFlag(a, "size", 32),
         a.flags.color ?? "white",
       );
+    },
+  },
+  grade: {
+    usage: "grade <input> <output> --look cinematic|teal-orange|noir|vintage|warm|cool|bleach|vivid [--strength 0..1]",
+    run: (a) => {
+      const { input, output } = inOut(a);
+      grade(input, output, stringFlag(a, "look"), optionalNumberFlag(a, "strength", 1));
+    },
+  },
+  effects: {
+    usage: "effects <input> <output> [--grain 0..1] [--vignette 0..1] [--letterbox 2.39] [--glow 0..1] [--chromatic PX] [--sharpen 0..1]",
+    run: (a) => {
+      const { input, output } = inOut(a);
+      effects(input, output, effectFlags(a));
+    },
+  },
+  captions: {
+    usage: "captions <input> <output> [--transcript words.json] [--style karaoke|pop|bold|minimal] [--position bottom|center|top] [--brand brand.json]",
+    run: (a) => {
+      const { input, output } = inOut(a);
+      return captions(input, output, {
+        transcript: a.flags.transcript,
+        style: a.flags.style as graphics.CaptionStyle | undefined,
+        position: a.flags.position,
+        model: a.flags.model,
+        brand: a.flags.brand,
+      });
     },
   },
   convert: {

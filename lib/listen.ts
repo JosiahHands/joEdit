@@ -131,6 +131,23 @@ function samples(input: string): Float32Array {
   return new Float32Array(new Uint8Array(bytes).buffer);
 }
 
+// Loudness of each video frame, from 0 (silent) to 1 (loudest moment). Used for audio-reactive graphics.
+export function levels(input: string, fps: number): number[] {
+  const data = samples(input);
+  const perFrame = RATE / fps;
+  const frames = Math.floor(data.length / perFrame);
+  const values: number[] = [];
+  for (let f = 0; f < frames; f++) {
+    let sum = 0;
+    const start = Math.floor(f * perFrame);
+    const end = Math.floor((f + 1) * perFrame);
+    for (let i = start; i < end; i++) sum += data[i] * data[i];
+    values.push(Math.sqrt(sum / (end - start))); // RMS = average strength
+  }
+  const loudest = Math.max(...values, 1e-9);
+  return values.map((v) => round(v / loudest, 3));
+}
+
 // How much the sound suddenly gets louder at each moment. Peaks are drum hits, notes and claps.
 function onsetStrength(data: Float32Array): number[] {
   const frames = Math.floor((data.length - WINDOW) / HOP);
