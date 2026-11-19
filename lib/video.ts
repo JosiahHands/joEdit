@@ -1,8 +1,6 @@
 // Video editing, built on ffmpeg / ffprobe.
 // CLI:     node video.ts <command> <input> <output> [--flags]
 // Library: import { trim } from "./joEdit/video.ts"
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   DEFAULT_FONT,
@@ -15,6 +13,7 @@ import {
   run,
   runCli,
   stringFlag,
+  withTempDir,
   type Command,
 } from "./shared.ts";
 
@@ -155,9 +154,8 @@ export function text(
   size = 32,
   color = "white",
 ): void {
-  const folder = mkdtempSync(join(tmpdir(), "video-text-"));
-  const picture = join(folder, "text.png");
-  try {
+  withTempDir((folder) => {
+    const picture = join(folder, "text.png");
     run("magick", [
       "-background", "none",
       "-font", DEFAULT_FONT,
@@ -167,9 +165,7 @@ export function text(
       picture,
     ]);
     ffmpeg(["-i", input, "-i", picture, "-filter_complex", `[0:v][1:v]overlay=${x}:${y}`, "-c:a", "copy", output]);
-  } finally {
-    rmSync(folder, { recursive: true, force: true });
-  }
+  });
 }
 
 // Change format based on the output file extension (e.g. .mov -> .mp4).
@@ -177,10 +173,10 @@ export function convert(input: string, output: string): void {
   ffmpeg(["-i", input, output]);
 }
 
-const commands: Record<string, Command> = {
+export const commands: Record<string, Command> = {
   info: {
     usage: "info <input>",
-    run: (a) => console.log(JSON.stringify(info(requireFile(a.positional[0])))),
+    run: (a) => info(requireFile(a.positional[0])),
   },
   trim: {
     usage: "trim <input> <output> --start SECONDS --end SECONDS",

@@ -94,10 +94,10 @@ export function convert(input: string, output: string, quality?: number): void {
   run("magick", [input, ...options, output]);
 }
 
-const commands: Record<string, Command> = {
+export const commands: Record<string, Command> = {
   info: {
     usage: "info <input>",
-    run: (a) => console.log(JSON.stringify(info(requireFile(a.positional[0])))),
+    run: (a) => info(requireFile(a.positional[0])),
   },
   resize: {
     usage: "resize <input> <output> [--width N] [--height N]",

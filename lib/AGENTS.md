@@ -1,113 +1,147 @@
 # joEdit: Guide for AI Agents
 
-Use these command-line tools to edit pictures, videos, and sound. Each tool is one file that you run with Node.js (v24 or newer). The tools need no npm packages.
+joEdit is a toolkit for editing pictures, video and sound, and for **seeing and hearing the results**. It runs entirely on this computer: no API keys, no cost per edit. Use it however suits the job: one command at a time, chained in a script, or imported as TypeScript functions. When joEdit doesn't do something, `ffmpeg`, `ffprobe` and `magick` are installed too, so call them directly or extend joEdit.
 
 ```
-node picture.ts <command> <input> <output> [--flags]
-node video.ts   <command> <input> <output> [--flags]
-node sound.ts   <command> <input> <output> [--flags]
+node joedit.ts <area> <command> ...      areas: picture, video, sound, look, listen
+node joedit.ts                           prints every command
+node joedit.ts doctor                    shows what this computer has installed
+```
+Paths here are written as if you are in this folder. From elsewhere, use `node joEdit/joedit.ts ...`.
+
+## How it works
+- **Output:** every command prints one line of JSON, e.g. `{"ok":true,"output":"out.mp4"}`, often with extra facts (times, sizes, scores). Errors exit with code 1 and print `Error: ...` and the correct usage to stderr.
+- **Files:** each edit reads an input and writes a new output file. The output's extension picks the format (`.mp4 .webm .gif .png .jpg .mp3 .wav`, …).
+- **Units:** times are in seconds (`1.5`). Positions are in pixels from the top-left corner.
+- **Setup:** `doctor` lists installed tools and gives the install command for anything missing. Optional AI **packs** (open models that run locally) are installed with `install <pack>`.
+
+## Seeing and hearing your work
+You can't watch video or hear sound directly, so `look` and `listen` turn them into pictures and text you can read:
+- `look sheet` makes a contact sheet of a whole video in one PNG. Reading it is the quickest way to know what a video contains or whether an edit worked.
+- `look strip` zooms in on a moment, such as a cut or a transition.
+- `listen wave`, `listen loudness`, `listen silences` and `listen beats` describe sound as images and numbers.
+- `listen transcribe` turns speech into words with timestamps, so you can find and cut by what is said.
+- `check <file>` is a quick quality report: black or frozen picture, long silence, too quiet or too loud. Each problem comes with a suggested fix command.
+
+Looking at results between steps catches most mistakes early. How often you look is up to you.
+
+## Commands
+`<in>` is an input file and `<out>` is a new output file.
+
+**picture** (ImageMagick)
+```
+info <in>                                   → width, height, format
+resize <in> <out> [--width N] [--height N]  give one value to keep the shape
+crop <in> <out> --x N --y N --width N --height N
+rotate <in> <out> --degrees N               clockwise, any angle
+flip <in> <out> --direction horizontal|vertical
+grayscale | brightness --amount -100..100 | contrast --amount -100..100 | blur --radius N   (all: <in> <out>)
+text <in> <out> --text "words" [--x 10] [--y 10] [--size 32] [--color white]
+convert <in> <out> [--quality 1..100]       e.g. .png → .jpg
 ```
 
-These commands are written as if you are inside this folder. From anywhere else, put the folder's path in front, for example `node joEdit/video.ts info clip.mp4`.
+**video** (ffmpeg)
+```
+info <in>                                   → duration, width, height, fps, hasAudio
+trim <in> <out> --start S --end S
+resize | crop | flip                        same flags as picture
+rotate <in> <out> --degrees 90|180|270
+speed <in> <out> --factor 0.5..100          2 = twice as fast (sound too)
+mute <in> <out>                             remove the sound
+extract-audio <in> <out.mp3>
+add-audio <in> <out> --audio FILE           replaces the sound; stops at the shorter one
+concat <in1> <in2> [...] <out>              one after another, sized to the first clip
+frame <in> <out.png> --time S               one still picture
+gif <in> <out.gif> [--fps 10] [--width 480]
+text <in> <out> --text "words" [--x] [--y] [--size] [--color]   on the whole video
+convert <in> <out>
+```
 
-**Requirements:** `magick` (ImageMagick 7) for pictures, and `ffmpeg` + `ffprobe` for video and sound. Running `npm install` in this folder only adds type definitions so code editors show no errors.
+**sound** (ffmpeg; also reads the sound of video files)
+```
+info <in>                                   → duration, sampleRate, channels, codec
+trim <in> <out> --start S --end S
+volume <in> <out> --factor N                2 = louder, 0.5 = quieter
+fade <in> <out> [--in S] [--out S]
+speed <in> <out> --factor 0.5..100          pitch stays the same
+pitch <in> <out> --semitones -12..12        length stays the same
+reverse | normalize | convert               (all: <in> <out>) normalize = -14 LUFS, the online standard
+loop <in> <out> --times N
+concat <in1> <in2> [...] <out>              one after another
+mix <in1> <in2> [...] <out>                 at the same time (e.g. voice over music)
+tone <out> [--frequency 440] [--duration 1]
+```
 
-## Rules
-- **Never overwrite the input.** Always write to a new output file.
-- **Output format comes from the output file's extension** (`.png`, `.jpg`, `.mp4`, `.webm`, `.gif`, `.mp3`, `.wav`, ...).
-- **Run `info` first** to learn the size, duration, or audio details before editing.
-- **Chain edits through temporary files:** `a.mp4 → step1.mp4 → step2.mp4 → final.mp4`.
-- **Times are in seconds** (decimals are allowed, e.g. `1.5`). **Positions are in pixels** from the top-left corner.
-- **Exit code 0** means success. **Exit code 1** means an error: a message starting with `Error:` and the correct usage line are printed to stderr.
-- Run a tool with no command (or `help`) to list all its commands.
+**look**: pictures of video, to read
+```
+sheet <video> <out.png> [--count 12]        frames from the whole video, labelled with times
+strip <video> <out.png> --start S --end S [--count 8]   close-up of one moment
+scenes <video> [--threshold 0.3]            → times of shot changes (0.1 sensitive … 0.6 hard cuts only)
+compare <pic1> <pic2> <out.png>             → difference 0..1, plus a picture marking differences in red
+```
 
-## Pictures: `node picture.ts`
+**listen**: sound as numbers, text and pictures
+```
+wave <sound> <out.png>                      waveform with a time ruler (tall = loud, flat = silent)
+spectrum <sound> <out.png>                  spectrogram (pitch over time)
+loudness <sound>                            → lufs, peak, verdict, suggested fixes
+silences <sound> [--db -35] [--min 0.5]     → silent parts (start, end)
+beats <sound>                               → bpm and the time of every beat
+transcribe <sound> <out.json> [--model base] [--language en]   → every word with its time (whisper pack)
+```
 
-| Command | Usage | Notes |
-|---|---|---|
-| info | `info <in>` | Prints JSON `{width, height, format}` |
-| resize | `resize <in> <out> [--width N] [--height N]` | Give only one value to keep the aspect ratio |
-| crop | `crop <in> <out> --x N --y N --width N --height N` | |
-| rotate | `rotate <in> <out> --degrees N` | Clockwise, any angle |
-| flip | `flip <in> <out> --direction horizontal\|vertical` | |
-| grayscale | `grayscale <in> <out>` | |
-| brightness | `brightness <in> <out> --amount -100..100` | |
-| contrast | `contrast <in> <out> --amount -100..100` | |
-| blur | `blur <in> <out> --radius N` | Bigger means more blur |
-| text | `text <in> <out> --text "words" [--x N] [--y N] [--size N] [--color name]` | Defaults: x=10, y=10, size=32, color white |
-| convert | `convert <in> <out> [--quality 1..100]` | Example: `.png` → `.jpg` |
-
-## Videos: `node video.ts`
-
-| Command | Usage | Notes |
-|---|---|---|
-| info | `info <in>` | Prints JSON `{duration, width, height, fps, hasAudio}` |
-| trim | `trim <in> <out> --start S --end S` | |
-| resize | `resize <in> <out> [--width N] [--height N]` | Give only one value to keep the aspect ratio |
-| crop | `crop <in> <out> --x N --y N --width N --height N` | |
-| rotate | `rotate <in> <out> --degrees 90\|180\|270` | Clockwise |
-| flip | `flip <in> <out> --direction horizontal\|vertical` | |
-| speed | `speed <in> <out> --factor 0.5..100` | 2 = twice as fast. The sound is sped up as well |
-| mute | `mute <in> <out>` | Removes the sound |
-| extract-audio | `extract-audio <in> <out.mp3>` | Fails if the video has no sound |
-| add-audio | `add-audio <in> <out> --audio FILE` | Replaces the sound. Output stops at the shorter of the two |
-| concat | `concat <in1> <in2> [...] <out>` | Scales every clip to the first clip's size. Sound is kept only if every input has sound |
-| frame | `frame <in> <out.png> --time S` | Saves one still picture |
-| gif | `gif <in> <out.gif> [--fps N] [--width N]` | Defaults: fps=10, width=480 |
-| text | `text <in> <out> --text "words" [--x N] [--y N] [--size N] [--color name]` | Shows on the whole video |
-| convert | `convert <in> <out>` | Example: `.mov` → `.mp4` |
-
-## Sound and music: `node sound.ts`
-
-Works on audio files. Commands that read sound also accept a video file and use its sound.
-
-| Command | Usage | Notes |
-|---|---|---|
-| info | `info <in>` | Prints JSON `{duration, sampleRate, channels, codec}` |
-| trim | `trim <in> <out> --start S --end S` | |
-| volume | `volume <in> <out> --factor N` | 2 = louder, 0.5 = quieter, 0 = silent |
-| fade | `fade <in> <out> [--in S] [--out S]` | Fades in at the start and/or out at the end |
-| speed | `speed <in> <out> --factor 0.5..100` | Pitch stays the same |
-| pitch | `pitch <in> <out> --semitones -12..12` | Length stays the same. 12 = one octave up |
-| reverse | `reverse <in> <out>` | Plays backwards |
-| normalize | `normalize <in> <out>` | Evens out the loudness to a standard level |
-| loop | `loop <in> <out> --times N` | Plays the sound N times in a row |
-| concat | `concat <in1> <in2> [...] <out>` | One after another. Inputs can be in different formats |
-| mix | `mix <in1> <in2> [...] <out>` | All at the same time (for example voice over music). Lasts as long as the longest input |
-| tone | `tone <out> [--frequency HZ] [--duration S]` | Makes a beep. Defaults: 440 Hz for 1 s |
-| convert | `convert <in> <out>` | Example: `.wav` → `.mp3` |
+**top level**
+```
+doctor                                      installed tools, machine, packs
+check <file>                                quality report with fix commands
+packs                                       available AI packs and whether they are installed
+install <pack>                              e.g. install whisper (needs uv)
+```
 
 ## Examples
+Ideas for combining commands, not fixed recipes.
 
-Make a 5-second clip from 0:10 of a video, 720 px wide, with a title:
+**Tighten a talk by removing a long pause**
 ```
-node video.ts trim input.mp4 tmp1.mp4 --start 10 --end 15
-node video.ts resize tmp1.mp4 tmp2.mp4 --width 720
-node video.ts text tmp2.mp4 final.mp4 --text "My Trip" --x 20 --y 20 --size 48
-```
-
-Put background music under a video:
-```
-node video.ts extract-audio clip.mp4 voice.mp3
-node sound.ts volume music.mp3 quiet-music.mp3 --factor 0.3
-node sound.ts mix voice.mp3 quiet-music.mp3 mixed.mp3
-node sound.ts fade mixed.mp3 final-audio.mp3 --out 2
-node video.ts add-audio clip.mp4 final.mp4 --audio final-audio.mp3
+node joedit.ts listen silences talk.mp4 --min 1.5      → silence 12.4–15.9
+node joedit.ts video trim talk.mp4 a.mp4 --start 0 --end 12.4
+node joedit.ts video trim talk.mp4 b.mp4 --start 15.9 --end 60
+node joedit.ts video concat a.mp4 b.mp4 tight.mp4
+node joedit.ts look strip tight.mp4 cut.png --start 11.5 --end 13.5
 ```
 
-Make a thumbnail from a video:
+**Cut a montage to the music**
 ```
-node video.ts frame input.mp4 frame.png --time 3
-node picture.ts resize frame.png thumb.jpg --width 320
+node joedit.ts listen beats song.mp3                   → bpm 120, beats [0.5, 1.0, 1.5, ...]
+(trim clips to lengths that match the beat spacing)
+node joedit.ts video concat c1.mp4 c2.mp4 c3.mp4 montage.mp4
+node joedit.ts video add-audio montage.mp4 final.mp4 --audio song.mp3
+node joedit.ts look sheet final.mp4 sheet.png
 ```
 
-## Use as a library (TypeScript)
-Every command is also an exported function with the same name (`extract-audio` → `extractAudio`, `add-audio` → `addAudio`):
+**Music under a voice**
+```
+node joedit.ts video extract-audio clip.mp4 voice.wav
+node joedit.ts sound volume music.mp3 quiet.mp3 --factor 0.25
+node joedit.ts sound mix voice.wav quiet.mp3 mixed.wav
+node joedit.ts sound normalize mixed.wav level.wav
+node joedit.ts video add-audio clip.mp4 final.mp4 --audio level.wav
+```
+
+**Find a moment by what is said**
+```
+node joedit.ts install whisper
+node joedit.ts listen transcribe interview.mp4 words.json
+(find the phrase in words.json, then trim from its first word's start to its last word's end)
+```
+
+## Use from code
+Every command is also an exported TypeScript function (`extract-audio` → `extractAudio`). Functions throw an `Error` on failure. Good for loops and bigger jobs.
 ```ts
-import { trim, info } from "./joEdit/video.ts";
-import { fade } from "./joEdit/sound.ts";
+import { trim } from "./joEdit/video.ts";
+import { sheet } from "./joEdit/look.ts";
+import { check } from "./joEdit/joedit.ts";
 trim("in.mp4", "out.mp4", 1, 4);
-fade("song.mp3", "song-faded.mp3", 2, 3);
-console.log(info("out.mp4"));
+sheet("out.mp4", "sheet.png");
+console.log(check("out.mp4"));
 ```
-Functions throw an `Error` on failure.

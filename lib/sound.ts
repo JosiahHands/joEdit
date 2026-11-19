@@ -2,6 +2,7 @@
 // CLI:     node sound.ts <command> <input> <output> [--flags]
 // Library: import { fade } from "./joEdit/sound.ts"
 import {
+  analyze,
   ffmpeg,
   inOut,
   numberFlag,
@@ -77,9 +78,19 @@ export function reverse(input: string, output: string): void {
   ffmpeg(["-i", input, "-filter:a", "areverse", output]);
 }
 
-// Make the loudness even and standard (good before publishing).
+// Make the loudness even and standard for online video: -14 LUFS, peaks below -1.5 dB.
+// Two passes: first measure the sound, then apply one exact correction (accurate even for short clips).
 export function normalize(input: string, output: string): void {
-  ffmpeg(["-i", input, "-filter:a", "loudnorm", output]);
+  const target = "I=-14:TP=-1.5:LRA=11";
+  // Pass 1: measure. loudnorm prints its measurements as JSON at the end of the log.
+  const log = analyze(input, "audio", `loudnorm=${target}:print_format=json`);
+  const measured = JSON.parse(log.slice(log.lastIndexOf("{"), log.lastIndexOf("}") + 1));
+  // Pass 2: correct, using the measurements.
+  const filter =
+    `loudnorm=${target}:measured_I=${measured.input_i}:measured_TP=${measured.input_tp}` +
+    `:measured_LRA=${measured.input_lra}:measured_thresh=${measured.input_thresh}:offset=${measured.target_offset}:linear=true`;
+  // loudnorm works at a very high sample rate inside, so set a normal one (48000) for the output.
+  ffmpeg(["-i", input, "-filter:a", filter, "-ar", "48000", output]);
 }
 
 // Repeat the sound `times` times in a row.
@@ -127,10 +138,10 @@ function manyInputs(positional: string[]): { inputs: string[]; output: string } 
   return { inputs: positional.slice(0, -1), output: positional[positional.length - 1] };
 }
 
-const commands: Record<string, Command> = {
+export const commands: Record<string, Command> = {
   info: {
     usage: "info <input>",
-    run: (a) => console.log(JSON.stringify(info(requireFile(a.positional[0])))),
+    run: (a) => info(requireFile(a.positional[0])),
   },
   trim: {
     usage: "trim <input> <output> --start SECONDS --end SECONDS",

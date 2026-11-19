@@ -1,5 +1,5 @@
 /// <reference path="./lib/node_modules/@types/node/index.d.ts" />
-// Tests for the picture, video and sound CLIs.
+// Tests for every joEdit CLI: picture, video, sound, look, listen and joedit (doctor, check, packs).
 // Run with: node --test test.ts   (run `npm install` in lib/ first, for editor types)
 import { spawnSync, execFileSync } from "node:child_process";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
@@ -11,7 +11,7 @@ import * as picture from "./lib/picture.ts";
 import * as video from "./lib/video.ts";
 import * as sound from "./lib/sound.ts";
 
-type Tool = "picture" | "video" | "sound";
+type Tool = "picture" | "video" | "sound" | "look" | "listen" | "joedit";
 
 const dir = mkdtempSync(join(tmpdir(), "editor-test-"));
 const file = (name: string) => join(dir, name);
@@ -68,6 +68,31 @@ before(() => {
   ]);
   // 5 second audio file.
   execFileSync("ffmpeg", ["-loglevel", "error", "-y", "-f", "lavfi", "-i", "sine=frequency=220", "-t", "5", file("sound.mp3")]);
+  // 8 second click track at exactly 120 BPM (a click every 0.5s).
+  execFileSync("ffmpeg", [
+    "-loglevel", "error", "-y",
+    "-f", "lavfi", "-i", "aevalsrc='0.8*sin(2*PI*1000*t)*lt(mod(t,0.5),0.03)':s=44100:d=8",
+    file("click120.wav"),
+  ]);
+  // 2s tone, 3s silence, 2s tone.
+  execFileSync("ffmpeg", [
+    "-loglevel", "error", "-y",
+    "-f", "lavfi", "-i", "sine=frequency=440:duration=2",
+    "-f", "lavfi", "-i", "anullsrc=r=44100:cl=mono",
+    "-f", "lavfi", "-i", "sine=frequency=440:duration=2",
+    "-filter_complex", "[1]atrim=0:3[s];[0][s][2]concat=n=3:v=0:a=1",
+    file("gap.wav"),
+  ]);
+  // 1.5s of black, then 3s of test picture, with sound.
+  execFileSync("ffmpeg", [
+    "-loglevel", "error", "-y",
+    "-f", "lavfi", "-i", "color=black:s=320x240:d=1.5",
+    "-f", "lavfi", "-i", "testsrc=size=320x240:d=3",
+    "-f", "lavfi", "-i", "sine=frequency=300:duration=4.5",
+    "-filter_complex", "[0][1]concat=n=2:v=1:a=0[v]",
+    "-map", "[v]", "-map", "2", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac",
+    file("blackstart.mp4"),
+  ]);
 });
 
 after(() => rmSync(dir, { recursive: true, force: true }));
@@ -75,7 +100,7 @@ after(() => rmSync(dir, { recursive: true, force: true }));
 describe("picture", () => {
   test("info", () => {
     const result = JSON.parse(ok("picture", ["info", file("in.png")]));
-    assert.deepEqual(result, { width: 400, height: 300, format: "PNG" });
+    assert.deepEqual(result, { ok: true, width: 400, height: 300, format: "PNG" });
   });
 
   test("resize keeps aspect ratio with only width", () => {
@@ -380,5 +405,150 @@ describe("sound", () => {
     assert.equal(cli("sound", ["volume", file("nope.mp3"), file("x.mp3"), "--factor", "2"]).code, 1);
     assert.equal(cli("sound", ["mix", file("sound.mp3"), file("x.mp3")]).code, 1);
     assert.equal(cli("sound", ["help"]).code, 0);
+  });
+});
+
+describe("look", () => {
+  test("sheet makes a labelled grid of frames", () => {
+    const result = JSON.parse(ok("look", ["sheet", file("in.mp4"), file("sheet.png"), "--count", "4", "--width", "160"]));
+    assert.equal(result.times.length, 4);
+    // 2x2 grid of 160px frames, plus spacing and a title.
+    const size = picture.info(file("sheet.png"));
+    assert.ok(size.width >= 320 && size.width < 400, `width ${size.width}`);
+    assert.ok(size.height > 240, `height ${size.height}`);
+  });
+
+  test("sheet explains that sound files have no picture", () => {
+    const result = cli("look", ["sheet", file("sound.mp3"), file("x.png")]);
+    assert.equal(result.code, 1);
+    assert.match(result.stderr, /listen wave/);
+  });
+
+  test("strip makes one row of frames", () => {
+    const result = JSON.parse(ok("look", ["strip", file("in.mp4"), file("strip.png"), "--start", "1", "--end", "2", "--count", "5", "--width", "100"]));
+    assert.deepEqual(result.times, [1, 1.25, 1.5, 1.75, 2]);
+    const size = picture.info(file("strip.png"));
+    assert.ok(size.width >= 500 && size.width > size.height * 3, `${size.width}x${size.height}`);
+  });
+
+  test("scenes finds the cut between two clips", () => {
+    ok("video", ["concat", file("in.mp4"), file("silent.mp4"), file("two-shots.mp4")]);
+    const result = JSON.parse(ok("look", ["scenes", file("two-shots.mp4")]));
+    assert.equal(result.count, 1);
+    assert.ok(Math.abs(result.cuts[0] - 3) < 0.1, `cut at ${result.cuts[0]}`);
+  });
+
+  test("compare: same picture scores 0, different pictures more", () => {
+    ok("picture", ["flip", file("in.png"), file("flipped.png"), "--direction", "horizontal"]);
+    const same = JSON.parse(ok("look", ["compare", file("in.png"), file("in.png"), file("same.png")]));
+    const different = JSON.parse(ok("look", ["compare", file("in.png"), file("flipped.png"), file("different.png")]));
+    assert.equal(same.difference, 0);
+    assert.equal(same.same, true);
+    assert.ok(different.difference > 0.1);
+    assert.equal(different.same, false);
+    // Three panels side by side: first, second, differences.
+    assert.ok(picture.info(file("different.png")).width > 1200);
+  });
+});
+
+describe("listen", () => {
+  test("wave and spectrum make pictures", () => {
+    ok("listen", ["wave", file("gap.wav"), file("wave.png"), "--width", "800", "--height", "200"]);
+    ok("listen", ["spectrum", file("in.mp4"), file("spectrum.png")]);
+    assert.deepEqual(picture.info(file("wave.png")), { width: 800, height: 224, format: "PNG" });
+    assert.ok(picture.info(file("spectrum.png")).width >= 1200);
+  });
+
+  test("loudness measures and judges the sound", () => {
+    const quiet = JSON.parse(ok("listen", ["loudness", file("gap.wav")]));
+    assert.ok(quiet.lufs < -20);
+    assert.match(quiet.verdict, /too quiet/);
+    assert.match(quiet.issues[0].fix, /sound normalize/);
+    // After normalize it should be near -14 LUFS and judged good.
+    ok("sound", ["normalize", file("gap.wav"), file("gap-normal.wav")]);
+    const normal = JSON.parse(ok("listen", ["loudness", file("gap-normal.wav")]));
+    assert.ok(Math.abs(normal.lufs + 14) < 1.5, `lufs ${normal.lufs}`);
+    assert.equal(normal.verdict, "good");
+  });
+
+  test("silences finds the gap", () => {
+    const result = JSON.parse(ok("listen", ["silences", file("gap.wav")]));
+    assert.equal(result.count, 1);
+    assert.ok(Math.abs(result.silences[0].start - 2) < 0.1);
+    assert.ok(Math.abs(result.silences[0].end - 5) < 0.1);
+  });
+
+  test("beats finds 120 BPM in a click track", () => {
+    const result = JSON.parse(ok("listen", ["beats", file("click120.wav")]));
+    assert.ok(Math.abs(result.bpm - 120) <= 3, `bpm ${result.bpm}`);
+    assert.ok(result.count >= 14);
+    // Beats should land on the clicks (every 0.5s).
+    for (const time of result.beats) {
+      const offBy = Math.abs(time - Math.round(time * 2) / 2);
+      assert.ok(offBy < 0.06, `beat at ${time} is not on a click`);
+    }
+  });
+
+  test("beats needs at least 3 seconds", () => {
+    ok("sound", ["trim", file("click120.wav"), file("short.wav"), "--start", "0", "--end", "2"]);
+    assert.equal(cli("listen", ["beats", file("short.wav")]).code, 1);
+  });
+
+  test("transcribe gives words with times (needs the whisper pack)", (t) => {
+    const packs = JSON.parse(ok("joedit", ["packs"])).packs;
+    if (!packs.find((p: any) => p.name === "whisper")?.installed) return t.skip("whisper pack not installed");
+    execFileSync("say", ["-o", file("speech.aiff"), "Hello world. This is a test."]);
+    const result = JSON.parse(ok("listen", ["transcribe", file("speech.aiff"), file("speech.json"), "--model", "tiny"]));
+    assert.match(result.text.toLowerCase(), /hello/);
+    assert.ok(result.words >= 5);
+  });
+});
+
+describe("joedit", () => {
+  test("runs every area through one entry point", () => {
+    const result = JSON.parse(ok("joedit", ["video", "info", file("in.mp4")]));
+    assert.equal(result.width, 320);
+    ok("joedit", ["picture", "grayscale", file("in.png"), file("gray2.png")]);
+    assert.ok(existsSync(file("gray2.png")));
+  });
+
+  test("every edit prints JSON with the output path", () => {
+    const result = JSON.parse(ok("joedit", ["sound", "volume", file("sound.mp3"), file("louder2.mp3"), "--factor", "2"]));
+    assert.deepEqual(result, { ok: true, output: file("louder2.mp3") });
+  });
+
+  test("help lists every area, unknown names fail", () => {
+    const help = ok("joedit", []);
+    for (const area of ["picture", "video", "sound", "look", "listen", "doctor", "check"]) assert.match(help, new RegExp(area));
+    assert.equal(cli("joedit", ["dance"]).code, 1);
+  });
+
+  test("doctor reports the tools and machine", () => {
+    const result = JSON.parse(ok("joedit", ["doctor"]));
+    assert.equal(result.ready, true);
+    assert.ok(result.tools.find((t: any) => t.name === "ffmpeg").found);
+    assert.ok(result.machine.cores > 0);
+    assert.ok(Array.isArray(result.packs));
+  });
+
+  test("check finds black frames and suggests the exact trim", () => {
+    const result = JSON.parse(ok("joedit", ["check", file("blackstart.mp4")]));
+    assert.equal(result.passed, false);
+    const black = result.problems.find((p: any) => p.problem === "black picture");
+    assert.ok(black, "black picture not found");
+    assert.match(black.fix, /video trim .* --start 1\.5/);
+  });
+
+  test("check passes a clean, normalized video", () => {
+    ok("sound", ["normalize", file("in.mp4"), file("normal.wav")]);
+    ok("video", ["add-audio", file("in.mp4"), file("clean.mp4"), "--audio", file("normal.wav")]);
+    const result = JSON.parse(ok("joedit", ["check", file("clean.mp4")]));
+    assert.equal(result.passed, true, JSON.stringify(result.problems));
+  });
+
+  test("install rejects unknown packs", () => {
+    const result = cli("joedit", ["install", "nope"]);
+    assert.equal(result.code, 1);
+    assert.match(result.stderr, /Available packs: .*whisper/);
   });
 });
