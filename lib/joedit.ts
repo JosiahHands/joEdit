@@ -1,5 +1,5 @@
 // joEdit: one entry point for every tool.
-// Usage: node joedit.ts <area> <command> ...   (areas: picture, video, sound, look, listen, graphics, movie)
+// Usage: node joedit.ts <area> <command> ...   (areas: picture, video, sound, look, listen, graphics, movie, voice)
 //        node joedit.ts doctor | check <file> | packs | install <pack or asset>
 //        node joedit.ts            (lists every command)
 // This file also holds the top-level commands: doctor and check.
@@ -26,6 +26,7 @@ import * as movie from "./movie.ts";
 import * as picture from "./picture.ts";
 import * as sound from "./sound.ts";
 import * as video from "./video.ts";
+import * as voice from "./voice.ts";
 
 // Each area is a group of commands: node joedit.ts <area> <command>.
 const areas: Record<string, Record<string, Command>> = {
@@ -36,6 +37,7 @@ const areas: Record<string, Record<string, Command>> = {
   listen: listen.commands,
   graphics: graphics.commands,
   movie: movie.commands,
+  voice: voice.commands,
 };
 
 // ---------- doctor: is this computer ready? ----------
@@ -150,7 +152,8 @@ export function check(file: string): Report {
   const notes: string[] = [];
 
   if (hasVideo) {
-    const log = analyze(file, "video", "blackdetect=d=0.5:pix_th=0.10,freezedetect=n=-60dB:d=2");
+    // pix_th 0.03: only near-pure black counts, so dark design colors (like #0B0B0F) are not reported.
+    const log = analyze(file, "video", "blackdetect=d=0.5:pix_th=0.03,freezedetect=n=-60dB:d=2");
     for (const m of log.matchAll(/black_start:\s*([\d.]+)\s+black_end:\s*([\d.]+)/g)) {
       const [start, end] = [Number(m[1]), Number(m[2])];
       problems.push({ problem: "black picture", at: `${formatTime(start)}-${formatTime(end)}`, fix: cutFix(file, start, end, duration) });

@@ -12,7 +12,7 @@ import * as video from "./lib/video.ts";
 import * as sound from "./lib/sound.ts";
 import * as graphics from "./lib/graphics.ts";
 
-type Tool = "picture" | "video" | "sound" | "look" | "listen" | "graphics" | "movie" | "joedit";
+type Tool = "picture" | "video" | "sound" | "look" | "listen" | "graphics" | "movie" | "voice" | "joedit";
 
 // Graphics tests need Chrome; they are skipped on machines without it.
 const hasChrome = (() => {
@@ -23,11 +23,12 @@ const hasChrome = (() => {
   }
 })();
 
-// Captions need the whisper pack (to find word times) and Chrome.
-function hasWhisper(): boolean {
+// Tests that need an AI pack are skipped when it is not installed.
+function hasPack(name: string): boolean {
   const packs = JSON.parse(ok("joedit", ["packs"])).packs;
-  return Boolean(packs.find((p: any) => p.name === "whisper")?.installed);
+  return Boolean(packs.find((p: any) => p.name === name)?.installed);
 }
+const hasWhisper = () => hasPack("whisper");
 
 const dir = mkdtempSync(join(tmpdir(), "editor-test-"));
 const file = (name: string) => join(dir, name);
@@ -523,6 +524,78 @@ describe("movie", () => {
       const offBeat = Math.abs(cut - Math.round(cut * 2) / 2);
       assert.ok(offBeat < 0.08, `cut at ${cut} is not on a beat`);
     }
+  });
+});
+
+describe("voice", () => {
+  const sentence = "The quick brown fox jumps over the lazy dog.";
+
+  test("speak with Kokoro says the words, with word times (needs the tts pack)", (t) => {
+    if (!hasPack("tts")) return t.skip("tts pack not installed");
+    const result = JSON.parse(ok("voice", ["speak", file("spoken.wav"), "--text", sentence, "--voice", "am_michael", "--words", file("spoken.json")]));
+    assert.ok(result.duration > 1.5);
+    assert.ok(result.words >= 9);
+    if (hasWhisper()) {
+      const heard = JSON.parse(ok("listen", ["transcribe", file("spoken.wav"), file("heard.json"), "--model", "base"]));
+      assert.match(heard.text.toLowerCase(), /quick brown fox/);
+    }
+    assert.equal(cli("voice", ["speak", file("x.wav"), "--text", "hi", "--voice", "zz_nobody"]).code, 1);
+  });
+
+  test("speak with macOS say (no pack needed)", (t) => {
+    if (process.platform !== "darwin") return t.skip("say is macOS only");
+    ok("voice", ["speak", file("say.wav"), "--text", sentence, "--engine", "say"]);
+    assert.ok(sound.info(file("say.wav")).duration > 1.5);
+  });
+
+  test("clone refuses to run without consent", () => {
+    execFileSync("say", ["-o", file("sample.aiff"), "This is a sample of my voice for the test."]);
+    const result = cli("voice", ["clone", file("cloned.wav"), "--sample", file("sample.aiff"), "--text", "Hello there."]);
+    assert.equal(result.code, 1);
+    assert.match(result.stderr, /--consent/);
+  });
+
+  test("clone with consent writes the voice and a consent record (needs the clone pack)", (t) => {
+    if (!hasPack("clone")) return t.skip("clone pack not installed");
+    const consent = "Test voice made with macOS say by the developer";
+    ok("voice", ["clone", file("cloned.wav"), "--sample", file("sample.aiff"), "--text", "A brand new sentence.", "--consent", consent]);
+    assert.ok(sound.info(file("cloned.wav")).duration > 0.5);
+    const record = execFileSync("cat", [file("cloned.wav.consent.txt")], { encoding: "utf8" });
+    assert.match(record, new RegExp(consent));
+    assert.match(record, /sha256 [0-9a-f]{64}/);
+  });
+
+  test("stems separates a voice from drums (needs the stems pack)", (t) => {
+    if (!hasPack("stems")) return t.skip("stems pack not installed");
+    // 6s of drums, with speech only from 2s to about 4.5s.
+    execFileSync("say", ["-o", file("words.aiff"), "Separate my voice from these drums please."]);
+    execFileSync("ffmpeg", [
+      "-loglevel", "error", "-y",
+      "-f", "lavfi", "-i", "aevalsrc='0.7*sin(2*PI*(50+80*exp(-mod(t,0.5)*30))*t)*exp(-mod(t,0.5)*10)':s=44100:d=6",
+      "-i", file("words.aiff"),
+      "-filter_complex", "[1:a]aresample=44100,adelay=2000|2000[v];[0:a][v]amix=inputs=2:normalize=0:duration=first",
+      file("band.wav"),
+    ]);
+    const result = JSON.parse(ok("voice", ["stems", file("band.wav"), file("stems"), "--only", "vocals"]));
+    assert.deepEqual(result.stems, ["vocals", "without-vocals"]);
+    // The vocal stem is much louder while the voice speaks than before it starts.
+    assert.ok(loudness(join(file("stems"), "vocals.wav"), 1.8) < loudness(join(file("stems"), "vocals.wav")) - 10);
+  });
+
+  test("a movie voice-over is spoken, mixed and captioned (needs the tts pack and Chrome)", (t) => {
+    if (!hasPack("tts") || !hasChrome) return t.skip("tts pack or Chrome missing");
+    writeFileSync(file("vo.json"), JSON.stringify({
+      size: "320x180",
+      scenes: [{ color: "#203040", duration: 4 }],
+      voiceover: { text: sentence, voice: "af_heart", at: 0.3 },
+      captions: { style: "bold" },
+    }));
+    const result = JSON.parse(ok("movie", ["render", file("vo.json"), file("vo.mp4")]));
+    assert.equal(result.warnings, undefined);
+    frameAt(file("vo.mp4"), 1.5, file("vo.png"));
+    frameAt(file("vo.mp4"), 0.05, file("vo-start.png"));
+    assert.ok(regionDiff(file("vo-start.png"), file("vo.png"), "320x60+0+110") > 0.03, "no captions at 1.5s");
+    assert.ok(loudness(file("vo.mp4")) > -40);
   });
 });
 

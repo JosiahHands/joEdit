@@ -5,6 +5,7 @@ A studio for AI agents: edit pictures, video and sound, make motion graphics and
 - **Films from one JSON file:** scenes, transitions, titles, music that ducks under speech, sound effects, captions and a color look, with cached scenes and fast drafts.
 - **Edit:** trim, join, jump cuts, reframe for phones, picture-in-picture, color grades, film effects, sound mixing, denoising.
 - **Create:** HTML → video motion graphics, titles, lower-thirds, karaoke captions, sound effects.
+- **Voice:** natural text-to-speech, consent-based voice cloning, and splitting songs into vocals/drums/bass (open models, run locally).
 - **See & hear:** contact sheets, waveforms, loudness, beats, transcripts, and a one-command quality `check`.
 
 ## Install

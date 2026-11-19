@@ -8,14 +8,15 @@ Vision: anyone with an AI CLI subscription installs joEdit, tells their agent to
 * look.ts and listen.ts let the agent see and hear results (contact sheets, waveforms, loudness, silences, beats, transcripts).
 * graphics.ts renders HTML pages to video/PNG through headless Chrome (DevTools protocol, virtual clock), plus templates (title, lower-third, counter) and the caption overlays used by `video captions`. This ffmpeg has no drawtext/libass, so all text art goes through Chrome.
 * movie.ts renders a movie.json (scenes, transitions, text, audio mix with ducking, sfx, captions, look, beatSync) into a film. Scenes are cached in .joedit-cache/ next to the movie file; --draft renders at 1/3 size. Templates live in TEMPLATES.
+* voice.ts speaks text (tts pack: Kokoro, or macOS say), clones voices with required --consent (clone pack: Chatterbox, watermarked, consent record saved), and splits stems (stems pack: Demucs). Movies use it for "voiceover".
 * shared.ts holds the plumbing used by all files, including the pack system (packs/<name>/ = pyproject.toml + run.py, installed by `uv` into .packs/), downloadable assets (.assets/: fonts, browser) and the brand kit (brand.json).
 * Structure rule: one file per CLI area, no extra modularity. Optimize for the AI making the fastest and best edits.
 
 lib/ is a fully self-contained library (own package.json, tsconfig.json, .gitignore). It must never import from outside lib/.
 Setup: `cd lib && npm install` (only installs @types/node for editor type checking).
 Run a tool: `node lib/joedit.ts <area> <command> ...` (Node 24+ runs .ts directly, no build step).
-Run tests: `node --test test.ts` (transcribe is skipped without the whisper pack; graphics and captions are skipped without Chrome).
-Roadmap: ~/.claude/plans/i-have-vision-to-zazzy-leaf.md (Phase 1 done: eyes, ears & one CLI. Phase 2 done: graphics, captions, looks, sound effects. Phase 3 done: movie.json, remove-silence, reframe, pip, interpolate, animate).
+Run tests: `node --test test.ts` (tests that need a pack — whisper, tts, clone, stems — or Chrome are skipped when it is missing).
+Roadmap: ~/.claude/plans/i-have-vision-to-zazzy-leaf.md (Phase 1 done: eyes, ears & one CLI. Phase 2 done: graphics, captions, looks, sound effects. Phase 3 done: movie.json, remove-silence, reframe, pip, interpolate, animate. Phase 4 done: voice).
 ---
 The 3 top layer files are for development.
 ## Core Rules

@@ -3,7 +3,7 @@
 joEdit is a toolkit for editing pictures, video and sound, making motion graphics, and **seeing and hearing the results**. It runs entirely on this computer: no API keys, no cost per edit. Use it however suits the job: one command at a time, chained in a script, or imported as TypeScript functions. When joEdit doesn't do something, `ffmpeg`, `ffprobe` and `magick` are installed too, so call them directly or extend joEdit.
 
 ```
-node joedit.ts <area> <command> ...      areas: picture, video, sound, look, listen, graphics, movie
+node joedit.ts <area> <command> ...      areas: picture, video, sound, look, listen, graphics, movie, voice
 node joedit.ts                           prints every command
 node joedit.ts doctor                    shows what this computer has installed
 ```
@@ -123,6 +123,17 @@ beats <sound>                               → bpm and the time of every beat
 transcribe <sound> <out.json> [--model base] [--language en]   → every word with its time (whisper pack)
 ```
 
+**voice**: speech, voice cloning and stems (AI packs that run on this computer)
+```
+speak <out.wav> --text "..." [--file script.txt] [--voice af_heart] [--speed 1] [--words words.json] [--engine kokoro|say]
+voices                                      → Kokoro voices (with descriptions) and the macOS say voices
+clone <out.wav> --sample voice.wav --text "..." --consent "who agreed, and when" [--emotion 0.5] [--pace 0.5]
+stems <music> <folder> [--only vocals|drums|bass|other]   → vocals.wav drums.wav bass.wav other.wav
+```
+- `speak` uses Kokoro (`install tts`): natural voices in American and British English, plus Spanish, French, Hindi, Italian and Portuguese. Good picks: `af_heart` (warm), `am_michael` (warm male), `bm_george` (classic narrator), `af_bella` (lively). `--words` saves the time of every word, ready for `video captions --transcript`. `--engine say` uses the built-in macOS voices and needs no pack.
+- `clone` (`install clone`, Chatterbox) speaks new words in the voice of a 5–20 second sample. It needs `--consent` with a sentence about whose voice it is and that they agreed; that statement is saved in `<out>.consent.txt` (with a fingerprint of the sample) and in the file's metadata, and the speech carries Chatterbox's inaudible watermark. `--emotion` 0.25 (calm) … 1 (very expressive).
+- `stems` (`install stems`, Demucs) splits any song or video sound. `--only vocals` gives `vocals.wav` and `without-vocals.wav`: voice isolation from noisy footage, karaoke backing tracks, remixes, or ducking a song's music under new speech.
+
 **movie**: a whole film from one JSON file
 ```
 render <movie.json> <out.mp4> [--draft]     → duration, scenes rendered/cached, time taken, and a quality check
@@ -153,6 +164,7 @@ A movie file describes the film; joEdit does the cutting, transitions, text, sou
     {"file": "music.mp3", "volume": 0.5, "duck": true, "loop": true, "fadeIn": 1, "fadeOut": 2, "from": 10}
   ],
   "sfx": [{"type": "whoosh", "at": 2.9}, {"type": "boom", "at": 0, "volume": 1}],
+  "voiceover": {"text": "Every great film starts with a voice.", "voice": "am_michael", "at": 0.5},   // tts pack
   "captions": {"style": "karaoke", "position": "bottom"},   // or {"transcript": "words.json"}; true = defaults
   "beatSync": "music.mp3",                 // move every cut to the nearest beat
   "notes": "free text for yourself"
@@ -162,16 +174,18 @@ A movie file describes the film; joEdit does the cutting, transitions, text, sou
 - **Scenes** are one of `title`, `video`, `image`, `html` (any page you write, rendered like `graphics render`) or `color`. Non-video scenes last 3 seconds unless `duration` is given. Video scenes use `from`/`to` (or `duration`) and `fit`: `cover` fills the frame and crops the edges, `contain` shows the whole clip on a blurred copy of itself (good for wide clips in a phone video).
 - **Transitions** belong to the scene they lead into: `fade`, `fadeblack`, `fadewhite`, `dissolve`, `wipeleft/right/up/down`, `slideleft/right/up/down`, `smoothleft/right/up/down`, `circleopen`, `circleclose`, `radial`, `pixelize`, `zoomin`, `hblur`, `squeezeh`, `coverleft`, `revealright` and more (`validate` lists them all). Each transition overlaps the two scenes, so the film gets shorter by its duration.
 - **Sound:** scene sound, `audio` tracks and `sfx` are mixed together and set to -14 LUFS. Tracks with `"duck": true` go quiet whenever the other sound (speech) is loud. `at` is seconds from the start of the film.
-- **Captions** transcribe the final mix (whisper pack) unless a transcript is given.
-- After rendering, the result includes `check` (black frames, silence, loudness). An intended black ending will show up there, which is fine.
+- **Voice-over** is spoken with Kokoro, mixed in like an audio track (music with `duck` goes quiet under it), and cached.
+- **Captions** use the transcript if given, else the voice-over's own word times, else they transcribe the final mix (whisper pack).
+- After rendering, the result includes `check` (black frames, silence, loudness) and `warnings`, e.g. a voice-over longer than the film. An intended black ending shows up in `check`, which is fine.
 
 **top level**
 ```
 doctor                                      installed tools, machine, packs
 check <file>                                quality report with fix commands
 packs                                       available AI packs and assets, and whether they are installed
-install <name>                              a pack (e.g. whisper, needs uv) or an asset (fonts, browser)
+install <name>                              a pack (needs uv) or an asset (fonts, browser)
 ```
+Packs: `whisper` (speech to text), `tts` (speak), `clone` (voice cloning), `stems` (music separation). Each installs once (a few minutes, mostly downloading) and then runs offline; the first use of each also downloads its model.
 
 ## Examples
 Ideas for combining commands, not fixed recipes.
@@ -196,6 +210,22 @@ node joedit.ts movie render movie.json draft.mp4 --draft
 node joedit.ts look sheet draft.mp4 sheet.png
 (adjust, then the full render reuses every unchanged scene)
 node joedit.ts movie render movie.json final.mp4
+```
+
+**Narrated explainer, no microphone**
+```
+node joedit.ts voice speak narration.wav --file script.txt --voice bm_george --words words.json
+node joedit.ts sound duck music.mp3 narration.wav mix.wav
+node joedit.ts video add-audio visuals.mp4 narrated.mp4 --audio mix.wav
+node joedit.ts video captions narrated.mp4 final.mp4 --transcript words.json --style minimal
+```
+(or put `"voiceover"` in a movie file, which does all of this)
+
+**Clean up speech recorded in a noisy place**
+```
+node joedit.ts voice stems street-interview.mp4 parts --only vocals
+node joedit.ts sound denoise parts/vocals.wav clean.wav
+node joedit.ts video add-audio street-interview.mp4 fixed.mp4 --audio clean.wav
 ```
 
 **Podcast to phone clip**

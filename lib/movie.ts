@@ -5,12 +5,13 @@
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
-import { ffmpeg, loadBrand, requireFile, round, runCli, withTempDir, type Brand, type Command } from "./shared.ts";
+import { ffmpeg, listPacks, loadBrand, requireFile, round, runCli, withTempDir, type Brand, type Command } from "./shared.ts";
 import * as graphics from "./graphics.ts";
 import * as listen from "./listen.ts";
 import * as picture from "./picture.ts";
 import * as sound from "./sound.ts";
 import * as video from "./video.ts";
+import * as voice from "./voice.ts";
 
 // ---------- The movie file ----------
 
@@ -66,6 +67,7 @@ export type Movie = {
   audio?: Track[];
   sfx?: { type: string; at: number; volume?: number; duration?: number }[];
   captions?: boolean | { style?: graphics.CaptionStyle; position?: string; transcript?: string; model?: string };
+  voiceover?: { text: string; voice?: string; speed?: number; at?: number; volume?: number }; // spoken by the tts pack
   beatSync?: string; // a sound file: cuts move to its nearest beats
   notes?: string; // free text, ignored when rendering
 };
@@ -80,7 +82,7 @@ export const TRANSITIONS = [
 
 const SCENE_KINDS = ["video", "image", "title", "html", "color"];
 const SCENE_KEYS = [...SCENE_KINDS, "duration", "from", "to", "volume", "fit", "motion", "subtitle", "data", "look", "transition", "text"];
-const MOVIE_KEYS = ["size", "fps", "brand", "look", "lookStrength", "effects", "scenes", "audio", "sfx", "captions", "beatSync", "notes"];
+const MOVIE_KEYS = ["size", "fps", "brand", "look", "lookStrength", "effects", "scenes", "audio", "sfx", "captions", "voiceover", "beatSync", "notes"];
 const TRACK_KEYS = ["file", "at", "volume", "from", "to", "fadeIn", "fadeOut", "loop", "duck"];
 const DEFAULT_DURATION = 3;
 const CACHE_VERSION = 1; // bump to throw away old cached scenes after changing how scenes render
@@ -209,6 +211,11 @@ export function validate(movie: Movie, base: string): { valid: boolean; errors: 
     if (typeof effect.at !== "number") errors.push(`sfx ${n + 1}: add "at" (seconds from the start of the movie).`);
   });
   if (typeof movie.captions === "object" && movie.captions.transcript) file("captions", movie.captions.transcript);
+  if (movie.voiceover) {
+    if (!movie.voiceover.text) errors.push('voiceover: add "text" (the words to speak).');
+    if (movie.voiceover.voice && !voice.VOICES[movie.voiceover.voice]) errors.push(`voiceover: unknown voice "${movie.voiceover.voice}". See: node joedit.ts voice voices`);
+    if (!listPacks().find((p) => p.name === "tts")?.installed) errors.push("voiceover: needs the tts pack. Run: node joedit.ts install tts");
+  }
   return { valid: errors.length === 0, errors };
 }
 
@@ -364,7 +371,7 @@ function joinScenes(movie: Movie, files: string[], lengths: number[], output: st
 }
 
 // Mix the scene sound with music, voice-over and sound effects, then make it -14 LUFS.
-function mixSound(movie: Movie, joined: string, length: number, output: string, ctx: Context): void {
+function mixSound(movie: Movie, tracks: Track[], joined: string, length: number, output: string, ctx: Context): void {
   const inputs = ["-i", joined];
   const voices = ["[0:a]"]; // scene sound and normal tracks: these make ducked music go quiet
   const music: string[] = []; // tracks with duck: true
@@ -372,7 +379,7 @@ function mixSound(movie: Movie, joined: string, length: number, output: string, 
   let graph = "";
   let count = 1;
 
-  for (const [n, track] of (movie.audio ?? []).entries()) {
+  for (const [n, track] of tracks.entries()) {
     const file = pathFrom(ctx.base, track.file);
     const at = track.at ?? 0;
     const from = track.from ?? 0;
@@ -419,6 +426,17 @@ function mixSound(movie: Movie, joined: string, length: number, output: string, 
   else ffmpeg(["-i", raw, "-ar", "48000", output]);
 }
 
+// Speak the voice-over (cached like scenes). Returns the sound file and the time of every word.
+function makeVoiceover(spec: NonNullable<Movie["voiceover"]>, ctx: Context): { file: string; words: graphics.CaptionWord[] } {
+  const key = createHash("sha256").update(JSON.stringify({ text: spec.text, voice: spec.voice, speed: spec.speed })).digest("hex").slice(0, 16);
+  const file = join(ctx.cache, `voice-${key}.wav`);
+  const wordsFile = join(ctx.cache, `voice-${key}.json`);
+  if (!existsSync(file) || !existsSync(wordsFile)) {
+    voice.speak(file, spec.text, { voice: spec.voice, speed: spec.speed, words: wordsFile });
+  }
+  return { file, words: JSON.parse(readFileSync(wordsFile, "utf8")).words ?? [] };
+}
+
 // Render a movie file into a finished video.
 export async function renderMovie(file: string, output: string, draft = false) {
   const { movie, base } = loadMovie(file);
@@ -452,19 +470,37 @@ export async function renderMovie(file: string, output: string, draft = false) {
     // 2. Join, 3. mix the sound.
     const joined = join(temp, "joined.mp4");
     const length = joinScenes(movie, segments, lengths, joined, ctx);
+    const tracks = [...(movie.audio ?? [])];
+    const spoken = movie.voiceover ? makeVoiceover(movie.voiceover, ctx) : undefined;
+    if (spoken) tracks.push({ file: spoken.file, at: movie.voiceover!.at ?? 0, volume: movie.voiceover!.volume ?? 1 });
     const mixed = join(temp, "mix-final.wav");
-    mixSound(movie, joined, length, mixed, ctx);
+    mixSound(movie, tracks, joined, length, mixed, ctx);
+    // Sound that would be cut off by the end of the film (not for looped music, which is meant to be cut).
+    const warnings: string[] = [];
+    for (const track of tracks) {
+      if (track.loop) continue;
+      const end = (track.at ?? 0) + (track.to ?? sound.info(pathFrom(base, track.file)).duration) - (track.from ?? 0);
+      if (end > length + 0.1) {
+        const name = track.file === spoken?.file ? "the voice-over" : track.file;
+        warnings.push(`${name} ends at ${round(end)}s but the film is ${round(length)}s, so it is cut off. Make the scenes longer (or start it earlier).`);
+      }
+    }
 
-    // 4. Captions from the final sound.
+    // 4. Captions: from a transcript, from the voice-over's own word times, or by transcribing the final sound.
     let captionFile = "";
     if (movie.captions) {
       const options = typeof movie.captions === "object" ? movie.captions : {};
-      let transcript = options.transcript ? pathFrom(base, options.transcript) : "";
-      if (!transcript) {
-        transcript = join(temp, "words.json");
+      let words: graphics.CaptionWord[] = [];
+      if (options.transcript) {
+        words = JSON.parse(readFileSync(pathFrom(base, options.transcript), "utf8")).words ?? [];
+      } else if (spoken) {
+        const at = movie.voiceover!.at ?? 0;
+        words = spoken.words.map((w) => ({ word: w.word, start: w.start + at, end: w.end + at }));
+      } else {
+        const transcript = join(temp, "words.json");
         listen.transcribe(mixed, transcript, options.model ?? "base");
+        words = JSON.parse(readFileSync(transcript, "utf8")).words ?? [];
       }
-      const words = JSON.parse(readFileSync(transcript, "utf8")).words ?? [];
       if (words.length) {
         captionFile = join(temp, "captions.mov");
         await graphics.captionsOverlay(words, captionFile, { width, height, fps, duration: length, style: options.style, position: options.position, brand });
@@ -503,6 +539,7 @@ export async function renderMovie(file: string, output: string, draft = false) {
       cached,
       seconds: round((Date.now() - started) / 1000, 1),
       check: { passed: report.passed, problems: report.problems },
+      ...(warnings.length ? { warnings } : {}),
     };
   });
 }

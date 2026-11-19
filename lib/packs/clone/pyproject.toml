@@ -1,0 +1,10 @@
+[project]
+name = "joedit-clone"
+version = "0.1.0"
+description = "Speak in a voice from a short sample, with consent (Chatterbox, MIT, watermarked output)."
+requires-python = ">=3.10,<3.13"
+dependencies = [
+  "chatterbox-tts>=0.1.7",
+  # The watermarker (resemble-perth) still uses pkg_resources, which newer setuptools removed.
+  "setuptools<81",
+]
