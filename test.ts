@@ -772,9 +772,8 @@ describe("music", () => {
     assert.equal(execFileSync("head", ["-c", "4", file("score.mid")], { encoding: "utf8" }), "MThd");
   });
 
-  test("compose plays the score in time (needs the instruments asset and fluidsynth)", (t) => {
-    const hasFluidsynth = spawnSync("which", ["fluidsynth"]).status === 0;
-    if (!hasInstruments() || !hasFluidsynth) return t.skip("instruments asset or fluidsynth missing");
+  test("compose plays the score in time (needs the instruments asset)", (t) => {
+    if (!hasInstruments()) return t.skip("instruments asset missing");
     writeFileSync(file("score.json"), JSON.stringify(score));
     ok("music", ["compose", file("score.json"), file("score.wav")]);
     near(sound.info(file("score.wav")).duration, 9.5, 0.2); // 8 seconds plus the last notes ringing out
@@ -1048,6 +1047,75 @@ describe("sound", () => {
       return Number(log.match(/mean_volume: (-?[\d.]+) dB/)?.[1]);
     };
     assert.ok(music(0.5) - music(2.7) > 6, `music before ${music(0.5)} dB, under voice ${music(2.7)} dB`);
+  });
+
+  // Mean level in dB of part of a sound, after an optional filter.
+  const level = (path: string, from = 0, length = 60, filter = "anull") => {
+    const log = spawnSync(FFMPEG, ["-hide_banner", "-ss", String(from), "-t", String(length), "-i", path, "-af", `${filter},volumedetect`, "-f", "null", "-"], { encoding: "utf8" }).stderr;
+    return Number(log.match(/mean_volume: (-?[\d.]+) dB/)?.[1] ?? -91);
+  };
+
+  test("duck starts dipping before the voice and reports when people speak", () => {
+    const result = JSON.parse(ok("sound", ["duck", file("duck-music.wav"), file("duck-voice.wav"), file("ducked2.wav")]));
+    assert.equal(result.speech.length, 1);
+    near(result.speech[0][0], 2, 0.1);
+    near(result.speech[0][1], 4, 0.1);
+    // Already quieter in the 0.15 s right before the voice starts.
+    assert.ok(level(file("ducked2.wav"), 0.5, 0.5) - level(file("ducked2.wav"), 1.8, 0.15) > 4, "no look-ahead dip");
+  });
+
+  test("timeline places, loops and pans clips from JSON", () => {
+    writeFileSync(file("clips.json"), JSON.stringify([
+      { file: "duck-music.wav", role: "music", loop: true, volume: 0.5 },
+      { file: "tone.wav", at: 3, pan: -1 },
+    ]));
+    const result = JSON.parse(ok("sound", ["timeline", file("clips.json"), file("timeline.wav"), "--length", "8"]));
+    near(sound.info(file("timeline.wav")).duration, 8, 0.05);
+    near(result.speech[0][0], 3, 0.1);
+    // Looped music is still playing at 7 s; the tone panned left is louder on the left.
+    assert.ok(level(file("timeline.wav"), 6.5, 1) > -40, "loop stopped");
+    const side = (pan: string) => level(file("timeline.wav"), 3.2, 1, `pan=mono|c0=${pan},highpass=f=300`);
+    assert.ok(side("c0") - side("c1") > 20, "pan did not move the tone left");
+  });
+
+  test("fx adds a room echo that rings out", () => {
+    execFileSync(FFMPEG, ["-loglevel", "error", "-y", "-f", "lavfi", "-i", "sine=frequency=600:duration=0.5", file("blip.wav")]);
+    ok("sound", ["fx", file("blip.wav"), file("blip-hall.wav"), "--reverb", "hall", "--mix", "0.5"]);
+    assert.ok(sound.info(file("blip-hall.wav")).duration > 2.5, "no tail");
+    assert.ok(level(file("blip-hall.wav"), 0.7, 0.5) > -60, "no echo after the sound ends");
+    assert.equal(cli("sound", ["fx", file("blip.wav"), file("x.wav"), "--reverb", "bathroom"]).code, 1);
+    assert.equal(cli("sound", ["fx", file("blip.wav"), file("x.wav")]).code, 1);
+  });
+
+  test("fx telephone voice cuts the lows; video keeps its picture", () => {
+    // A low hum and a mid tone: the telephone keeps the mid tone and loses the hum.
+    execFileSync(FFMPEG, ["-loglevel", "error", "-y", "-f", "lavfi", "-i", "sine=frequency=120:duration=3", "-f", "lavfi", "-i", "sine=frequency=1500:duration=3", "-filter_complex", "[0][1]amix=inputs=2", file("two-tones.wav")]);
+    ok("sound", ["fx", file("two-tones.wav"), file("phone.wav"), "--voice", "telephone"]);
+    const lowShare = (path: string) => level(path, 0, 3, "lowpass=f=250") - level(path, 0, 3, "highpass=f=800");
+    assert.ok(lowShare(file("two-tones.wav")) - lowShare(file("phone.wav")) > 15, "lows not cut");
+    ok("sound", ["fx", file("in.mp4"), file("fx.mp4"), "--reverb", "room", "--width", "0"]);
+    const streams = probe(file("fx.mp4")).streams.map((s: any) => s.codec_type);
+    assert.deepEqual(streams.sort(), ["audio", "video"]);
+    near(sound.info(file("fx.mp4")).duration, 3, 0.15);
+  });
+
+  test("design renders an agent-written Web Audio script", () => {
+    writeFileSync(file("laser.js"), [
+      "export default ({ ctx, duration, noise }) => {",
+      "  const o = ctx.createOscillator();",
+      "  o.frequency.setValueAtTime(1200, 0);",
+      "  o.frequency.exponentialRampToValueAtTime(100, duration);",
+      "  const hiss = ctx.createBufferSource();",
+      "  hiss.buffer = noise(duration, 'pink');",
+      "  o.connect(ctx.destination); hiss.connect(ctx.destination);",
+      "  o.start(0); hiss.start(0);",
+      "};",
+    ].join("\n"));
+    ok("sound", ["design", file("laser.js"), file("laser.wav"), "--duration", "1.5"]);
+    near(sound.info(file("laser.wav")).duration, 1.5, 0.05);
+    assert.ok(level(file("laser.wav")) > -30);
+    writeFileSync(file("silent.js"), "export default () => {};");
+    assert.match(cli("sound", ["design", file("silent.js"), file("x.wav")]).stderr, /silence/);
   });
 
   test("denoise removes hiss and keeps the tone", () => {

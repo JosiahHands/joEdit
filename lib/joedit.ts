@@ -88,6 +88,7 @@ const LIBRARIES = [
   { name: "onnxruntime-node", does: "runs AI models (cutout and more)" },
   { name: "kokoro-js", does: "natural voices" },
   { name: "koffi", does: "loads raylib for GPU effects, transitions and shaders" },
+  { name: "spessasynth_core", does: "plays MIDI scores with the instruments SoundFont (music compose)" },
 ];
 
 // Is an npm library installed, and which version?
@@ -132,7 +133,6 @@ export function doctor() {
   const optional: Tool[] = [
     tool("blender", ["--version"], "3d (Blender scenes, 3D titles, turntables)", mac ? "brew install --cask blender" : "install Blender: https://www.blender.org/download/"),
     tool("uv", ["--version"], "Python AI packs: song, image, clone, stems, videogen", mac ? "brew install uv" : "curl -LsSf https://astral.sh/uv/install.sh | sh"),
-    tool("fluidsynth", ["--version"], "music compose", mac ? "brew install fluid-synth" : "sudo apt install fluidsynth"),
   ];
 
   const missingLibraries = libraries.filter((l) => !l.found);

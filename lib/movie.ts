@@ -56,6 +56,8 @@ export type Track = {
   fadeOut?: number;
   loop?: boolean; // repeat until the movie ends
   duck?: boolean; // turn down automatically while people speak (for music)
+  pan?: number; // -1 (left) .. 1 (right)
+  reverb?: string; // a room: room, studio, hall, plate, cathedral
 };
 
 export type Movie = {
@@ -99,7 +101,7 @@ const SCENE_KINDS = ["video", "image", "title", "html", "color"];
 const IMAGE_MOTIONS = [...picture.MOTIONS, "parallax", ...picture.PARALLAX_MOTIONS.map((m) => `parallax-${m}`)];
 const SCENE_KEYS = [...SCENE_KINDS, "duration", "from", "to", "volume", "fit", "motion", "subtitle", "data", "look", "transition", "text"];
 const MOVIE_KEYS = ["size", "fps", "brand", "look", "lookStrength", "effects", "scenes", "audio", "sfx", "captions", "voiceover", "music", "beatSync", "notes"];
-const TRACK_KEYS = ["file", "at", "volume", "from", "to", "fadeIn", "fadeOut", "loop", "duck"];
+const TRACK_KEYS = ["file", "at", "volume", "from", "to", "fadeIn", "fadeOut", "loop", "duck", "pan", "reverb"];
 const DEFAULT_DURATION = 3;
 const CACHE_VERSION = 1; // bump to throw away old cached scenes after changing how scenes render
 // How many scenes render at the same time (each encode already uses several cores).
@@ -236,6 +238,7 @@ export function validate(movie: Movie, base: string): { valid: boolean; errors: 
     const where = `audio ${n + 1}`;
     unknownKeys(where, track, TRACK_KEYS);
     file(where, track.file);
+    if (track.reverb && !sound.ROOMS[track.reverb]) errors.push(`${where}: unknown reverb "${track.reverb}". Rooms: ${Object.keys(sound.ROOMS).join(", ")}.`);
   });
   (movie.sfx ?? []).forEach((effect, n) => {
     if (!sound.SFX_TYPES.includes(effect.type)) errors.push(`sfx ${n + 1}: unknown type "${effect.type}". Types: ${sound.SFX_TYPES.join(", ")}.`);
@@ -407,71 +410,35 @@ function joinScenes(movie: Movie, files: string[], lengths: number[], output: st
   return length;
 }
 
-// Mix the scene sound with music, voice-over and sound effects, then make it -14 LUFS.
-function mixSound(movie: Movie, tracks: Track[], joined: string, length: number, output: string, ctx: Context): void {
-  const inputs = ["-i", joined];
-  const voices = ["[0:a]"]; // scene sound and normal tracks: these make ducked music go quiet
-  const music: string[] = []; // tracks with duck: true
-  const effects: string[] = [];
-  let graph = "";
-  let count = 1;
-
-  for (const [n, track] of tracks.entries()) {
-    const file = pathFrom(ctx.base, track.file);
-    const at = track.at ?? 0;
-    const from = track.from ?? 0;
-    const fileLength = (track.to ?? sound.info(file).duration) - from;
-    const plays = Math.max(0.1, track.loop ? length - at : Math.min(fileLength, length - at));
-    if (track.loop) inputs.push("-stream_loop", "-1");
-    inputs.push("-i", file);
-    let chain = `[${count++}:a]atrim=start=${from}${track.to && !track.loop ? `:end=${track.to}` : ""},asetpts=PTS-STARTPTS,${AUDIO_FORMAT}`;
-    chain += `,atrim=end=${round(plays, 3)},volume=${track.volume ?? 1}`;
-    if (track.fadeIn) chain += `,afade=t=in:d=${track.fadeIn}`;
-    if (track.fadeOut) chain += `,afade=t=out:st=${round(Math.max(0, plays - track.fadeOut), 3)}:d=${track.fadeOut}`;
-    chain += `,adelay=${Math.round(at * 1000)}:all=1[t${n}];`;
-    graph += chain;
-    (track.duck ? music : voices).push(`[t${n}]`);
+// Mix the scene sound with music, voice-over and sound effects (Web Audio), then make it -14 LUFS.
+// Music (duck: true) dips a moment before anyone speaks, in the scenes or the voice-over, and comes back after.
+async function mixSound(movie: Movie, tracks: Track[], joined: string, length: number, output: string, ctx: Context) {
+  const clips: sound.Clip[] = [{ file: joined, role: "voice" }]; // the scenes' own sound
+  for (const track of tracks) {
+    const { duck, ...rest } = track;
+    clips.push({ ...rest, file: pathFrom(ctx.base, track.file), role: duck ? "music" : "voice" });
   }
-
-  for (const [n, effect] of (movie.sfx ?? []).entries()) {
+  for (const effect of movie.sfx ?? []) {
     const file = join(ctx.cache, `sfx-${effect.type}-${effect.duration ?? "default"}.wav`);
     if (!existsSync(file)) sound.sfx(file, effect.type, effect.duration);
-    inputs.push("-i", file);
-    graph += `[${count++}:a]${AUDIO_FORMAT},volume=${effect.volume ?? 0.8},adelay=${Math.round(effect.at * 1000)}:all=1[s${n}];`;
-    effects.push(`[s${n}]`);
+    clips.push({ file, at: effect.at, volume: effect.volume ?? 0.8, role: "effect" });
   }
-
-  const mix = (labels: string[], out: string) =>
-    labels.length === 1 ? `${labels[0]}anull[${out}];` : `${labels.join("")}amix=inputs=${labels.length}:duration=longest:normalize=0[${out}];`;
-  graph += mix(voices, "voice");
-  const parts = ["[voice]"];
-  if (music.length) {
-    graph += mix(music, "music");
-    // The music gets quieter whenever the voice bus is loud (sidechain compression).
-    graph += `[voice]asplit=2[vmix][vkey];[music][vkey]sidechaincompress=threshold=0.03:ratio=8:attack=20:release=400[ducked];`;
-    parts[0] = "[vmix]";
-    parts.push("[ducked]");
-  }
-  parts.push(...effects);
-  graph += mix(parts, "all");
-  graph += `[all]apad=whole_dur=${round(length, 3)},atrim=end=${round(length, 3)}[out]`;
-
   const raw = join(ctx.temp, "mix.wav");
-  ffmpeg([...inputs, "-filter_complex", graph, "-map", "[out]", raw]);
+  await sound.mixClips(clips, raw, { length });
   // Silent movies stay silent; everything else is set to the online standard loudness.
   if (listen.loudness(raw).lufs > -60) sound.normalize(raw, output);
   else ffmpeg(["-i", raw, "-ar", "48000", output]);
 }
 
 // Make the movie's music (cached). Composed scores also give their exact beat times.
-function makeMusic(spec: MusicSpec, ctx: Context): { file: string; beats?: number[] } {
+async function makeMusic(spec: MusicSpec, ctx: Context): Promise<{ file: string; beats?: number[] }> {
   if (spec.file) return { file: pathFrom(ctx.base, spec.file) };
   if (spec.score) {
     const scoreFile = pathFrom(ctx.base, spec.score);
     const key = createHash("sha256").update(readFileSync(scoreFile)).digest("hex").slice(0, 16);
     const file = join(ctx.cache, `score-${key}.wav`);
     const score = JSON.parse(readFileSync(scoreFile, "utf8"));
-    const made = existsSync(file) ? { beats: music.scoreToMidi(score).beats } : music.compose(scoreFile, file);
+    const made = existsSync(file) ? { beats: music.scoreToMidi(score).beats } : await music.compose(scoreFile, file);
     const secondsPerBeat = 60 / (score.tempo ?? 120);
     return { file, beats: Array.from({ length: Math.ceil(made.beats) }, (_, k) => k * secondsPerBeat) };
   }
@@ -512,7 +479,7 @@ export async function renderMovie(file: string, output: string, draft = false) {
     const brand = loadBrand(movie.brand ? pathFrom(base, movie.brand) : undefined);
     const ctx: Context = { base, width, height, fps, draft, brand, cache, temp };
     // Music first, because beatSync can cut to its beats.
-    const backing = movie.music ? makeMusic(movie.music, ctx) : undefined;
+    const backing = movie.music ? await makeMusic(movie.music, ctx) : undefined;
     let beats: number[] = [];
     if (movie.beatSync === true && backing) beats = backing.beats ?? listen.beats(backing.file).beats;
     if (typeof movie.beatSync === "string") beats = listen.beats(pathFrom(base, movie.beatSync)).beats;
@@ -542,7 +509,7 @@ export async function renderMovie(file: string, output: string, draft = false) {
     const spoken = movie.voiceover ? makeVoiceover(movie.voiceover, ctx) : undefined;
     if (spoken) tracks.push({ file: spoken.file, at: movie.voiceover!.at ?? 0, volume: movie.voiceover!.volume ?? 1 });
     const mixed = join(temp, "mix-final.wav");
-    mixSound(movie, tracks, joined, length, mixed, ctx);
+    await mixSound(movie, tracks, joined, length, mixed, ctx);
     // Sound that would be cut off by the end of the film (not for looped music, which is meant to be cut).
     const warnings: string[] = [];
     for (const track of tracks) {

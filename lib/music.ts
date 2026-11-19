@@ -4,7 +4,7 @@
 // Library: import { compose } from "./joEdit/music.ts"
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { ASSETS, ffmpeg, hasProgram, optionalNumberFlag, requireFile, round, run, runCli, runPack, withTempDir, type Command } from "./shared.ts";
+import { ASSETS, need, optionalNumberFlag, requireFile, round, runCli, runPack, withTempDir, type Command } from "./shared.ts";
 import * as sound from "./sound.ts";
 
 // ---------- The score ----------
@@ -295,8 +295,31 @@ function soundfont(): string {
   return file;
 }
 
+// Play MIDI with the instrument sounds (SoundFont) and return the left and right channels.
+// Uses spessasynth, a SoundFont synthesizer written in JavaScript (no outside program needed).
+async function synthesize(midiBytes: Uint8Array, seconds: number, sampleRate = 48000): Promise<Float32Array[]> {
+  const { BasicMIDI, SoundBankLoader, SpessaSynthProcessor, SpessaSynthSequencer } = need("spessasynth_core");
+  const font = readFileSync(soundfont());
+  const synth = new SpessaSynthProcessor(sampleRate, { eventsEnabled: false });
+  synth.soundBankManager.addSoundBank(SoundBankLoader.fromArrayBuffer(font.buffer.slice(font.byteOffset, font.byteOffset + font.length)), "main");
+  await synth.ready;
+  synth.setSystemParameter("autoAllocateVoices", true); // no limit on notes playing at once
+  const sequencer = new SpessaSynthSequencer(synth);
+  sequencer.loadNewSongList([BasicMIDI.fromArrayBuffer(midiBytes.buffer.slice(midiBytes.byteOffset, midiBytes.byteOffset + midiBytes.length))]);
+  sequencer.play();
+  const total = Math.ceil(sampleRate * seconds);
+  const left = new Float32Array(total);
+  const right = new Float32Array(total);
+  // Small steps keep vibrato and other slow changes smooth.
+  for (let done = 0; done < total; done += 128) {
+    sequencer.processTick();
+    synth.process(left, right, done, Math.min(128, total - done));
+  }
+  return [left, right];
+}
+
 // Play a score with real instrument sounds. Output .mid writes just the MIDI file (for other music apps).
-export function compose(scoreFile: string, output: string) {
+export async function compose(scoreFile: string, output: string) {
   const score: Score = JSON.parse(readFileSync(requireFile(scoreFile), "utf8"));
   const { midi, beats } = scoreToMidi(score);
   const tempo = score.tempo ?? 120;
@@ -305,17 +328,15 @@ export function compose(scoreFile: string, output: string) {
     writeFileSync(output, midi);
     return result;
   }
-  if (!hasProgram("fluidsynth")) throw new Error("Music needs fluidsynth. Install it: brew install fluid-synth (macOS) or apt install fluidsynth (Linux)");
-  const font = soundfont();
-  withTempDir((folder) => {
-    const midiFile = join(folder, "score.mid");
+  // The musical length plus a moment for the last notes to ring, faded out, then standard loudness.
+  const length = result.seconds + 1.5;
+  const channels = await synthesize(midi, length);
+  const fadeStart = Math.floor((result.seconds + 0.5) * 48000);
+  for (const channel of channels) for (let i = fadeStart; i < channel.length; i++) channel[i] *= 1 - (i - fadeStart) / (channel.length - fadeStart);
+  await withTempDir(async (folder) => {
     const raw = join(folder, "raw.wav");
-    writeFileSync(midiFile, midi);
-    run("fluidsynth", ["-ni", "-q", "-g", "0.7", "-r", "44100", "-F", raw, font, midiFile]);
-    // Keep the musical length (plus a moment for the last notes to ring), then set standard loudness.
-    const trimmed = join(folder, "trimmed.wav");
-    ffmpeg(["-i", raw, "-af", `atrim=end=${result.seconds + 1.5},afade=t=out:st=${result.seconds + 0.5}:d=1`, trimmed]);
-    sound.normalize(trimmed, output);
+    sound.writeWav(raw, channels, 48000);
+    sound.normalize(raw, output);
   });
   return result;
 }
@@ -336,7 +357,7 @@ export function song(output: string, prompt: string, options: { lyrics?: string;
 
 export const commands: Record<string, Command> = {
   compose: {
-    usage: "compose <score.json> <output.wav|.mp3|.mid>  (needs: install instruments, and fluidsynth)",
+    usage: "compose <score.json> <output.wav|.mp3|.mid>  (needs: install instruments)",
     run: (a) => {
       if (a.positional.length < 2) throw new Error("Give the score file and the output.");
       return compose(a.positional[0], a.positional[1]);
