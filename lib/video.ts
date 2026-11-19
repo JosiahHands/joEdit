@@ -254,7 +254,7 @@ export function effects(input: string, output: string, chosen: Effects): void {
 
 // ---------- Captions ----------
 
-// Burn animated captions into a video. Uses a transcript from `listen transcribe`, or makes one (whisper pack).
+// Burn animated captions into a video. Uses a transcript from `listen transcribe`, or makes one (whisper model).
 export async function captions(
   input: string,
   output: string,

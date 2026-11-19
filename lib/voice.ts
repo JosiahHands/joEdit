@@ -181,7 +181,7 @@ export async function speak(output: string, text: string, options: SpeakOptions 
   });
 }
 
-// The voices you can use: Kokoro's (tts pack) and, on macOS, the system voices for --engine say.
+// The voices you can use: Kokoro's (kokoro model) and, on macOS, the system voices for --engine say.
 export function voices() {
   const kokoro = Object.entries(VOICES).map(([name, description]) => ({ name, description }));
   let say: string[] = [];

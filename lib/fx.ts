@@ -481,7 +481,7 @@ const EFFECTS: Record<string, Effect> = {
   // ----- color -----
   grade: {
     kind: "color",
-    does: "exposure (stops), contrast, saturation and warmth (-1 cool .. 1 warm); animate these with movie keyframes",
+    does: "exposure (stops), contrast, saturation and warmth (-1 cool .. 1 warm)",
     settings: { exposure: 0, contrast: 1, saturation: 1, warmth: 0 },
     glsl: `vec4 effect(vec2 uv) {
   vec4 c = pixel(uv);

@@ -547,9 +547,17 @@ export async function canvas(
       return images.get(file);
     },
   };
+  const name = basename(script);
   return drawFrames(output, o, async (ctx, t) => {
     const frame = Math.round(t * o.fps);
-    await draw(ctx, t, { ...info, frame, level: audio?.levels[frame] ?? 0 });
+    try {
+      await draw(ctx, t, { ...info, frame, level: audio?.levels[frame] ?? 0 });
+    } catch (error) {
+      // Point at the line in the draw file, e.g. "ctx.nope is not a function (draw.mjs line 2, at 0.5 s)".
+      const place = String((error as Error).stack ?? "").match(new RegExp(`/${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}:(\\d+):\\d+`));
+      const where = place ? `${name} line ${place[1]}, ` : "";
+      throw new Error(`${(error as Error).message} (${where}at ${round(t, 2)} s)`);
+    }
   }, o.time ?? 0);
 }
 

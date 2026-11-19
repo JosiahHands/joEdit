@@ -1025,9 +1025,9 @@ describe("graphics", () => {
     assert.equal(pixel(file("box1.png"), 120, 20), "srgb(255,0,0)");
     const result = JSON.parse(ok("graphics", ["canvas", file("draw.mjs"), file("box.mp4"), "--duration", "1", "--fps", "10", ...size]));
     assert.equal(result.frames, 10);
-    // A draw file with a mistake gives a clear error.
-    writeFileSync(file("bad.mjs"), "export default function draw(ctx) { ctx.nope(); }");
-    assert.match(cli("graphics", ["canvas", file("bad.mjs"), file("bad.png"), "--time", "0"]).stderr, /nope/);
+    // A draw file with a mistake gives a clear error with its line.
+    writeFileSync(file("bad.mjs"), "export default function draw(ctx) {\n  ctx.nope();\n}");
+    assert.match(cli("graphics", ["canvas", file("bad.mjs"), file("bad.png"), "--time", "0"]).stderr, /nope.*bad\.mjs line 2/);
   });
 });
 

@@ -894,7 +894,7 @@ export const ASSET_LIST: Asset[] = [
   },
   {
     name: "browser",
-    description: "A headless Chrome for graphics, only needed if Google Chrome or Chromium is not installed.",
+    description: "A headless Chrome for HTML pages (graphics render and still), only needed if Google Chrome or Chromium is not installed.",
     license: "BSD (Chromium)",
     command: ["npx", "-y", "@puppeteer/browsers", "install", "chrome-headless-shell@stable", "--path"],
   },

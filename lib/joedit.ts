@@ -1,6 +1,6 @@
 // joEdit: one entry point for every tool.
 // Usage: node joedit.ts <area> <command> ...   (areas: picture, video, sound, look, listen, graphics, fx, movie, voice, music, 3d)
-//        node joedit.ts doctor | check <file> | packs | install <pack or asset>
+//        node joedit.ts doctor | check <file> | packs | install <model, asset or pack>
 //        node joedit.ts            (lists every command)
 // This file also holds the top-level commands: doctor and check.
 import { cpus, totalmem } from "node:os";
@@ -8,6 +8,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   DEFAULT_FONT,
+  FFMPEG,
   LIB,
   LIBS,
   analyze,
@@ -53,7 +54,7 @@ const areas: Record<string, Record<string, Command>> = {
 
 // ---------- doctor: is this computer ready? ----------
 
-type Tool = { name: string; found: boolean; version?: string; neededFor: string; optional?: boolean; fix?: string };
+type Tool = { name: string; found: boolean; version?: string; path?: string; neededFor: string; optional?: boolean; fix?: string };
 
 // First line of a program's version text, or "" if the program is missing.
 function versionOf(program: string, args: string[]): string {
@@ -124,7 +125,8 @@ export function doctor() {
       neededFor: "everything",
       fix: nodeMajor >= 24 ? undefined : "install Node.js 24 or newer: https://nodejs.org",
     },
-    tool("ffmpeg", ["-version"], "video, sound, look, listen, check", `cd ${LIB} && npm install`),
+    // joEdit's own ffmpeg: its path is shown so it can be run directly for anything joEdit has no command for.
+    { ...tool("ffmpeg", ["-version"], "video, sound, look, listen, check", `cd ${LIB} && npm install`), path: FFMPEG },
     {
       name: "font",
       found: existsSync(DEFAULT_FONT),

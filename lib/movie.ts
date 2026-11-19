@@ -90,7 +90,7 @@ export type Scene = {
   to?: number; // video: end time in the clip
   volume?: number; // video: loudness of the clip's own sound (0 = silent)
   fit?: "cover" | "contain"; // video: fill the frame (crop) or fit inside it (blurred background)
-  motion?: string; // image: zoom-in, zoom-out, pan-left, pan-right, pan-up, pan-down, none, or parallax (3D, needs the depth pack)
+  motion?: string; // image: zoom-in, zoom-out, pan-left, pan-right, pan-up, pan-down, none, or parallax (3D, needs: install depth)
   subtitle?: string; // title: smaller second line
   data?: unknown; // html: window.joedit.data; canvas: info.data
   look?: string; // a color grade for this scene only
