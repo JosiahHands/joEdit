@@ -2,3 +2,4 @@ node_modules/
 .packs/
 .assets/
 .joedit-cache/
+__pycache__/
