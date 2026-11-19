@@ -671,6 +671,71 @@ describe("movie", () => {
     assert.match(render.stderr, /missing\.mp4/);
   });
 
+  test("layers move by keyframes and follow a tracked thing", async () => {
+    await paint(file("square.png"), 40, 40, () => WHITE);
+    // A made-up track: a 40x40 box moving from the left to the right of a 320x180 clip in 2 seconds.
+    const points = [0, 1, 2].map((t) => ({ time: t, x: 20 + t * 120, y: 70, width: 40, height: 40 }));
+    writeFileSync(file("box-track.json"), JSON.stringify({ label: "box", width: 320, height: 180, every: 1, points }));
+    write("layers.json", {
+      size: "320x180",
+      scenes: [
+        { color: "black", duration: 2, layers: [
+          // Top strip: slides from x 0.25 to 0.75.
+          { image: "square.png", width: 0.1, y: 0.15, keys: [{ time: 0, x: 0.25 }, { time: 1.9, x: 0.75 }] },
+          // Middle: sits on the tracked box.
+          { image: "square.png", width: 0.1, track: "box-track.json", anchor: "center", blend: "screen" },
+        ] },
+      ],
+    });
+    ok("movie", ["render", file("layers.json"), file("layers.mp4")]);
+    frameAt(file("layers.mp4"), 0.05, file("layers-start.png"));
+    frameAt(file("layers.mp4"), 1.95, file("layers-end.png"));
+    const bright = (path: string, region: string) => mean(path, region) > 0.5;
+    // Keyframes: left at the start, right at the end.
+    assert.ok(bright(file("layers-start.png"), "20x10+70+22") && !bright(file("layers-start.png"), "20x10+230+22"));
+    assert.ok(bright(file("layers-end.png"), "20x10+230+22") && !bright(file("layers-end.png"), "20x10+70+22"));
+    // Tracking: the box centre is at x 40 at the start and x 280 at the end (y 90).
+    assert.ok(bright(file("layers-start.png"), "10x10+35+85") && !bright(file("layers-start.png"), "10x10+275+85"));
+    assert.ok(bright(file("layers-end.png"), "10x10+275+85"));
+  });
+
+  test("scene fx with keyframed amount and a GPU transition", (t) => {
+    if (!hasRaylib) return t.skip("raylib not included for this system");
+    write("gpu.json", {
+      size: "320x180",
+      scenes: [
+        { color: "#ff0000", duration: 1 },
+        // Inverted blue is yellow; the effect fades in over the first 0.4 s of the scene.
+        { color: "#0000ff", duration: 1.5, transition: { type: "cube", duration: 0.5 }, fx: { effect: "invert", keys: [{ time: 0, amount: 0 }, { time: 0.4, amount: 1 }] } },
+      ],
+      fx: "vignette",
+    });
+    const result = JSON.parse(ok("movie", ["render", file("gpu.json"), file("gpu.mp4")]));
+    near(result.duration, 2, 0.05); // 1 + 1.5 - 0.5
+    const centre = (time: number) => {
+      frameAt(file("gpu.mp4"), time, file("gpu.png"));
+      return pixel(file("gpu.png"), 160, 90).match(/[\d.]+/g)!.map(Number);
+    };
+    const [r0, g0, b0] = centre(0.2);
+    assert.ok(r0 > 200 && g0 < 50 && b0 < 50, `not red at the start: ${r0},${g0},${b0}`);
+    const [r1, g1, b1] = centre(1.9);
+    assert.ok(r1 > 200 && g1 > 200 && b1 < 60, `not yellow (inverted blue) at the end: ${r1},${g1},${b1}`);
+  });
+
+  test("validate explains the movie v2 keys", () => {
+    write("bad2.json", {
+      scenes: [
+        { color: "red", fx: "sparkle", layers: [{ text: "hi", blend: "melt", keys: [{ time: 0, color: 1 }] }, { image: "in.png", text: "both" }] },
+        { color: "blue", transition: "warp-speed", fx: { effect: "lut" } },
+      ],
+      voiceover: { text: "hello", reverb: "bathroom" },
+    });
+    const all = JSON.parse(ok("movie", ["validate", file("bad2.json")])).errors.join("\n");
+    for (const hint of [/effect "sparkle"/, /blend "melt"/, /"color" cannot be keyframed/, /exactly one of image, video or text/, /transition "warp-speed"/, /lut effect needs/, /reverb "bathroom"/]) {
+      assert.match(all, hint);
+    }
+  });
+
   test("templates write starting movies that name their placeholder files", () => {
     const list = JSON.parse(ok("movie", ["templates"])).templates;
     assert.ok(list.length >= 6);

@@ -887,6 +887,11 @@ function loadLut(file: string): { size: number; texture: Texture } {
   return { size, texture: upload(`lut:${file}`, table, size * size, size) };
 }
 
+// Every built-in effect name (plus "lut").
+export function effectNames(): string[] {
+  return [...Object.keys(EFFECTS), "lut"];
+}
+
 // Turn effect names (or .glsl files) and --set values into ready shaders, in order.
 export function prepareEffects(names: string[], set: Record<string, string> = {}, lut?: string): Step[] {
   if (!names.length) throw new Error(`Name at least one effect with --effect, e.g. --effect bloom,grain. See: node joedit.ts fx list`);
@@ -1150,6 +1155,33 @@ async function* clipFrames(input: string, o: { width: number; height: number; fp
 
 const even = (n: number) => Math.max(2, Math.round(n / 2) * 2);
 
+// The frames of a transition: the end of `first` (from `head` seconds on) blending into the start of `second`,
+// over `duration` seconds. Both clips are read at exactly width x height and fps.
+export async function* transitionFrames(
+  shader: any,
+  first: string,
+  second: string,
+  size: { width: number; height: number; fps: number },
+  head: number,
+  duration: number,
+): AsyncGenerator<Buffer> {
+  const tail = clipFrames(first, { ...size, start: head, duration });
+  const start = clipFrames(second, { ...size, duration });
+  const count = Math.max(1, Math.round(duration * size.fps));
+  let from: Frame | undefined;
+  let to: Frame | undefined;
+  for (let n = 0; n < count; n++) {
+    const nextFrom = await tail.next();
+    const nextTo = await start.next();
+    if (!nextFrom.done) from = nextFrom.value;
+    if (!nextTo.done) to = nextTo.value;
+    if (!from || !to) break;
+    yield transitionFrame(shader, from.pixels, to.pixels, size.width, size.height, (n + 0.5) / count);
+  }
+  while (!(await tail.next()).done); // let both readers finish
+  while (!(await start.next()).done);
+}
+
 // ---------- Commands ----------
 
 // Apply effects to a picture or video. A picture with a video output becomes a clip of `duration` seconds
@@ -1220,21 +1252,7 @@ export async function transition(first: string, second: string, output: string, 
     // 1. The first clip until the transition starts.
     if (head > 0) for await (const frame of clipFrames(first, { ...size, duration: head })) await writer.write(frame.pixels);
     // 2. The overlap: both clips at once.
-    const tail = clipFrames(first, { ...size, start: head, duration });
-    const start = clipFrames(second, { ...size, duration });
-    const count = Math.max(1, Math.round(duration * fps));
-    let from: Frame | undefined;
-    let to: Frame | undefined;
-    for (let n = 0; n < count; n++) {
-      const nextFrom = await tail.next();
-      const nextTo = await start.next();
-      if (!nextFrom.done) from = nextFrom.value;
-      if (!nextTo.done) to = nextTo.value;
-      if (!from || !to) break;
-      await writer.write(transitionFrame(shader, from.pixels, to.pixels, width, height, (n + 0.5) / count));
-    }
-    while (!(await tail.next()).done); // let both readers finish
-    while (!(await start.next()).done);
+    for await (const pixels of transitionFrames(shader, first, second, size, head, duration)) await writer.write(pixels);
     // 3. The rest of the second clip.
     for await (const frame of clipFrames(second, { ...size, start: duration, duration: b.length - duration })) await writer.write(frame.pixels);
     await writer.finish();
