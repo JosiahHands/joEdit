@@ -1,0 +1,19 @@
+[project]
+name = "joedit-image"
+version = "0.1.0"
+description = "Pictures from a description (Z-Image Turbo, Apache-2.0): mflux on Apple Silicon, diffusers on NVIDIA. ~6 GB of models."
+requires-python = ">=3.11,<3.13"
+dependencies = [
+  "mflux>=0.24; sys_platform == 'darwin' and platform_machine == 'arm64'",
+  "diffusers>=0.36; sys_platform != 'darwin'",
+  "torch>=2.5; sys_platform != 'darwin'",
+  "transformers>=4.51; sys_platform != 'darwin'",
+  "accelerate; sys_platform != 'darwin'",
+]
+
+[tool.uv]
+environments = [
+  "sys_platform == 'darwin' and platform_machine == 'arm64'",
+  "sys_platform == 'linux'",
+  "sys_platform == 'win32'",
+]

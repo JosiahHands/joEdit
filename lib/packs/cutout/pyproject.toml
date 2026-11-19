@@ -1,0 +1,6 @@
+[project]
+name = "joedit-cutout"
+version = "0.1.0"
+description = "Remove backgrounds: people and objects on a see-through background (rembg + BiRefNet, MIT)."
+requires-python = ">=3.11,<3.14"
+dependencies = ["rembg[cpu]>=2.0.60", "pillow"]

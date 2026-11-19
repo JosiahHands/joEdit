@@ -37,7 +37,7 @@ export type Scene = {
   to?: number; // video: end time in the clip
   volume?: number; // video: loudness of the clip's own sound (0 = silent)
   fit?: "cover" | "contain"; // video: fill the frame (crop) or fit inside it (blurred background)
-  motion?: string; // image: zoom-in, zoom-out, pan-left, pan-right, pan-up, pan-down, none
+  motion?: string; // image: zoom-in, zoom-out, pan-left, pan-right, pan-up, pan-down, none, or parallax (3D, needs the depth pack)
   subtitle?: string; // title: smaller second line
   data?: unknown; // html: given to the page as window.joedit.data
   look?: string; // a color grade for this scene only
@@ -94,6 +94,8 @@ export const TRANSITIONS = [
 ];
 
 const SCENE_KINDS = ["video", "image", "title", "html", "color"];
+// Flat moves (Ken Burns) and 2.5D moves that use the picture's depth.
+const IMAGE_MOTIONS = [...picture.MOTIONS, "parallax", ...picture.PARALLAX_MOTIONS.map((m) => `parallax-${m}`)];
 const SCENE_KEYS = [...SCENE_KINDS, "duration", "from", "to", "volume", "fit", "motion", "subtitle", "data", "look", "transition", "text"];
 const MOVIE_KEYS = ["size", "fps", "brand", "look", "lookStrength", "effects", "scenes", "audio", "sfx", "captions", "voiceover", "music", "beatSync", "notes"];
 const TRACK_KEYS = ["file", "at", "volume", "from", "to", "fadeIn", "fadeOut", "loop", "duck"];
@@ -201,7 +203,10 @@ export function validate(movie: Movie, base: string): { valid: boolean; errors: 
       }
       if (scene.image) file(where, scene.image);
       if (scene.html) file(where, scene.html);
-      if (scene.motion && !picture.MOTIONS.includes(scene.motion)) errors.push(`${where}: unknown motion "${scene.motion}". Motions: ${picture.MOTIONS.join(", ")}.`);
+      if (scene.motion && !IMAGE_MOTIONS.includes(scene.motion)) errors.push(`${where}: unknown motion "${scene.motion}". Motions: ${IMAGE_MOTIONS.join(", ")}.`);
+      if (scene.motion?.startsWith("parallax") && !listPacks().find((p) => p.name === "depth")?.installed) {
+        errors.push(`${where}: "${scene.motion}" needs the depth pack. Run: node joedit.ts install depth`);
+      }
       if (scene.duration !== undefined && !(scene.duration > 0)) errors.push(`${where}: duration must be more than 0 seconds.`);
       if (scene.look && !video.LOOKS[scene.look]) errors.push(`${where}: unknown look "${scene.look}". Looks: ${Object.keys(video.LOOKS).join(", ")}.`);
       const transition = transitionOf(scene);
@@ -323,7 +328,11 @@ async function renderScene(scene: Scene, n: number, duration: number, ctx: Conte
     graph += hasAudio ? `[0:a]${AUDIO_FORMAT},volume=${scene.volume ?? 1},apad[a]` : `[1:a]${AUDIO_FORMAT}[a]`;
   } else {
     const made = join(ctx.temp, `scene-${n}.mp4`);
-    if (scene.image) {
+    if (scene.motion?.startsWith("parallax")) {
+      // "parallax" is a slow push in; "parallax-orbit", "parallax-pan-left", ... pick another 3D camera move.
+      const motion = scene.motion === "parallax" ? "dolly" : scene.motion.slice("parallax-".length);
+      await picture.parallax(pathFrom(ctx.base, scene.image!), made, { duration, motion, width, height, fps });
+    } else if (scene.image) {
       picture.animate(pathFrom(ctx.base, scene.image), made, { duration, motion: scene.motion ?? "zoom-in", width, height, fps });
     } else if (scene.title !== undefined) {
       await graphics.title(made, { text: scene.title, subtitle: scene.subtitle, duration, width, height, fps, brand: ctx.brand });

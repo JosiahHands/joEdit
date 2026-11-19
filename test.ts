@@ -29,6 +29,7 @@ function hasPack(name: string): boolean {
   return Boolean(packs.find((p: any) => p.name === name)?.installed);
 }
 const hasWhisper = () => hasPack("whisper");
+const hasAsset = (name: string) => existsSync(join("lib", ".assets", name));
 
 const dir = mkdtempSync(join(tmpdir(), "editor-test-"));
 const file = (name: string) => join(dir, name);
@@ -233,6 +234,57 @@ describe("picture", () => {
     assert.equal(cli("picture", ["animate", file("in.png"), file("x.mp4"), "--motion", "spin"]).code, 1);
   });
 
+  test("generate makes a picture from a description", (t) => {
+    if (!hasPack("image")) return t.skip("image pack not installed");
+    const result = JSON.parse(ok("picture", ["generate", file("made.jpg"), "--prompt", "a red apple on a white table", "--width", "512", "--height", "384", "--steps", "4", "--seed", "1"]));
+    assert.equal(result.seed, 1);
+    assert.deepEqual(picture.info(file("made.jpg")), { width: 512, height: 384, format: "JPEG" });
+    assert.equal(cli("picture", ["generate", file("x.png")]).code, 1); // no --prompt
+  });
+
+  test("upscale makes a picture bigger", (t) => {
+    if (!hasAsset("upscaler")) return t.skip("upscaler asset not installed");
+    ok("picture", ["resize", file("in.png"), file("small.png"), "--width", "100"]);
+    const result = JSON.parse(ok("picture", ["upscale", file("small.png"), file("big.png"), "--scale", "3"]));
+    assert.deepEqual([result.width, result.height], [300, 225]);
+    assert.deepEqual(picture.info(file("big.png")), { width: 300, height: 225, format: "PNG" });
+    assert.equal(cli("picture", ["upscale", file("small.png"), file("x.png"), "--scale", "5"]).code, 1);
+  });
+
+  test("cutout removes the background", (t) => {
+    if (!hasPack("cutout")) return t.skip("cutout pack not installed");
+    execFileSync("magick", ["-size", "320x240", "xc:white", "-fill", "red", "-draw", "circle 160,120 160,50", file("subject.png")]);
+    ok("picture", ["cutout", file("subject.png"), file("cut.png")]);
+    // The ball stays, the white around it becomes see-through.
+    assert.match(execFileSync("magick", [file("cut.png"), "-format", "%[pixel:p{160,120}]", "info:"], { encoding: "utf8" }), /^srgba?\(25\d,/);
+    assert.equal(execFileSync("magick", [file("cut.png"), "-format", "%[fx:p{5,5}.a]", "info:"], { encoding: "utf8" }), "0");
+    ok("picture", ["cutout", file("subject.png"), file("mask.png"), "--mask"]);
+    assert.ok(mean(file("mask.png")) > 0.1 && mean(file("mask.png")) < 0.5);
+  });
+
+  test("depth makes a near-white, far-black map", (t) => {
+    if (!hasPack("depth")) return t.skip("depth pack not installed");
+    const result = JSON.parse(ok("picture", ["depth", file("subject.png"), file("depth.png")]));
+    assert.deepEqual([result.width, result.height], [320, 240]);
+    assert.deepEqual(picture.info(file("depth.png")), { width: 320, height: 240, format: "PNG" });
+  });
+
+  test("parallax moves near parts more than far parts", (t) => {
+    if (!hasChrome) return t.skip("Chrome not found");
+    // A hand-made depth map: the top half is near (white), the bottom half far (black).
+    execFileSync("magick", ["-size", "400x150", "xc:white", "-size", "400x150", "xc:black", "-append", file("halves-depth.png")]);
+    execFileSync("magick", ["-size", "400x300", "pattern:checkerboard", "-scale", "400%", file("checks.png")]);
+    const result = JSON.parse(ok("picture", ["parallax", file("checks.png"), file("parallax.mp4"), "--depth", file("halves-depth.png"),
+      "--motion", "pan-right", "--duration", "1", "--width", "320", "--height", "240"]));
+    assert.equal(result.frames, 30);
+    frameAt(file("parallax.mp4"), 0, file("px-start.png"));
+    frameAt(file("parallax.mp4"), 0.95, file("px-end.png"));
+    const nearMove = regionDiff(file("px-start.png"), file("px-end.png"), "320x80+0+20");
+    const farMove = regionDiff(file("px-start.png"), file("px-end.png"), "320x80+0+140");
+    assert.ok(nearMove > farMove, `near ${nearMove} should move more than far ${farMove}`);
+    assert.equal(cli("picture", ["parallax", file("checks.png"), file("x.mp4"), "--motion", "spin"]).code, 1);
+  });
+
   test("errors: missing file, missing flag, unknown command", () => {
     assert.equal(cli("picture", ["resize", file("nope.png"), file("x.png"), "--width", "10"]).code, 1);
     assert.equal(cli("picture", ["crop", file("in.png"), file("x.png"), "--x", "1"]).code, 1);
@@ -394,6 +446,28 @@ describe("video", () => {
     assert.equal(cli("video", ["reframe", file("in.mp4"), file("x.mp4"), "--aspect", "wide"]).code, 1);
   });
 
+  test("reframe --follow keeps a moving subject in the crop", (t) => {
+    if (!hasPack("cutout")) return t.skip("cutout pack not installed");
+    // A red ball moving from the left to the right of a wide video.
+    execFileSync("magick", ["-size", "100x100", "xc:none", "-fill", "red", "-draw", "circle 50,50 50,5", file("ball-small.png")]);
+    execFileSync("ffmpeg", [
+      "-loglevel", "error", "-y", "-f", "lavfi", "-i", "color=c=0xDDDDDD:s=640x360:r=30:d=3", "-i", file("ball-small.png"),
+      "-filter_complex", "[0][1]overlay=x='20+t*170':y=130,format=yuv420p", file("moving.mp4"),
+    ]);
+    const result = JSON.parse(ok("video", ["reframe", file("moving.mp4"), file("follow.mp4"), "--aspect", "9:16", "--follow", "--smooth", "1"]));
+    assert.deepEqual([result.width, result.height], [202, 360]);
+    // The crop moves right with the ball, and the ball is near the middle of the crop halfway through.
+    assert.ok(result.path.at(-1).x > result.path[0].x + 200, JSON.stringify(result.path));
+    frameAt(file("follow.mp4"), 1.5, file("follow-mid.png"));
+    assert.match(pixel(file("follow-mid.png"), 101, 180), /^srgb\(2[0-5]\d,[0-4]?\d,[0-4]?\d\)$/);
+  });
+
+  test("generate explains what it needs", () => {
+    const result = cli("video", ["generate", file("x.mp4")]);
+    assert.equal(result.code, 1);
+    assert.match(result.stderr, /--prompt/);
+  });
+
   test("pip puts a small video in a corner", () => {
     ok("video", ["pip", file("in.mp4"), file("silent.mp4"), file("pip.mp4"), "--corner", "top-left", "--size", "0.4"]);
     assert.equal(video.info(file("pip.mp4")).width, 320);
@@ -464,7 +538,7 @@ describe("movie", () => {
     const result = JSON.parse(ok("movie", ["validate", file("bad.json")]));
     assert.equal(result.valid, false);
     const all = result.errors.join("\n");
-    for (const hint of [/size/, /first scene/, /missing\.mp4/, /motion "spin"/, /unknown key "durration"/, /exactly one of/, /transition "teleport"/, /kazoo/]) {
+    for (const hint of [/size/, /first scene/, /missing\.mp4/, /motion "spin"/, /parallax-orbit/, /unknown key "durration"/, /exactly one of/, /transition "teleport"/, /kazoo/]) {
       assert.match(all, hint);
     }
     // Rendering a broken movie fails with the same list.
@@ -921,6 +995,38 @@ describe("look", () => {
     assert.equal(different.same, false);
     // Three panels side by side: first, second, differences.
     assert.ok(picture.info(file("different.png")).width > 1200);
+  });
+
+  test("colors finds the main colors and their shares", () => {
+    // in.png is 3/4 red and 1/4 blue.
+    const result = JSON.parse(ok("look", ["colors", file("in.png"), "--count", "4", "--swatch", file("swatch.png")]));
+    assert.equal(result.colors.length, 2, JSON.stringify(result.colors));
+    // Color reduction may land a step off (e.g. #0100FE), so compare each channel loosely.
+    const channels = (hex: string) => [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16));
+    const close = (hex: string, expected: string) => channels(hex).every((v, i) => Math.abs(v - channels(expected)[i]) <= 4);
+    assert.ok(close(result.colors[0].hex, "#FF0000"), result.colors[0].hex);
+    near(result.colors[0].share, 0.75, 0.02);
+    assert.ok(close(result.colors[1].hex, "#0000FF"), result.colors[1].hex);
+    assert.ok(existsSync(file("swatch.png")));
+  });
+
+  test("find locates the moment that matches a description", (t) => {
+    if (!hasPack("vision")) return t.skip("vision pack not installed");
+    // 2s of blue sky color, 2s of a red ball on white, 2s of green: the ball is at 2-4s.
+    execFileSync("magick", ["-size", "320x240", "xc:white", "-fill", "red", "-draw", "circle 160,120 160,40", file("ball.png")]);
+    execFileSync("ffmpeg", [
+      "-loglevel", "error", "-y",
+      "-f", "lavfi", "-i", "color=c=0x3B82F6:s=320x240:r=30:d=2",
+      "-loop", "1", "-t", "2", "-r", "30", "-i", file("ball.png"),
+      "-f", "lavfi", "-i", "color=c=0x16A34A:s=320x240:r=30:d=2",
+      "-filter_complex", "[0][1][2]concat=n=3:v=1[v]", "-map", "[v]", "-pix_fmt", "yuv420p", file("find.mp4"),
+    ]);
+    const result = JSON.parse(ok("look", ["find", file("find.mp4"), "--query", "a red ball", "--top", "1", "--sheet", file("found.png")]));
+    const best = result.matches[0];
+    assert.ok(best.time > 2 && best.time < 4, `best match at ${best.time}`);
+    near(best.start, 2, 0.01);
+    near(best.end, 4, 0.01);
+    assert.ok(existsSync(file("found.png")));
   });
 });
 

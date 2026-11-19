@@ -1,0 +1,6 @@
+[project]
+name = "joedit-depth"
+version = "0.1.0"
+description = "Depth maps: how far away each part of a picture is (Depth Anything V2 Small, Apache-2.0)."
+requires-python = ">=3.11,<3.14"
+dependencies = ["transformers>=4.45", "torch>=2.4", "pillow"]

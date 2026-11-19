@@ -43,7 +43,18 @@ grade | effects                             same looks and effects as video (bel
 animate <in> <out.mp4> [--duration 5] [--motion zoom-in|zoom-out|pan-left|pan-right|pan-up|pan-down|none] [--amount 0.15] [--width 1920] [--height 1080]
                                             slow camera move over a still ("Ken Burns")
 convert <in> <out> [--quality 1..100]       e.g. .png → .jpg
+generate <out.png> --prompt "..." [--width 1024] [--height 1024] [--seed N] [--steps 9]   new picture from a description
+upscale <in> <out> [--scale 2|3|4] [--style photo|art]   bigger, with AI-restored detail
+cutout <in> <out.png> [--mask]              remove the background (see-through PNG), or a white-on-black mask of the subject
+depth <in> <out.png>                        depth map: near = white, far = black
+parallax <in> <out.mp4> [--motion dolly|orbit|pan-left|pan-right|rise|fall] [--duration 5] [--amount 1] [--depth map.png]
+                                            3D camera move inside a still photo: near things move more than far things
 ```
+- `generate` (`install image`, Z-Image Turbo) makes photoreal or illustrated pictures in seconds on Apple Silicon or an NVIDIA GPU. Describe the subject, setting, light, lens and style in plain words (`"studio portrait, soft window light, 85mm, film grain"`). The same `--seed` and prompt give the same picture, so you can change one word and compare. It also renders short text in the picture well.
+- `upscale` (`install upscaler`, Real-ESRGAN) restores detail when enlarging: old photos, small web pictures, generated pictures before printing. `--style art` is tuned for drawings, anime and graphics.
+- `cutout` (`install cutout`) keeps hair and fine edges. Put the subject on a new background with `magick bg.jpg cut.png -composite out.jpg`, or use `--mask` with ffmpeg/magick to grade or blur only the subject or only the background.
+- `depth` (`install depth`) is the base for parallax, fake depth of field (blur by the map), fog, and "near/far" masks.
+- `parallax` (`install depth` + Chrome) brings a still to life far more than `animate`: a slow `dolly` push in, an `orbit` sway, or a sideways pan. `--amount` above 1 moves more but starts to stretch the edges of near objects; check a frame. `--depth` reuses a map you already made.
 
 **video** (ffmpeg)
 ```
@@ -65,9 +76,13 @@ effects <in> <out> [--grain 0..1] [--vignette 0..1] [--letterbox 2.39] [--glow 0
 captions <in> <out> [--transcript words.json] [--style karaoke|pop|bold|minimal] [--position bottom|center|top] [--brand brand.json]
 remove-silence <in> <out> [--min 0.6] [--db -35] [--pad 0.1]   automatic jump cuts: removes every pause longer than --min
 reframe <in> <out> --aspect 9:16|1:1|4:5|16:9 [--x 0..1] [--y 0..1]   crop to a new shape; --x 0 = keep left, 1 = keep right
+reframe <in> <out> --aspect 9:16 --follow [--smooth 2] [--every 0.5]   the crop follows the main subject as it moves
 pip <main> <small> <out> [--corner bottom-right] [--size 0.3]   picture-in-picture (sound from main)
 interpolate <in> <out> [--fps 60]           invents in-between frames: smoother motion, or slow motion with `speed`
+generate <out.mp4> --prompt "..." [--image start.png] [--seconds 5] [--steps 50] [--seed N]   AI video clip
 ```
+- `reframe --follow` (`install cutout`) finds the subject every `--every` seconds and glides the crop along its path like a camera operator; `--smooth` is seconds of smoothing (bigger = calmer). The result includes the crop `path`. It is the quick way to turn landscape footage of a person or product into a phone video.
+- `generate` (`install videogen`, Wan 2.2 TI2V-5B) makes a clip from a description, or animates `--image` (for example a `picture generate` result). It needs a big GPU (24 GB+ of video memory, ~30 GB of models) and takes minutes per clip; on smaller machines, `picture parallax` and `picture animate` bring stills to life instead.
 `captions` makes its own transcript (whisper pack) when none is given. A transcript is any JSON with `{"words": [{"word", "start", "end"}]}`, so you can fix spellings in it, or write one by hand, before burning it in. Styles: `karaoke` lights each word as it is spoken, `pop` grows the spoken word, `bold` is big uppercase lines, `minimal` is plain subtitles.
 
 **sound** (ffmpeg; also reads the sound of video files)
@@ -111,7 +126,11 @@ sheet <video> <out.png> [--count 12]        frames from the whole video, labelle
 strip <video> <out.png> --start S --end S [--count 8]   close-up of one moment
 scenes <video> [--threshold 0.3]            → times of shot changes (0.1 sensitive … 0.6 hard cuts only)
 compare <pic1> <pic2> <out.png>             → difference 0..1, plus a picture marking differences in red
+find <video|picture|folder> --query "a dog on a beach" [--top 5] [--every 1] [--sheet out.png]   search by meaning
+colors <picture|video> [--count 6] [--swatch out.png]   → main colors (hex) and their share of the picture
 ```
+- `find` (`install vision`, SigLIP 2) searches what footage shows, not what it is called: `"close-up of hands typing"`, `"crowd cheering"`, `"logo on a white background"`. Each match has the best `time` and the whole moment (`start`–`end`), ready for `video trim` or a movie scene's `from`/`to`. Scores only mean something relative to each other within one search. Frames are cached in `.joedit-cache/`, so further searches of the same footage take seconds.
+- `colors` gives a palette to match titles, captions and brand colors to the footage.
 
 **listen**: sound as numbers, text and pictures
 ```
@@ -180,6 +199,7 @@ A movie file describes the film; joEdit does the cutting, transitions, text, sou
     {"title": "Big title", "subtitle": "small line", "duration": 3},
     {"video": "clip.mp4", "from": 2, "to": 8, "volume": 1, "fit": "cover"},
     {"image": "photo.jpg", "motion": "zoom-in", "duration": 4, "transition": "fade"},
+    {"image": "landscape.jpg", "motion": "parallax", "duration": 4},   // 3D move, depth pack
     {"html": "chart.html", "data": {"values": [1, 2]}, "duration": 5, "transition": {"type": "slideleft", "duration": 0.6}},
     {"color": "#000000", "duration": 1},
     {"video": "b.mp4", "look": "noir", "text": [
@@ -199,7 +219,7 @@ A movie file describes the film; joEdit does the cutting, transitions, text, sou
 }
 ```
 (Comments above are explanations; JSON itself has no comments.)
-- **Scenes** are one of `title`, `video`, `image`, `html` (any page you write, rendered like `graphics render`) or `color`. Non-video scenes last 3 seconds unless `duration` is given. Video scenes use `from`/`to` (or `duration`) and `fit`: `cover` fills the frame and crops the edges, `contain` shows the whole clip on a blurred copy of itself (good for wide clips in a phone video).
+- **Scenes** are one of `title`, `video`, `image`, `html` (any page you write, rendered like `graphics render`) or `color`. Non-video scenes last 3 seconds unless `duration` is given. Image `motion` is a flat move (`zoom-in` (default), `zoom-out`, `pan-left/right/up/down`, `none`) or a 3D one: `parallax` (a push in), `parallax-orbit`, `parallax-pan-left/right`, `parallax-rise/fall`. Video scenes use `from`/`to` (or `duration`) and `fit`: `cover` fills the frame and crops the edges, `contain` shows the whole clip on a blurred copy of itself (good for wide clips in a phone video).
 - **Transitions** belong to the scene they lead into: `fade`, `fadeblack`, `fadewhite`, `dissolve`, `wipeleft/right/up/down`, `slideleft/right/up/down`, `smoothleft/right/up/down`, `circleopen`, `circleclose`, `radial`, `pixelize`, `zoomin`, `hblur`, `squeezeh`, `coverleft`, `revealright` and more (`validate` lists them all). Each transition overlaps the two scenes, so the film gets shorter by its duration.
 - **Sound:** scene sound, `audio` tracks and `sfx` are mixed together and set to -14 LUFS. Tracks with `"duck": true` go quiet whenever the other sound (speech) is loud. `at` is seconds from the start of the film.
 - **Music** is made once and cached: a `score` is composed (with exact beat times for `beatSync`), a `song` is generated by the song pack, a `file` is used as it is. It ducks under speech unless `"duck": false`, and fades out over 2 seconds unless `fadeOut` says otherwise.
@@ -214,7 +234,7 @@ check <file>                                quality report with fix commands
 packs                                       available AI packs and assets, and whether they are installed
 install <name>                              a pack (needs uv) or an asset (fonts, browser)
 ```
-Packs: `whisper` (speech to text), `tts` (speak), `clone` (voice cloning), `stems` (music separation), `song` (AI songs). Assets: `fonts`, `instruments` (sounds for music compose), `browser`. Each installs once (a few minutes, mostly downloading) and then runs offline; the first use of each also downloads its model.
+Packs: `whisper` (speech to text), `tts` (speak), `clone` (voice cloning), `stems` (music separation), `song` (AI songs), `image` (picture generate), `cutout` (backgrounds, follow), `depth` (depth maps, parallax), `vision` (look find), `videogen` (video generate, big GPU). Assets: `fonts`, `instruments` (sounds for music compose), `upscaler`, `browser`. Each installs once (a few minutes, mostly downloading) and then runs offline; the first use of each also downloads its model.
 
 ## Examples
 Ideas for combining commands, not fixed recipes.
@@ -261,7 +281,7 @@ node joedit.ts video add-audio street-interview.mp4 fixed.mp4 --audio clean.wav
 ```
 node joedit.ts video trim podcast.mp4 part.mp4 --start 754 --end 812
 node joedit.ts video remove-silence part.mp4 tight.mp4
-node joedit.ts video reframe tight.mp4 tall.mp4 --aspect 9:16 --x 0.3      (keep the speaker on the left)
+node joedit.ts video reframe tight.mp4 tall.mp4 --aspect 9:16 --x 0.3      (keep the speaker on the left; or --follow if they move)
 node joedit.ts video captions tall.mp4 final.mp4 --style karaoke
 ```
 
@@ -318,6 +338,22 @@ ffmpeg -i interview.mp4 -itsoffset 2 -i tag.mov -filter_complex "[0:v][1:v]overl
 node joedit.ts install whisper
 node joedit.ts listen transcribe interview.mp4 words.json
 (find the phrase in words.json, then trim from its first word's start to its last word's end)
+```
+
+**Find a moment by what is shown**
+```
+node joedit.ts look find holiday/ --query "kids jumping into a pool" --top 3 --sheet found.png
+                                                      → holiday/day2.mp4 start 41 end 47, ...
+node joedit.ts video trim holiday/day2.mp4 splash.mp4 --start 41 --end 47
+```
+
+**Product shot from one photo**
+```
+node joedit.ts picture cutout phone.jpg phone.png
+node joedit.ts picture generate set.png --prompt "minimal marble table, soft morning light, blurred plants behind" --width 1920 --height 1080
+magick set.png ( phone.png -resize 45% ) -gravity center -composite scene.png
+node joedit.ts look colors scene.png                   → pick title colors that fit
+node joedit.ts picture parallax scene.png shot.mp4 --motion dolly --duration 5
 ```
 
 ## Use from code

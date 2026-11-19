@@ -1,0 +1,21 @@
+[project]
+name = "joedit-videogen"
+version = "0.1.0"
+description = "Video clips from a description or a starting picture (Wan 2.2 TI2V-5B, Apache-2.0). Needs a big GPU (24 GB+); ~30 GB of models."
+requires-python = ">=3.11,<3.13"
+dependencies = [
+  "diffusers>=0.35",
+  "transformers>=4.51",
+  "torch>=2.5",
+  "accelerate",
+  "ftfy",
+  "sentencepiece",
+  "pillow",
+]
+
+[tool.uv]
+environments = [
+  "sys_platform == 'darwin' and platform_machine == 'arm64'",
+  "sys_platform == 'linux'",
+  "sys_platform == 'win32'",
+]

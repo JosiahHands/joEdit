@@ -3,8 +3,9 @@
 // CLI:     node joedit.ts look <command> ...
 // Library: import { sheet } from "./joEdit/look.ts"
 import { spawnSync } from "node:child_process";
-import { existsSync } from "node:fs";
-import { basename, join } from "node:path";
+import { createHash } from "node:crypto";
+import { existsSync, mkdirSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { basename, dirname, join, resolve } from "node:path";
 import {
   DEFAULT_FONT,
   analyze,
@@ -17,6 +18,7 @@ import {
   round,
   run,
   runCli,
+  runPack,
   withTempDir,
   type Command,
 } from "./shared.ts";
@@ -126,7 +128,146 @@ export function compare(first: string, second: string, output: string): { differ
   });
 }
 
+const PICTURE_FILE = /\.(png|jpe?g|webp|gif|bmp|tiff?|heic)$/i;
+const VIDEO_FILE = /\.(mp4|mov|m4v|mkv|webm|avi)$/i;
+
+// time: the best frame; start / end: the whole moment that matches (videos only).
+export type Match = { file: string; time?: number; start?: number; end?: number; score: number };
+
+// Search pictures and videos by meaning: "a dog on a beach", "close-up of hands typing" (vision pack).
+// input: a video, a picture or a folder of them. Videos are sampled every `every` seconds.
+// Frames and their embeddings are cached in .joedit-cache/ next to the input, so the next search is fast.
+export function find(input: string, query: string, options: { top?: number; every?: number; sheet?: string } = {}) {
+  requireFile(input);
+  if (!query.trim()) throw new Error('Describe what to find with --query, e.g. --query "a red car".');
+  const { top = 5, every = 1 } = options;
+  const files = statSync(input).isDirectory()
+    ? readdirSync(input).filter((name) => PICTURE_FILE.test(name) || VIDEO_FILE.test(name)).sort().map((name) => join(input, name))
+    : [input];
+  if (files.length === 0) throw new Error("No pictures or videos in this folder.");
+  const cacheRoot = join(statSync(input).isDirectory() ? input : dirname(input), ".joedit-cache", "find");
+
+  // Every candidate is one picture on disk: a picture file, or one frame of a video.
+  const candidates: { picture: string; file: string; time?: number }[] = [];
+  for (const file of files) {
+    if (PICTURE_FILE.test(file)) {
+      candidates.push({ picture: file, file });
+      continue;
+    }
+    const length = video.info(file).duration;
+    const key = createHash("sha256").update(`${resolve(file)}|${statSync(file).mtimeMs}|${every}`).digest("hex").slice(0, 16);
+    const folder = join(cacheRoot, key);
+    if (!existsSync(join(folder, "done"))) {
+      mkdirSync(folder, { recursive: true });
+      // One small frame from the middle of every `every` seconds.
+      ffmpeg(["-i", file, "-vf", `fps=1/${every},scale=384:-2`, "-q:v", "3", join(folder, "%05d.jpg")]);
+      writeFileSync(join(folder, "done"), "");
+    }
+    readdirSync(folder).filter((name) => name.endsWith(".jpg")).sort().forEach((name, n) => {
+      const time = round((n + 0.5) * every);
+      if (time < length) candidates.push({ picture: join(folder, name), file, time });
+    });
+  }
+
+  mkdirSync(cacheRoot, { recursive: true });
+  const cacheKey = createHash("sha256").update(candidates.map((c) => resolve(c.picture)).join("|")).digest("hex").slice(0, 16);
+  const { scores } = runPack("vision", ["--query", query, "--cache", join(cacheRoot, `${cacheKey}.npz`), ...candidates.map((c) => c.picture)]);
+
+  // Best first. For a video, a match grows into a moment (start - end) over the neighbouring frames
+  // that also match well, and frames inside a moment already found are skipped.
+  // Matches far weaker than the best one (under a tenth of its score) are left out.
+  const scored = candidates.map((c, n) => ({ ...c, n, score: scores[n] as number }));
+  const best = Math.max(...scored.map((c) => c.score));
+  const chosen: (typeof scored[number] & { start?: number; end?: number })[] = [];
+  for (const candidate of [...scored].sort((a, b) => b.score - a.score)) {
+    if (chosen.length === top || candidate.score < best * 0.1) break;
+    if (candidate.time === undefined) {
+      chosen.push(candidate);
+      continue;
+    }
+    if (chosen.some((c) => c.file === candidate.file && candidate.time! >= c.start! && candidate.time! <= c.end!)) continue;
+    const sameMoment = (c: (typeof scored)[number] | undefined) => c && c.file === candidate.file && c.score >= candidate.score * 0.5;
+    let first = candidate.n;
+    let last = candidate.n;
+    while (sameMoment(scored[first - 1])) first--;
+    while (sameMoment(scored[last + 1])) last++;
+    chosen.push({ ...candidate, start: round(Math.max(0, scored[first].time! - every / 2)), end: round(scored[last].time! + every / 2) });
+  }
+  const matches: Match[] = chosen.map((c) => ({
+    file: c.file,
+    ...(c.time === undefined ? {} : { time: c.time, start: c.start, end: c.end }),
+    score: round(c.score, 4),
+  }));
+
+  // Optional picture of the matches, best first, labelled with the file, time and score.
+  if (options.sheet) {
+    const labelled = chosen.flatMap((c) => [
+      "-label", `${basename(c.file)}${c.time === undefined ? "" : ` ${formatTime(c.start!)}-${formatTime(c.end!)}`}  ${round(c.score, 3)}`, c.picture,
+    ]);
+    run("magick", [
+      "montage", "-font", DEFAULT_FONT, "-pointsize", "14", "-fill", "white", "-background", "#202020",
+      ...labelled, "-tile", `${Math.min(chosen.length, 5)}x`, "-geometry", "320x+4+4", "-title", query, options.sheet,
+    ]);
+  }
+  return { query, searched: candidates.length, matches, ...(options.sheet ? { sheet: options.sheet } : {}) };
+}
+
+// The main colors of a picture or video, biggest share first, as hex codes.
+// Useful to match text, titles and brand colors to the footage. swatch: optional picture of the palette.
+export function colors(input: string, count = 6, swatch?: string) {
+  requireFile(input);
+  return withTempDir((folder) => {
+    let source = input;
+    if (!PICTURE_FILE.test(input)) {
+      // A video: put 6 frames from across it side by side and read the colors of all of them.
+      const length = requireVideo(input).duration;
+      const frames = Array.from({ length: 6 }, (_, n) => {
+        const frame = join(folder, `frame${n}.png`);
+        ffmpeg(["-ss", String(((n + 0.5) * length) / 6), "-i", input, "-frames:v", "1", "-vf", "scale=240:-2", "-update", "1", frame]);
+        return frame;
+      }).filter((frame) => existsSync(frame));
+      source = join(folder, "frames.png");
+      run("magick", [...frames, "+append", source]);
+    }
+    // Shrink, then let ImageMagick pick `count` representative colors and count their pixels.
+    const histogram = run("magick", [source, "-resize", "200x200", "-alpha", "off", "+dither", "-colors", String(count), "-format", "%c", "histogram:info:-"]);
+    const found = [...histogram.matchAll(/^\s*(\d+):.*?(#[0-9A-F]{6})/gim)].map((m) => ({ hex: m[2].toUpperCase(), pixels: Number(m[1]) }));
+    const total = found.reduce((sum, c) => sum + c.pixels, 0);
+    // Merge colors that look the same (soft edges make near-copies) into the bigger one.
+    const rgb = (hex: string) => [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16));
+    const distance = (a: string, b: string) => Math.hypot(...rgb(a).map((v, i) => v - rgb(b)[i]));
+    const merged: typeof found = [];
+    for (const c of found.sort((a, b) => b.pixels - a.pixels)) {
+      const same = merged.find((m) => distance(m.hex, c.hex) < 20);
+      if (same) same.pixels += c.pixels;
+      else merged.push({ ...c });
+    }
+    const palette = merged.map((c) => ({ hex: c.hex, share: round(c.pixels / total, 3) }));
+    if (swatch) {
+      run("magick", [
+        ...palette.flatMap((c) => ["(", "-size", "160x120", `xc:${c.hex}`, "-gravity", "south", "-background", "#202020",
+          "-fill", "white", "-font", DEFAULT_FONT, "-pointsize", "16", "-splice", "0x28", "-annotate", "+0+4", c.hex, ")"]),
+        "+append", swatch,
+      ]);
+    }
+    return { colors: palette, ...(swatch ? { swatch } : {}) };
+  });
+}
+
 export const commands: Record<string, Command> = {
+  find: {
+    usage: 'find <video|picture|folder> --query "what to find" [--top 5] [--every 1] [--sheet matches.png]  (needs: install vision)',
+    run: (a) =>
+      find(requireFile(a.positional[0]), a.flags.query ?? "", {
+        top: optionalNumberFlag(a, "top", 5),
+        every: optionalNumberFlag(a, "every", 1),
+        sheet: a.flags.sheet,
+      }),
+  },
+  colors: {
+    usage: "colors <picture|video> [--count 6] [--swatch palette.png]",
+    run: (a) => colors(requireFile(a.positional[0]), optionalNumberFlag(a, "count", 6), a.flags.swatch),
+  },
   sheet: {
     usage: "sheet <video> <output.png> [--count 12] [--width 320]",
     run: (a) => {

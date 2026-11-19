@@ -1,7 +1,7 @@
 // Video editing, built on ffmpeg / ffprobe.
 // CLI:     node video.ts <command> <input> <output> [--flags]
 // Library: import { trim } from "./joEdit/video.ts"
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   DEFAULT_FONT,
@@ -14,6 +14,7 @@ import {
   round,
   run,
   runCli,
+  runPack,
   stringFlag,
   withTempDir,
   loadBrand,
@@ -343,6 +344,89 @@ export function reframe(input: string, output: string, aspect: string, x = 0.5, 
   ffmpeg(["-i", input, "-vf", filter, "-c:a", "copy", output]);
 }
 
+// Crop to a new shape while following the main subject (a person, a product) as it moves (cutout pack).
+// The subject is found every `every` seconds, its path is smoothed like a camera operator would,
+// and the crop glides along it. smooth: seconds of smoothing (bigger = calmer camera).
+export function reframeFollow(input: string, output: string, aspect: string, every = 0.5, smooth = 2) {
+  const { width, height, fps, duration } = info(input);
+  if (!width) throw new Error("This file has no picture.");
+  const a = parseAspect(aspect);
+  const cropW = Math.floor(Math.min(width, height * a) / 2) * 2;
+  const cropH = Math.floor(Math.min(height, width / a) / 2) * 2;
+
+  return withTempDir((folder) => {
+    // 1. Small frames, one every `every` seconds, and a subject mask for each (white = subject).
+    ffmpeg(["-i", input, "-vf", `fps=1/${every},scale=384:-2`, join(folder, "%05d.png")]);
+    const frames = readdirSync(folder).filter((name) => name.endsWith(".png")).sort().map((name) => join(folder, name));
+    const { files: masks } = runPack("cutout", [join(folder, "masks"), ...frames, "--mask"]);
+
+    // 2. The centre of each mask (0..1 across and down). Frames with no subject keep the last centre.
+    let last = [0.5, 0.5];
+    const centres = (masks as string[]).map((mask) => {
+      // A tiny grayscale version as text (PGM): "P2 width height 255 value value ...".
+      const [, w, h, , ...values] = run("magick", [mask, "-resize", "64x64!", "-compress", "none", "pgm:-"]).trim().split(/\s+/).map(Number);
+      let total = 0, sumX = 0, sumY = 0;
+      values.forEach((v, i) => {
+        total += v;
+        sumX += v * ((i % w) + 0.5) / w;
+        sumY += v * (Math.floor(i / w) + 0.5) / h;
+      });
+      if (total > 255 * 20) last = [sumX / total, sumY / total]; // at least ~20 subject pixels
+      return last;
+    });
+
+    // 3. Smooth the path with a moving average, then turn centres into crop corners kept inside the frame.
+    const reach = Math.max(1, Math.round(smooth / every / 2));
+    const corners = centres.map((_, k) => {
+      const near = centres.slice(Math.max(0, k - reach), k + reach + 1);
+      const cx = near.reduce((s, c) => s + c[0], 0) / near.length;
+      const cy = near.reduce((s, c) => s + c[1], 0) / near.length;
+      const x = Math.min(Math.max(cx * width - cropW / 2, 0), width - cropW);
+      const y = Math.min(Math.max(cy * height - cropH / 2, 0), height - cropH);
+      return { time: (k + 0.5) * every, x, y };
+    });
+
+    // 4. A crop position for every frame (straight lines between the samples), sent to ffmpeg's crop filter.
+    const lines: string[] = [];
+    for (let frame = 0; frame < Math.ceil(duration * fps); frame++) {
+      const t = frame / fps;
+      const after = corners.findIndex((c) => c.time >= t);
+      const b = corners[after === -1 ? corners.length - 1 : after];
+      const p = corners[Math.max(0, (after === -1 ? corners.length : after) - 1)];
+      const mix = b.time === p.time ? 0 : (t - p.time) / (b.time - p.time);
+      const x = Math.round(p.x + (b.x - p.x) * Math.min(Math.max(mix, 0), 1));
+      const y = Math.round(p.y + (b.y - p.y) * Math.min(Math.max(mix, 0), 1));
+      lines.push(`${t.toFixed(4)} crop@follow x ${x}, crop@follow y ${y};`);
+    }
+    const commands = join(folder, "follow.txt");
+    writeFileSync(commands, lines.join("\n"));
+    const start = corners[0];
+    ffmpeg([
+      "-i", input,
+      "-vf", `sendcmd=f='${commands}',crop@follow=${cropW}:${cropH}:${Math.round(start.x)}:${Math.round(start.y)},setsar=1`,
+      "-c:a", "copy", output,
+    ]);
+    return { width: cropW, height: cropH, samples: corners.length, path: corners.map((c) => ({ time: round(c.time), x: Math.round(c.x), y: Math.round(c.y) })) };
+  });
+}
+
+// Make a short clip from a description, or bring a picture to life (videogen pack: Wan 2.2 TI2V-5B).
+// Needs a big GPU (24 GB+ of video memory) and takes minutes per clip; fewer steps = faster, rougher.
+export function generate(output: string, prompt: string, options: { image?: string; seconds?: number; width?: number; height?: number; steps?: number; seed?: number } = {}) {
+  if (!prompt.trim()) throw new Error('Describe the clip with --prompt, e.g. --prompt "waves rolling onto a beach at sunset, slow camera push".');
+  if (options.image) requireFile(options.image);
+  return withTempDir((folder) => {
+    const frames = join(folder, "frames");
+    const args = [frames, "--prompt", prompt, "--seconds", String(options.seconds ?? 5), "--width", String(options.width ?? 1280),
+      "--height", String(options.height ?? 704), "--steps", String(options.steps ?? 50)];
+    if (options.image) args.push("--image", options.image);
+    if (options.seed !== undefined) args.push("--seed", String(options.seed));
+    const result = runPack("videogen", args);
+    ffmpeg(["-framerate", String(result.fps), "-i", join(frames, "%05d.png"), "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18", output]);
+    return { ...result, seconds: round(result.frames / result.fps) };
+  });
+}
+
 // Picture-in-picture: a small video in a corner of the main one. Sound comes from the main video.
 // size: width of the small video as a part of the main width. corner: top-left|top-right|bottom-left|bottom-right.
 export function pip(main: string, small: string, output: string, corner = "bottom-right", size = 0.3, margin = 0.03): void {
@@ -525,10 +609,27 @@ export const commands: Record<string, Command> = {
     },
   },
   reframe: {
-    usage: "reframe <input> <output> --aspect 9:16|1:1|4:5|16:9 [--x 0..1] [--y 0..1]  (0.5 = centre)",
+    usage: "reframe <input> <output> --aspect 9:16|1:1|4:5|16:9 [--x 0..1] [--y 0..1]  (0.5 = centre)  |  --follow [--smooth 2] [--every 0.5]  (follows the subject; needs: install cutout)",
     run: (a) => {
       const { input, output } = inOut(a);
+      if (a.flags.follow === "true") {
+        return reframeFollow(input, output, stringFlag(a, "aspect"), optionalNumberFlag(a, "every", 0.5), optionalNumberFlag(a, "smooth", 2));
+      }
       reframe(input, output, stringFlag(a, "aspect"), optionalNumberFlag(a, "x", 0.5), optionalNumberFlag(a, "y", 0.5));
+    },
+  },
+  generate: {
+    usage: 'generate <output.mp4> --prompt "what happens, camera move, style" [--image start.png] [--seconds 5] [--width 1280] [--height 704] [--steps 50] [--seed N]  (needs: install videogen, a big GPU)',
+    run: (a) => {
+      if (!a.positional[0]) throw new Error("Missing output path.");
+      return generate(a.positional[0], a.flags.prompt ?? "", {
+        image: a.flags.image,
+        seconds: optionalNumberFlag(a, "seconds", 5),
+        width: optionalNumberFlag(a, "width", 1280),
+        height: optionalNumberFlag(a, "height", 704),
+        steps: optionalNumberFlag(a, "steps", 50),
+        seed: a.flags.seed === undefined ? undefined : numberFlag(a, "seed"),
+      });
     },
   },
   pip: {
