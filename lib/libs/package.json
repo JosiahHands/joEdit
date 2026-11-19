@@ -22,5 +22,11 @@
     "kokoro-js": {
       "@huggingface/transformers": "$@huggingface/transformers"
     }
+  },
+  "allowScripts": {
+    "koffi": false,
+    "node-av": false,
+    "onnxruntime-node": false,
+    "protobufjs": false
   }
 }

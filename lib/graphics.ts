@@ -569,25 +569,6 @@ export type CaptionWord = { word: string; start: number; end: number; speaker?: 
 // Word colors for different speakers (with speakerColors on): the first speaker stays white.
 const SPEAKER_COLORS = ["#FFFFFF", "#7FDBFF", "#FFD166", "#FF8FAB", "#B5F44A", "#C9A7FF"];
 
-// Split words into short groups that fit on screen, breaking at pauses.
-function captionGroups(words: CaptionWord[], maxChars: number): CaptionWord[][] {
-  const groups: CaptionWord[][] = [];
-  let current: CaptionWord[] = [];
-  for (const word of words) {
-    const length = current.map((w) => w.word).join(" ").length + word.word.length + 1;
-    const previous = current[current.length - 1];
-    const pause = previous ? word.start - previous.end : 0;
-    const sentenceEnded = previous ? /[.!?]$/.test(previous.word) : false;
-    if (current.length && (length > maxChars || pause > 0.7 || sentenceEnded)) {
-      groups.push(current);
-      current = [];
-    }
-    current.push(word);
-  }
-  if (current.length) groups.push(current);
-  return groups;
-}
-
 type CaptionLook = { width: number; height: number; style: CaptionStyle; position: string; brand: Brand; speakers: string[] };
 
 // Draw one caption: the words of a group, with word `active` highlighted (-1: none).
@@ -681,7 +662,7 @@ export async function captionsOverlay(
   if (!["karaoke", "pop", "bold", "minimal"].includes(style)) throw new Error("--style must be karaoke, pop, bold or minimal.");
   const brand = options.brand ?? loadBrand();
   const maxChars = Math.round(Math.min(32, (options.width / options.height) * 18));
-  const groups = captionGroups(words, maxChars);
+  const groups = listen.wordGroups(words, maxChars);
 
   // A list of (start, end, group, active word). Group -1 means no caption on screen.
   type State = { start: number; end: number; group: number; active: number };

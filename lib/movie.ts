@@ -8,6 +8,7 @@ import { cpus } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import {
   drawText,
+  even,
   ffmpeg,
   ffmpegAsync,
   isModelInstalled,
@@ -29,6 +30,7 @@ import {
 import * as fx from "./fx.ts";
 import * as graphics from "./graphics.ts";
 import * as listen from "./listen.ts";
+import * as look from "./look.ts";
 import * as music from "./music.ts";
 import * as picture from "./picture.ts";
 import * as sound from "./sound.ts";
@@ -785,7 +787,8 @@ async function makeVoiceover(spec: NonNullable<Movie["voiceover"]>, ctx: Context
 }
 
 // Render a movie file into a finished video.
-export async function renderMovie(file: string, output: string, draft = false) {
+// sheet: also save a contact sheet of the result there (to look at it right away).
+export async function renderMovie(file: string, output: string, draft = false, sheet?: string) {
   const { movie, base } = loadMovie(file);
   const { valid, errors } = validate(movie, base);
   if (!valid) throw new Error(`The movie has ${errors.length} problem(s):\n- ${errors.join("\n- ")}`);
@@ -793,7 +796,6 @@ export async function renderMovie(file: string, output: string, draft = false) {
   const started = Date.now();
   const size = sizeOf(movie);
   // Drafts are a third of the size (kept even, as video needs).
-  const even = (n: number) => Math.max(2, Math.round(n / 2) * 2);
   const width = draft ? even(size.width / 3) : size.width;
   const height = draft ? even(size.height / 3) : size.height;
   const fps = movie.fps ?? 30;
@@ -840,10 +842,11 @@ export async function renderMovie(file: string, output: string, draft = false) {
     if (spoken) tracks.push({ file: spoken.file, at: movie.voiceover!.at ?? 0, volume: movie.voiceover!.volume ?? 1, reverb: movie.voiceover!.reverb });
     const mixed = join(temp, "mix-final.wav");
     await mixSound(movie, tracks, joined, length, mixed, ctx);
-    // Sound that would be cut off by the end of the film (not for looped music, which is meant to be cut).
+    // Sound that would be cut off by the end of the film. Not for looped or faded-out tracks (music): those are
+    // meant to be cut, and their fade-out happens at the end of the film.
     const warnings: string[] = [];
     for (const track of tracks) {
-      if (track.loop) continue;
+      if (track.loop || track.fadeOut) continue;
       const end = (track.at ?? 0) + (track.to ?? sound.info(pathFrom(base, track.file)).duration) - (track.from ?? 0);
       if (end > length + 0.1) {
         const name = track.file === spoken?.file ? "the voice-over" : track.file;
@@ -902,9 +905,23 @@ export async function renderMovie(file: string, output: string, draft = false) {
       ffmpeg([...inputs, "-filter_complex", graph, "-map", "[v]", "-map", "1:a", ...encoder(ctx), ...finish]);
     }
 
-    // 6. Quality check (loaded here because joedit.ts also loads this file).
+    // 6. Quality check (loaded here because joedit.ts also loads this file). A picture that holds still inside a
+    // title, canvas, page, color or unmoving picture scene, or is black inside a color scene, is how it was designed.
     const { check } = await import("./joedit.ts");
     const report = check(output);
+    const designed = designedScenes(movie, lengths);
+    // A film with nothing to hear (no video scenes, audio, sfx, music or voice-over) is silent on purpose.
+    const silentByDesign = !movie.scenes.some((s) => s.video) && !tracks.length && !movie.sfx?.length;
+    const isExpected = (problem: { problem: string; at?: string }) => {
+      if (problem.problem === "the sound is silent") return silentByDesign;
+      const kinds = problem.problem === "frozen picture (nothing moves)" ? ["still", "color"] : problem.problem === "black picture" ? ["color"] : [];
+      if (!problem.at || !kinds.length) return false;
+      const [start, end] = problem.at.split("-").map(secondsOf);
+      return designed.some((range) => kinds.includes(range.kind) && start >= range.start - 0.6 && end <= range.end + 0.6);
+    };
+    const problems = report.problems.filter((p) => !isExpected(p));
+    const expected = report.problems.filter(isExpected).map((p) => `${p.problem} ${p.at} (a scene designed to hold still)`);
+    if (sheet) await look.sheet(output, sheet);
     return {
       duration: round(length),
       size: `${width}x${height}`,
@@ -913,10 +930,33 @@ export async function renderMovie(file: string, output: string, draft = false) {
       rendered: movie.scenes.length - cached,
       cached,
       seconds: round((Date.now() - started) / 1000, 1),
-      check: { passed: report.passed, problems: report.problems },
+      check: { passed: problems.length === 0, problems, ...(expected.length ? { expected } : {}) },
       ...(warnings.length ? { warnings } : {}),
+      ...(sheet ? { sheet } : {}),
     };
   });
+}
+
+// "1:15.5" -> 75.5 (the times check prints).
+function secondsOf(time: string): number {
+  const [minutes, seconds] = time.split(":");
+  return Number(minutes) * 60 + Number(seconds);
+}
+
+// Where the film's designed scenes are: "color" scenes, and "still" ones (title, canvas, html, a picture with
+// motion "none"), merged when they follow each other.
+function designedScenes(movie: Movie, lengths: number[]): { kind: string; start: number; end: number }[] {
+  const ranges: { kind: string; start: number; end: number }[] = [];
+  let start = 0;
+  movie.scenes.forEach((scene, n) => {
+    if (n > 0) start -= transitionOf(scene)?.duration ?? 0;
+    const kind = scene.color ? "color" : scene.title !== undefined || scene.canvas || scene.html || (scene.image && scene.motion === "none") ? "still" : "";
+    const last = ranges.at(-1);
+    if (kind && last?.kind === kind && last.end >= start - 0.01) last.end = start + lengths[n];
+    else if (kind) ranges.push({ kind, start, end: start + lengths[n] });
+    start += lengths[n];
+  });
+  return ranges;
 }
 
 // ---------- Templates ----------
@@ -1028,10 +1068,10 @@ export const TEMPLATES: Record<string, { description: string; movie: Movie }> = 
 
 export const commands: Record<string, Command> = {
   render: {
-    usage: "render <movie.json> <output.mp4> [--draft]  (draft = a third of the size, fast, for checking)",
+    usage: "render <movie.json> <output.mp4> [--draft] [--sheet sheet.png]  (draft = a third of the size, fast, for checking; sheet = a contact sheet of the result)",
     run: (a) => {
       if (a.positional.length < 2) throw new Error("Give the movie file and the output video.");
-      return renderMovie(a.positional[0], a.positional[1], a.flags.draft === "true");
+      return renderMovie(a.positional[0], a.positional[1], a.flags.draft === "true", a.flags.sheet);
     },
   },
   validate: {

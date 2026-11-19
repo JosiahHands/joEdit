@@ -5,6 +5,7 @@ import { readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   drawText,
+  even,
   ffmpeg,
   inOut,
   need,
@@ -58,6 +59,9 @@ export function info(input: string): VideoInfo {
 // Keep only the part between start and end (in seconds).
 export function trim(input: string, output: string, start: number, end: number): void {
   if (end <= start) throw new Error("--end must be bigger than --start.");
+  // Starting past the end would make an empty file, so say so instead.
+  const length = info(input).duration;
+  if (start >= length) throw new Error(`--start ${start} is after the end of the input (${round(length)}s).`);
   ffmpeg(["-i", input, "-ss", String(start), "-to", String(end), output]);
 }
 
@@ -122,35 +126,137 @@ export function addAudio(input: string, audio: string, output: string): void {
 // Sound is kept only if every input has sound.
 export function concat(inputs: string[], output: string): void {
   if (inputs.length < 2) throw new Error("Give at least 2 inputs.");
-  inputs.forEach(requireFile);
-  const infos = inputs.map(info);
-  const { width, height } = infos[0];
-  const withAudio = infos.every((i) => i.hasAudio);
-
-  const parts: string[] = [];
-  let joined = "";
-  inputs.forEach((_, n) => {
-    // Make every clip the same size and frame shape so they can be joined.
-    parts.push(`[${n}:v]scale=${width}:${height},setsar=1,fps=${infos[0].fps || 30}[v${n}]`);
-    joined += withAudio ? `[v${n}][${n}:a]` : `[v${n}]`;
-  });
-  const audioCount = withAudio ? 1 : 0;
-  const outLabels = withAudio ? "[v][a]" : "[v]";
-  parts.push(`${joined}concat=n=${inputs.length}:v=1:a=${audioCount}${outLabels}`);
+  const infos = inputs.map(requirePicture);
+  // Everything takes the first clip's size and frame rate. A clip of another shape fits inside with black
+  // bars (never stretched). If any clip has sound, clips without sound get silence, so no sound is lost.
+  const width = even(infos[0].width);
+  const height = even(infos[0].height);
+  const fps = infos[0].fps || 30;
+  const withAudio = infos.some((i) => i.hasAudio);
 
   const args = inputs.flatMap((file) => ["-i", file]);
+  const parts: string[] = [];
+  let joined = "";
+  infos.forEach((clip, n) => {
+    parts.push(`[${n}:v]scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=${fps},format=yuv420p[v${n}]`);
+    joined += `[v${n}]`;
+    if (withAudio) {
+      let source = `${n}:a`;
+      if (!clip.hasAudio) {
+        source = `${args.length / 2}:a`;
+        args.push("-f", "lavfi", "-t", String(clip.duration), "-i", "anullsrc=r=48000:cl=stereo");
+      }
+      // Same sound format, and exactly as long as the clip's picture, so picture and sound stay together.
+      parts.push(`[${source}]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,apad,atrim=end=${clip.duration},asetpts=PTS-STARTPTS[a${n}]`);
+      joined += `[a${n}]`;
+    }
+  });
+  parts.push(`${joined}concat=n=${inputs.length}:v=1:a=${withAudio ? 1 : 0}${withAudio ? "[v][a]" : "[v]"}`);
   args.push("-filter_complex", parts.join(";"), "-map", "[v]");
   if (withAudio) args.push("-map", "[a]");
   ffmpeg([...args, output]);
 }
 
+// The details of a file that must have a picture (a clear error for a sound file).
+function requirePicture(input: string): VideoInfo {
+  const details = info(requireFile(input));
+  if (!details.width) throw new Error(`"${input}" has no picture (it is sound only). For sound, use the sound and listen commands.`);
+  return details;
+}
+
 // Save a single frame at `time` seconds as a picture.
 export function frame(input: string, output: string, time: number): void {
+  const { duration } = requirePicture(input);
+  if (time < 0 || time > duration) throw new Error(`--time ${time} is outside the video (0 to ${round(duration)}s).`);
   ffmpeg(["-ss", String(time), "-i", input, "-frames:v", "1", "-update", "1", output]);
+}
+
+// Fade in from a color at the start and/or out to it at the end, picture and sound together.
+export function fade(input: string, output: string, fadeIn = 0, fadeOut = 0, color = "black"): void {
+  if (fadeIn <= 0 && fadeOut <= 0) throw new Error("Give --in and/or --out (seconds).");
+  const { duration, hasAudio } = requirePicture(input);
+  if (fadeIn + fadeOut > duration) throw new Error(`The fades (${fadeIn + fadeOut}s) are longer than the video (${round(duration)}s).`);
+  const picture: string[] = [];
+  const sound: string[] = [];
+  if (fadeIn > 0) {
+    picture.push(`fade=t=in:st=0:d=${fadeIn}:color=${color}`);
+    sound.push(`afade=t=in:st=0:d=${fadeIn}`);
+  }
+  if (fadeOut > 0) {
+    const start = round(duration - fadeOut, 3);
+    picture.push(`fade=t=out:st=${start}:d=${fadeOut}:color=${color}`);
+    sound.push(`afade=t=out:st=${start}:d=${fadeOut}`);
+  }
+  ffmpeg(["-i", input, "-vf", picture.join(","), ...(hasAudio ? ["-af", sound.join(",")] : []), output]);
+}
+
+// Play backwards, picture and sound. Long videos are reversed 5 seconds at a time, so memory stays small.
+export function reverse(input: string, output: string): void {
+  const { duration, hasAudio, fps } = requirePicture(input);
+  const sound = hasAudio ? ["-af", "areverse"] : [];
+  if (duration <= 10) {
+    ffmpeg(["-i", input, "-vf", "reverse", ...sound, output]);
+    return;
+  }
+  withTempDir((folder) => {
+    // Each piece reversed (near-lossless, so the final encode is the only real one), then joined last piece first.
+    const pieces: string[] = [];
+    for (let start = 0, n = 0; start < duration; start += 5, n++) {
+      const piece = join(folder, `piece-${n}.mkv`);
+      ffmpeg(["-ss", String(start), "-t", "5", "-i", input, "-vf", "reverse", ...sound, "-c:v", "libx264", "-crf", "10", "-preset", "veryfast", ...(hasAudio ? ["-c:a", "pcm_s16le"] : []), piece]);
+      pieces.push(piece);
+    }
+    const list = join(folder, "list.txt");
+    writeFileSync(list, pieces.reverse().map((p) => `file '${p}'`).join("\n"));
+    ffmpeg(["-f", "concat", "-safe", "0", "-i", list, "-vf", `fps=${fps || 30}`, output]);
+  });
+}
+
+// Calm down shaky handheld video. strength 0..1: how big a shake to remove. zoom: how much to enlarge to
+// hide the moving edges (0 keeps the edges, filled in by mirroring).
+export function stabilize(input: string, output: string, strength = 0.5, zoom = 0.05): void {
+  const { width, height } = requirePicture(input);
+  if (strength < 0 || strength > 1) throw new Error("--strength is 0..1.");
+  const search = 16 * Math.round(1 + strength * 3); // pixels of shake to look for: 16, 32, 48 or 64 (deshake's steps)
+  const crop = zoom > 0 ? `,crop=iw/${1 + zoom}:ih/${1 + zoom},scale=${even(width)}:${even(height)}` : "";
+  ffmpeg(["-i", input, "-vf", `deshake=rx=${search}:ry=${search}:edge=mirror${crop},setsar=1`, "-c:a", "copy", output]);
+}
+
+// Put a picture (a logo, a sticker, a see-through PNG) or a video on top of a video.
+// x, y: the centre of the layer as fractions of the frame (0..1). width: a fraction of the frame width.
+// at / duration: when it shows (seconds). fade: seconds to fade in and out. The main video's sound is kept.
+export function overlay(
+  input: string,
+  layer: string,
+  output: string,
+  o: { x?: number; y?: number; width?: number; at?: number; duration?: number; opacity?: number; fade?: number } = {},
+): void {
+  const main = requirePicture(input);
+  requireFile(layer);
+  const isPicture = /\.(png|jpe?g|webp|gif|bmp|tiff?)$/i.test(layer);
+  const at = o.at ?? 0;
+  const end = Math.min(main.duration, o.duration ? at + o.duration : main.duration);
+  if (at >= main.duration) throw new Error(`--at ${at} is after the end of the video (${round(main.duration)}s).`);
+  const opacity = o.opacity ?? 1;
+  if (opacity <= 0 || opacity > 1) throw new Error("--opacity is more than 0, up to 1.");
+  const fade = Math.min(o.fade ?? 0, (end - at) / 2);
+  // A picture is repeated for the whole video; a video layer starts at `at`.
+  const source = isPicture ? ["-loop", "1", "-t", String(main.duration), "-i", layer] : ["-itsoffset", String(at), "-i", layer];
+  const look = [
+    `scale=${even(main.width * (o.width ?? 0.3))}:-2`,
+    "format=rgba",
+    ...(opacity < 1 ? [`colorchannelmixer=aa=${opacity}`] : []),
+    ...(fade > 0 ? [`fade=t=in:st=${at}:d=${fade}:alpha=1`, `fade=t=out:st=${round(end - fade, 3)}:d=${fade}:alpha=1`] : []),
+  ].join(",");
+  const x = `${main.width * (o.x ?? 0.5)}-w/2`;
+  const y = `${main.height * (o.y ?? 0.5)}-h/2`;
+  const graph = `[1:v]${look}[layer];[0:v][layer]overlay=x=${x}:y=${y}:enable='between(t,${at},${end})':eof_action=pass,format=yuv420p[v]`;
+  ffmpeg(["-i", input, ...source, "-filter_complex", graph, "-map", "[v]", "-map", "0:a?", "-c:a", "copy", "-t", String(main.duration), output]);
 }
 
 // Make an animated GIF.
 export function gif(input: string, output: string, fps = 10, width = 480): void {
+  requirePicture(input);
   const base = `fps=${fps},scale=${width}:-1:flags=lanczos`;
   // Build a color palette first so the GIF looks good.
   const filter = `${base},split[a][b];[a]palettegen[p];[b][p]paletteuse`;
@@ -637,6 +743,43 @@ export const commands: Record<string, Command> = {
       const files = a.positional;
       if (files.length < 3) throw new Error("Give at least 2 inputs and 1 output.");
       concat(files.slice(0, -1), files[files.length - 1]);
+    },
+  },
+  fade: {
+    usage: "fade <input> <output> [--in SECONDS] [--out SECONDS] [--color black|white]  (picture and sound)",
+    run: (a) => {
+      const { input, output } = inOut(a);
+      fade(input, output, optionalNumberFlag(a, "in", 0), optionalNumberFlag(a, "out", 0), a.flags.color ?? "black");
+    },
+  },
+  reverse: {
+    usage: "reverse <input> <output>  (plays backwards, picture and sound)",
+    run: (a) => {
+      const { input, output } = inOut(a);
+      reverse(input, output);
+    },
+  },
+  stabilize: {
+    usage: "stabilize <input> <output> [--strength 0..1] [--zoom 0.05]  (calms shaky handheld video; zoom hides the moving edges)",
+    run: (a) => {
+      const { input, output } = inOut(a);
+      stabilize(input, output, optionalNumberFlag(a, "strength", 0.5), optionalNumberFlag(a, "zoom", 0.05));
+    },
+  },
+  overlay: {
+    usage: "overlay <input> <picture|video> <output> [--x 0..1] [--y 0..1] [--width 0..1] [--at S] [--duration S] [--opacity 0..1] [--fade S]  (logo, watermark, sticker; x/y = its centre)",
+    run: (a) => {
+      if (a.positional.length < 3) throw new Error("Give the video, the picture or video to put on top, and the output.");
+      const [input, layer, output] = a.positional;
+      overlay(input, layer, output, {
+        x: a.flags.x === undefined ? undefined : numberFlag(a, "x"),
+        y: a.flags.y === undefined ? undefined : numberFlag(a, "y"),
+        width: a.flags.width === undefined ? undefined : numberFlag(a, "width"),
+        at: a.flags.at === undefined ? undefined : numberFlag(a, "at"),
+        duration: a.flags.duration === undefined ? undefined : numberFlag(a, "duration"),
+        opacity: a.flags.opacity === undefined ? undefined : numberFlag(a, "opacity"),
+        fade: a.flags.fade === undefined ? undefined : numberFlag(a, "fade"),
+      });
     },
   },
   frame: {

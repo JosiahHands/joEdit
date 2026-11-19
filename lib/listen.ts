@@ -358,6 +358,65 @@ function sentences(words: Word[]): Transcript["segments"] {
 
 // Speech to text with the time of every word, with Whisper running inside Node.
 // model: tiny, base, small or turbo (bigger = better but slower). language: a code or name ("fr", "french"), or found automatically.
+// ---------- Subtitle files ----------
+
+// Split words into short groups that fit on screen: at most maxChars, a new group after a pause or a sentence end.
+// Used for subtitle files here and for burned-in captions (graphics).
+export function wordGroups<T extends Word>(words: T[], maxChars: number): T[][] {
+  const groups: T[][] = [];
+  let current: T[] = [];
+  for (const word of words) {
+    const length = current.map((w) => w.word).join(" ").length + word.word.length + 1;
+    const previous = current[current.length - 1];
+    const pause = previous ? word.start - previous.end : 0;
+    const sentenceEnded = previous ? /[.!?]$/.test(previous.word) : false;
+    if (current.length && (length > maxChars || pause > 0.7 || sentenceEnded)) {
+      groups.push(current);
+      current = [];
+    }
+    current.push(word);
+  }
+  if (current.length) groups.push(current);
+  return groups;
+}
+
+// "srt" or "vtt" from a file name, or "" for other files.
+function subtitleFormat(file: string): "srt" | "vtt" | "" {
+  const type = file.split(".").pop()?.toLowerCase();
+  return type === "srt" || type === "vtt" ? type : "";
+}
+
+// Subtitle file text: numbered lines (srt) or a WebVTT file, each line on screen while it is said.
+export function subtitleText(words: Word[], format: "srt" | "vtt", maxChars = 42): string {
+  const stamp = (seconds: number) => {
+    const ms = Math.round(seconds * 1000);
+    const pad = (n: number, size = 2) => String(n).padStart(size, "0");
+    const time = `${pad(Math.floor(ms / 3600000))}:${pad(Math.floor(ms / 60000) % 60)}:${pad(Math.floor(ms / 1000) % 60)}`;
+    return `${time}${format === "srt" ? "," : "."}${pad(ms % 1000, 3)}`;
+  };
+  const groups = wordGroups(words, maxChars);
+  const cues = groups.map((group, n) => {
+    const start = group[0].start;
+    // Stay a moment after the last word (at least 0.8 s on screen), but never past the next line's start.
+    const next = groups[n + 1]?.[0].start ?? Infinity;
+    const end = Math.min(Math.max(group[group.length - 1].end + 0.3, start + 0.8), next);
+    const text = group.map((w) => w.word).join(" ");
+    return `${format === "srt" ? `${n + 1}\n` : ""}${stamp(start)} --> ${stamp(end)}\n${text}\n`;
+  });
+  return (format === "vtt" ? "WEBVTT\n\n" : "") + cues.join("\n");
+}
+
+// Turn a transcript (words.json from transcribe or speakers, or voice speak --words) into a .srt or .vtt file,
+// for players and platforms that show subtitles themselves (YouTube, Vimeo, video players, the web).
+export function subtitles(transcript: string, output: string, maxChars = 42) {
+  const format = subtitleFormat(output);
+  if (!format) throw new Error("The output must be a .srt or .vtt file.");
+  const words: Word[] = JSON.parse(readFileSync(requireFile(transcript), "utf8")).words ?? [];
+  if (!words.length) throw new Error(`${transcript} has no words. Make one with: node joedit.ts listen transcribe <sound> words.json`);
+  writeFileSync(output, subtitleText(words, format, maxChars));
+  return { lines: wordGroups(words, maxChars).length, format };
+}
+
 export async function transcribe(input: string, output: string, model = "base", language = ""): Promise<{ language: string; words: number; text: string }> {
   const audio = monoSamples(input, 16000);
   const transcriber = await whisper(model);
@@ -378,7 +437,9 @@ export async function transcribe(input: string, output: string, model = "base", 
   }
   words = alignWords(words, audio);
   const transcript: Transcript = { language: spoken, text: words.map((w) => w.word).join(" "), words, segments: sentences(words) };
-  writeFileSync(output, JSON.stringify(transcript, null, 2));
+  // A .srt or .vtt output is a subtitle file; anything else gets the full transcript as JSON.
+  const format = subtitleFormat(output);
+  writeFileSync(output, format ? subtitleText(words, format) : JSON.stringify(transcript, null, 2));
   const preview = transcript.text.length > 200 ? `${transcript.text.slice(0, 200)}...` : transcript.text;
   return { language: transcript.language, words: transcript.words.length, text: preview };
 }
@@ -602,10 +663,17 @@ export const commands: Record<string, Command> = {
     run: (a) => beats(requireFile(a.positional[0])),
   },
   transcribe: {
-    usage: `transcribe <sound> <output.json> [--model ${Object.keys(WHISPER_MODELS).join("|")}] [--language en]  (language is found automatically if not given)`,
+    usage: `transcribe <sound> <output.json|.srt|.vtt> [--model ${Object.keys(WHISPER_MODELS).join("|")}] [--language en]  (language is found automatically if not given; .srt/.vtt = a subtitle file)`,
     run: (a) => {
       const { input, output } = inOut(a);
       return transcribe(input, output, a.flags.model ?? "base", a.flags.language ?? "");
+    },
+  },
+  subtitles: {
+    usage: "subtitles <words.json> <output.srt|.vtt> [--max-chars 42]  (a subtitle file from a transcript, for players and platforms)",
+    run: (a) => {
+      const { input, output } = inOut(a);
+      return subtitles(input, output, optionalNumberFlag(a, "max-chars", 42));
     },
   },
   find: {

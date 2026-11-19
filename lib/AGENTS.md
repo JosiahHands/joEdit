@@ -80,7 +80,12 @@ speed <in> <out> --factor 0.5..100          2 = twice as fast (sound too)
 mute <in> <out>                             remove the sound
 extract-audio <in> <out.mp3|.wav|.m4a>
 add-audio <in> <out> --audio FILE           replaces the sound; stops at the shorter one
-concat <in1> <in2> [...] <out>              one after another, sized to the first clip
+concat <in1> <in2> [...] <out>              one after another, at the first clip's size (other shapes get bars, never stretched)
+fade <in> <out> [--in S] [--out S] [--color black|white]   picture and sound together
+reverse <in> <out>                          plays backwards (any length)
+stabilize <in> <out> [--strength 0..1] [--zoom 0.05]   calms shaky handheld video
+overlay <in> <picture|video> <out> [--x 0..1] [--y 0..1] [--width 0..1] [--at S] [--duration S] [--opacity 0..1] [--fade S]
+                                            a logo, watermark, sticker or second video on top; x/y = its centre
 frame <in> <out.png> --time S               one still picture
 gif <in> <out.gif> [--fps 10] [--width 480]
 text <in> <out> --text "words" [same styling flags as picture text]   on the whole video
@@ -99,6 +104,8 @@ generate <out.mp4> --prompt "..." [--image start.png] [--seconds 5] [--steps 50]
 ```
 - `captions` makes its own transcript (`install whisper`) when none is given. A transcript is any JSON with `{"words": [{"word", "start", "end"}]}`, so you can fix spellings in it, or write one by hand, before burning it in. Styles: `karaoke` lights each word as it is spoken, `pop` puts the spoken word on a colored tag, `bold` is big outlined capitals, `minimal` is plain subtitles on a dark box. `--speakers` gives each speaker their own color; use a transcript from `listen speakers` (its words carry a `speaker`).
 - `remove-fillers` and `remove-silence` together make a talk tight in two commands.
+- `overlay` takes a see-through PNG as it is, so a `picture cutout`, a `graphics lower-third --transparent` still or a logo all sit cleanly on the video. A video on top is silent; the main video's sound is kept.
+- `concat` keeps the sound even when some clips have none (they get silence).
 - `blur-faces` (`install faces`) is for privacy: bystanders, kids, people who did not agree to be shown.
 - `reframe --follow` (`install cutout`) finds the subject every `--every` seconds and glides the crop along its path like a camera operator; `--smooth` is seconds of smoothing (bigger = calmer). The result includes the crop `path`.
 - `generate` (`install videogen`, Wan 2.2 TI2V-5B) makes a clip from a description, or animates `--image`. It needs a big GPU (24 GB+ of video memory, ~30 GB of models) and takes minutes per clip; on smaller machines, `picture parallax`, `picture animate` and `fx` bring stills to life instead.
@@ -156,11 +163,12 @@ spectrum <sound> <out.png>                  spectrogram (pitch over time)
 loudness <sound>                            → lufs, peak, verdict, suggested fixes
 silences <sound> [--db -35] [--min 0.5]     → silent parts (start, end)
 beats <sound>                               → bpm and the time of every beat
-transcribe <sound> <out.json> [--model tiny|base|small|turbo] [--language en]   → every word with its time
+transcribe <sound> <out.json|.srt|.vtt> [--model tiny|base|small|turbo] [--language en]   → every word with its time
+subtitles <words.json> <out.srt|.vtt> [--max-chars 42]   a subtitle file from a transcript
 find <sound|video> --query "dog barking" [--top 5] [--window 4]   search sounds by meaning
 speakers <sound> <out.json> [--transcript words.json] [--speakers N]   who speaks when
 ```
-- `transcribe` needs `install whisper` (`whisper-small` or `whisper-turbo` for harder audio). The language is found automatically.
+- `transcribe` needs `install whisper` (`whisper-small` or `whisper-turbo` for harder audio). The language is found automatically. A `.srt` or `.vtt` output is a subtitle file for YouTube, Vimeo, players and the web (burned-in captions are `video captions`). `subtitles` makes one from any words file, e.g. after you fix spellings, or from `voice speak --words`.
 - `find` (`install sounds`) works best with short labels: `"applause"`, `"glass breaking"`, `"siren"`, `"laughter"`.
 - `speakers` (`install speakers`) saves the transcript with a `speaker` on every word and segment, plus how long each person talks: ready for `video captions --speakers`, or to cut to whoever is speaking.
 
@@ -206,7 +214,7 @@ preview <picture|video> [--effect crt] [--set] [--amount] [--lut] [--seconds N] 
 
 **movie**: a whole film from one JSON file
 ```
-render <movie.json> <out.mp4> [--draft]     → duration, scenes rendered/cached, time taken, and a quality check
+render <movie.json> <out.mp4> [--draft] [--sheet sheet.png]   → duration, scenes rendered/cached, time taken, a quality check, and a contact sheet
 validate <movie.json>                       → every problem, each with a hint to fix it
 templates                                   → starting points: short, ad, explainer, slideshow, lyric, podcast
 template <name> <movie.json>                writes one; replace its placeholder files (validate lists them)
@@ -256,7 +264,7 @@ A movie file describes the film; joEdit does the cutting, transitions, layers, e
 - **Music** is made once and cached: a `score` is composed (with exact beat times for `beatSync`), a `song` is generated by the song pack, a `file` is used as it is. It ducks under speech unless `"duck": false`, and fades out over 2 seconds unless `fadeOut` says otherwise.
 - **Voice-over** is spoken with Kokoro, mixed in like an audio track (music with `duck` goes quiet under it), and cached. `reverb` puts it in a room.
 - **Captions** use the transcript if given, else the voice-over's own word times, else they transcribe the final mix. `"speakers": true` colors each speaker (from the transcript's `speaker` fields, or found with `install speakers`).
-- After rendering, the result includes `check` (black frames, silence, loudness) and `warnings`, e.g. a voice-over longer than the film. An intended black ending shows up in `check`, which is fine.
+- After rendering, the result includes `check` (black frames, frozen picture, silence, loudness) and `warnings`, e.g. a voice-over longer than the film. What the movie file explains (a title or chart holding still, a black color card, a film with no sound sources) is listed under `check.expected` instead of `problems`. `--sheet` saves a contact sheet of the result in the same step.
 
 **voice**: speech, voice cloning and stems
 ```
@@ -356,9 +364,8 @@ node joedit.ts look strip tight.mp4 cut.png --start 11.5 --end 13.5      (check 
 node joedit.ts movie template short movie.json
 (edit movie.json: your clips, words and music)
 node joedit.ts movie validate movie.json
-node joedit.ts movie render movie.json draft.mp4 --draft
-node joedit.ts look sheet draft.mp4 sheet.png
-(adjust, then the full render reuses every unchanged scene)
+node joedit.ts movie render movie.json draft.mp4 --draft --sheet sheet.png
+(read sheet.png, adjust, then the full render reuses every unchanged scene)
 node joedit.ts movie render movie.json final.mp4
 ```
 
@@ -441,6 +448,14 @@ node joedit.ts picture generate set.png --prompt "minimal marble table, soft mor
 node joedit.ts picture compose design.json scene.png
 node joedit.ts look colors scene.png                   → pick title colors that fit
 node joedit.ts picture parallax scene.png shot.mp4 --motion dolly --duration 5
+```
+
+**Branded upload with subtitles**
+```
+node joedit.ts video stabilize walk.mp4 steady.mp4
+node joedit.ts video overlay steady.mp4 logo.png branded.mp4 --x 0.92 --y 0.08 --width 0.1 --opacity 0.85
+node joedit.ts video fade branded.mp4 final.mp4 --in 0.5 --out 1
+node joedit.ts listen transcribe final.mp4 final.srt                 (upload next to the video)
 ```
 
 **Privacy before posting**

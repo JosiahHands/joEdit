@@ -459,13 +459,72 @@ describe("video", () => {
     near(result.duration, 6, 0.2);
   });
 
-  test("concat different sizes, one without sound", () => {
+  test("concat different sizes, one without sound: the sound is kept", () => {
     ok("video", ["concat", file("in.mp4"), file("silent.mp4"), file("concat2.mp4")]);
     const result = video.info(file("concat2.mp4"));
     assert.equal(result.width, 320);
     assert.equal(result.height, 240);
-    assert.equal(result.hasAudio, false);
+    assert.equal(result.hasAudio, true); // silence fills in for the silent clip
     near(result.duration, 5, 0.2);
+    assert.ok(loudness(file("concat2.mp4")) > -40, "the first clip's sound is lost");
+  });
+
+  test("concat fits a clip of another shape inside, without stretching", () => {
+    // A tall white clip after a wide one: it keeps its shape, with black bars at the sides.
+    execFileSync(FFMPEG, ["-loglevel", "error", "-y", "-f", "lavfi", "-i", "color=white:size=120x240:rate=30", "-t", "1", "-pix_fmt", "yuv420p", file("tall.mp4")]);
+    ok("video", ["concat", file("in.mp4"), file("tall.mp4"), file("concat3.mp4")]);
+    frameAt(file("concat3.mp4"), 3.5, file("concat3.png"));
+    assert.ok(mean(file("concat3.png"), "40x40+140+100") > 0.9, "the middle should be the white clip");
+    assert.ok(mean(file("concat3.png"), "40x40+0+100") < 0.1, "the sides should be black bars");
+  });
+
+  test("fade, reverse, stabilize", () => {
+    ok("video", ["fade", file("in.mp4"), file("faded.mp4"), "--in", "1", "--out", "1"]);
+    frameAt(file("faded.mp4"), 0.02, file("faded-start.png"));
+    frameAt(file("faded.mp4"), 1.5, file("faded-middle.png"));
+    assert.ok(mean(file("faded-start.png")) < 0.05, "should start from black");
+    assert.ok(mean(file("faded-middle.png")) > 0.2);
+    assert.ok(loudness(file("faded.mp4"), 0.3) < loudness(file("faded.mp4")) - 6, "the sound fades in too");
+    assert.equal(cli("video", ["fade", file("in.mp4"), file("x.mp4")]).code, 1);
+
+    // Reversed: the last frame of the original is the first frame of the result.
+    ok("video", ["reverse", file("in.mp4"), file("reversed.mp4")]);
+    frameAt(file("in.mp4"), 2.95, file("in-end.png"));
+    frameAt(file("reversed.mp4"), 0, file("reversed-start.png"));
+    assert.ok(regionDiff(file("in-end.png"), file("reversed-start.png"), "320x240+0+0") < 0.05);
+    assert.ok(video.info(file("reversed.mp4")).hasAudio);
+
+    ok("video", ["stabilize", file("in.mp4"), file("stable.mp4"), "--strength", "1"]);
+    const stable = video.info(file("stable.mp4"));
+    assert.deepEqual([stable.width, stable.height], [320, 240]);
+    near(stable.duration, 3, 0.15);
+  });
+
+  test("overlay puts a picture on top, only while asked", async () => {
+    await paint(file("dot.png"), 50, 50, () => RED);
+    ok("video", ["overlay", file("in.mp4"), file("dot.png"), file("dotted.mp4"), "--x", "0.75", "--y", "0.5", "--width", "0.25", "--at", "1", "--duration", "1"]);
+    // Is the dot there? Compare its spot with the same moment of the original.
+    const shown = (time: number) => {
+      frameAt(file("dotted.mp4"), time, file("dotted.png"));
+      frameAt(file("in.mp4"), time, file("undotted.png"));
+      return regionDiff(file("dotted.png"), file("undotted.png"), "30x30+225+105") > 0.2;
+    };
+    assert.ok(!shown(0.5), "shown too early");
+    assert.ok(shown(1.5), "not shown at 1.5 s");
+    assert.ok(!shown(2.5), "shown too late");
+  });
+
+  test("a sound file given to video frame says it has no picture", () => {
+    const result = cli("video", ["frame", file("sound.mp3"), file("x.png"), "--time", "1"]);
+    assert.equal(result.code, 1);
+    assert.match(result.stderr, /no picture/);
+    assert.match(cli("picture", ["resize", file("in.mp4"), file("x.png"), "--width", "10"]).stderr, /not a picture/);
+  });
+
+  test("trim past the end fails instead of making an empty file", () => {
+    const result = cli("video", ["trim", file("in.mp4"), file("x.mp4"), "--start", "60", "--end", "70"]);
+    assert.equal(result.code, 1);
+    assert.match(result.stderr, /after the end/);
   });
 
   test("frame", () => {
@@ -771,6 +830,15 @@ describe("movie", () => {
     assert.deepEqual([again.rendered, again.cached], [1, 2]);
     const draft = JSON.parse(ok("movie", ["render", file("basic.json"), file("draft.mp4"), "--draft"]));
     assert.equal(draft.size, "106x60");
+  });
+
+  test("render --sheet, and held-still designed scenes are expected, not problems", () => {
+    // A title and a plain color card hold still on purpose; check would call that frozen in any other video.
+    write("still.json", { size: "320x180", scenes: [{ title: "Held", duration: 4 }, { color: "#224466", duration: 3, transition: "fade" }] });
+    const result = JSON.parse(ok("movie", ["render", file("still.json"), file("still.mp4"), "--sheet", file("still-sheet.png")]));
+    assert.equal(result.check.passed, true, JSON.stringify(result.check));
+    assert.ok(result.check.expected?.some((e: string) => /frozen/.test(e)), JSON.stringify(result.check));
+    assert.ok(existsSync(file("still-sheet.png")));
   });
 
   test("beatSync moves cuts onto the beat", () => {
@@ -1452,6 +1520,20 @@ describe("look", () => {
 });
 
 describe("listen", () => {
+  test("subtitles turns a transcript into .srt and .vtt files", () => {
+    writeFileSync(file("sub-words.json"), JSON.stringify({ words: [
+      { word: "Hello", start: 0.5, end: 0.9 }, { word: "there.", start: 1.0, end: 1.4 },
+      { word: "Second", start: 3.0, end: 3.5 }, { word: "line", start: 3.6, end: 4.0 },
+    ] }));
+    const result = JSON.parse(ok("listen", ["subtitles", file("sub-words.json"), file("subs.srt")]));
+    assert.equal(result.lines, 2);
+    const srt = readFileSync(file("subs.srt"), "utf8");
+    assert.match(srt, /^1\n00:00:00,500 --> 00:00:01,700\nHello there\.\n\n2\n00:00:03,000 --> 00:00:04,300\nSecond line\n/);
+    ok("listen", ["subtitles", file("sub-words.json"), file("subs.vtt")]);
+    assert.match(readFileSync(file("subs.vtt"), "utf8"), /^WEBVTT\n\n00:00:00\.500 --> /);
+    assert.equal(cli("listen", ["subtitles", file("sub-words.json"), file("subs.txt")]).code, 1);
+  });
+
   test("wave and spectrum make pictures", () => {
     ok("listen", ["wave", file("gap.wav"), file("wave.png"), "--width", "800", "--height", "200"]);
     ok("listen", ["spectrum", file("in.mp4"), file("spectrum.png")]);
@@ -1714,6 +1796,12 @@ describe("joedit", () => {
     const black = result.problems.find((p: any) => p.problem === "black picture");
     assert.ok(black, "black picture not found");
     assert.match(black.fix, /video trim .* --start 1\.5/);
+  });
+
+  test("check does not call a title on a dark card black", () => {
+    ok("graphics", ["title", file("dark-title.mp4"), "--text", "Hi", "--duration", "2", "--width", "640", "--height", "360"]);
+    const result = JSON.parse(ok("joedit", ["check", file("dark-title.mp4")]));
+    assert.equal(result.problems.filter((p: any) => p.problem === "black picture").length, 0, JSON.stringify(result.problems));
   });
 
   test("check passes a clean, normalized video", () => {

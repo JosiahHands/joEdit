@@ -7,6 +7,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import {
   LIBS,
+  even,
   ffmpeg,
   need,
   openPicture,
@@ -1153,7 +1154,6 @@ async function* clipFrames(input: string, o: { width: number; height: number; fp
   yield* readFrames(input, { width: o.width, height: o.height, fps: o.fps, start: o.start, duration: o.duration });
 }
 
-const even = (n: number) => Math.max(2, Math.round(n / 2) * 2);
 
 // The frames of a transition: the end of `first` (from `head` seconds on) blending into the start of `second`,
 // over `duration` seconds. Both clips are read at exactly width x height and fps.

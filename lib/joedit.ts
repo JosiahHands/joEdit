@@ -210,7 +210,8 @@ export function check(file: string): Report {
 
   if (hasVideo) {
     // pix_th 0.03: only near-pure black counts, so dark design colors (like #0B0B0F) are not reported.
-    const log = analyze(file, "video", "blackdetect=d=0.5:pix_th=0.03,freezedetect=n=-60dB:d=2");
+    // pic_th 0.999: a frame is black only if 99.9% of it is, so a title on a dark card is not reported.
+    const log = analyze(file, "video", "blackdetect=d=0.5:pix_th=0.03:pic_th=0.999,freezedetect=n=-60dB:d=2");
     for (const m of log.matchAll(/black_start:\s*([\d.]+)\s+black_end:\s*([\d.]+)/g)) {
       const [start, end] = [Number(m[1]), Number(m[2])];
       problems.push({ problem: "black picture", at: `${formatTime(start)}-${formatTime(end)}`, fix: cutFix(file, start, end, duration) });

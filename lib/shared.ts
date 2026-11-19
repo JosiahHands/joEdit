@@ -144,6 +144,11 @@ export function round(value: number, decimals = 2): number {
   return Math.round(value * factor) / factor;
 }
 
+// The nearest even number (at least 2): video sizes must be even.
+export function even(value: number): number {
+  return Math.max(2, Math.round(value / 2) * 2);
+}
+
 // Read a media file's streams and format, in the same shape ffprobe prints (read in-process by node-av).
 // Width and height are as shown: a phone video recorded upright (rotated 90°) reports a tall size.
 export function probe(input: string): { streams: any[]; format: any } {
@@ -306,6 +311,9 @@ export async function savePicture(image: any, output: string, quality?: number):
 // iPhone photos (.heic, .heif) are decoded by ffmpeg first: sharp's ready-made build cannot read them.
 export async function openPicture(input: string): Promise<any> {
   requireFile(input);
+  if (/\.(mp4|mov|m4v|webm|mkv|avi|mp3|wav|m4a|aac|flac|ogg|opus)$/i.test(input)) {
+    throw new Error(`"${input}" is a video or sound file, not a picture. Use the video commands (same names), or take a still first: node joedit.ts video frame <video> still.png --time S`);
+  }
   if (/\.(heic|heif)$/i.test(input)) {
     const png = execFileSync(FFMPEG, ["-hide_banner", "-loglevel", "error", "-i", input, "-frames:v", "1", "-f", "image2pipe", "-c:v", "png", "-"], {
       maxBuffer: 1024 * 1024 * 1024,
@@ -975,7 +983,13 @@ export const DEFAULT_BRAND: Brand = {
 // Read a brand.json file (if given) on top of the defaults.
 export function loadBrand(path?: string): Brand {
   if (!path) return DEFAULT_BRAND;
-  const custom = JSON.parse(readFileSync(requireFile(path), "utf8"));
+  let custom;
+  try {
+    custom = JSON.parse(readFileSync(requireFile(path), "utf8"));
+  } catch (error: any) {
+    if (error.message.startsWith("File not found")) throw error;
+    throw new Error(`${path} is not valid JSON (${error.message}). Example: {"colors": {"primary": "#7C5CFF"}, "fonts": {"heading": "Montserrat"}}`);
+  }
   const brand: Brand = {
     colors: { ...DEFAULT_BRAND.colors, ...custom.colors },
     fonts: { ...DEFAULT_BRAND.fonts, ...custom.fonts },
