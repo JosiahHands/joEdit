@@ -2,52 +2,81 @@
 // An agent cannot watch a video, but it can read a contact sheet.
 // CLI:     node joedit.ts look <command> ...
 // Library: import { sheet } from "./joEdit/look.ts"
-import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import {
-  DEFAULT_FONT,
   analyze,
+  drawText,
   ffmpeg,
   formatTime,
+  grabFrame,
   inOut,
+  measureText,
+  need,
   numberFlag,
+  openPicture,
   optionalNumberFlag,
   requireFile,
   round,
-  run,
   runCli,
   runPack,
-  withTempDir,
+  saveCanvas,
+  skia,
   type Command,
+  type Frame,
 } from "./shared.ts";
-import * as picture from "./picture.ts";
 import * as video from "./video.ts";
 
-// Grab one frame at each time and arrange them in a grid, each labelled with its timestamp.
-function frameGrid(input: string, output: string, times: number[], columns: number, width: number, title: string): void {
-  withTempDir((folder) => {
-    const labelled: string[] = [];
-    times.forEach((time, n) => {
-      const frame = join(folder, `frame${n}.png`);
-      ffmpeg(["-ss", String(time), "-i", input, "-frames:v", "1", "-vf", `scale=${width}:-2`, "-update", "1", frame]);
-      if (!existsSync(frame)) throw new Error(`Could not read a frame at ${formatTime(time)}.`);
-      labelled.push("-label", formatTime(time), frame);
-    });
-    run("magick", [
-      "montage",
-      "-font", DEFAULT_FONT,
-      "-pointsize", "14",
-      "-fill", "white",
-      "-background", "#202020",
-      ...labelled,
-      "-tile", `${columns}x`,
-      "-geometry", "+4+4",
-      "-title", title,
-      output,
-    ]);
+// A picture to put on a board: RGBA pixels and a label.
+type Tile = { pixels: Buffer; width: number; height: number; label: string };
+
+// Lay tiles out in a grid on a dark background, each labelled underneath, with a title on top.
+async function board(tiles: Tile[], columns: number, output: string, title?: string): Promise<void> {
+  const { createCanvas, ImageData } = await skia();
+  const gap = 8;
+  const labelHeight = 22;
+  const cellWidth = Math.max(...tiles.map((t) => t.width));
+  const cellHeight = Math.max(...tiles.map((t) => t.height)) + labelHeight;
+  const rows = Math.ceil(tiles.length / columns);
+  const width = columns * cellWidth + (columns + 1) * gap;
+  // The title wraps onto more lines when the grid is narrow.
+  const titleStyle = { size: 16, weight: 600, align: "center" as const, maxWidth: width - 16 };
+  const titleHeight = title ? measureText(createCanvas(1, 1).getContext("2d"), title, titleStyle).height + 12 : 0;
+  const canvas = createCanvas(width, titleHeight + rows * cellHeight + (rows + 1) * gap);
+  const ctx = canvas.getContext("2d");
+  ctx.fillStyle = "#202020";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  if (title) drawText(ctx, title, width / 2, 8, titleStyle);
+  tiles.forEach((tile, n) => {
+    const x = gap + (n % columns) * (cellWidth + gap) + (cellWidth - tile.width) / 2;
+    const y = titleHeight + gap + Math.floor(n / columns) * (cellHeight + gap);
+    const pixels = new Uint8ClampedArray(tile.pixels.buffer, tile.pixels.byteOffset, tile.width * tile.height * 4);
+    ctx.putImageData(new ImageData(pixels, tile.width, tile.height), Math.round(x), y);
+    drawText(ctx, tile.label, x + tile.width / 2, y + tile.height + 3, { size: 14, weight: 500, align: "center" });
   });
+  await saveCanvas(canvas, output);
+}
+
+// A picture file as a tile, scaled to `width`.
+async function pictureTile(file: string, width: number, label: string): Promise<Tile> {
+  const { data, info } = await (await openPicture(file)).resize(width).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+  return { pixels: data, width: info.width, height: info.height, label };
+}
+
+// One frame at each time (8 read at once), as labelled tiles.
+async function frameTiles(input: string, times: number[], width: number): Promise<Tile[]> {
+  const frames: (Frame | null)[] = [];
+  for (let i = 0; i < times.length; i += 8) frames.push(...(await Promise.all(times.slice(i, i + 8).map((t) => grabFrame(input, t, width)))));
+  return frames.map((frame, n) => {
+    if (!frame) throw new Error(`Could not read a frame at ${formatTime(times[n])}.`);
+    return { ...frame, label: formatTime(times[n]) };
+  });
+}
+
+// Grab one frame at each time and arrange them in a grid, each labelled with its timestamp.
+async function frameGrid(input: string, output: string, times: number[], columns: number, width: number, title: string): Promise<void> {
+  await board(await frameTiles(input, times, width), columns, output, title);
 }
 
 // Throw a helpful error if the file has no picture (for example an mp3).
@@ -59,27 +88,27 @@ function requireVideo(input: string): video.VideoInfo {
 
 // Contact sheet: `count` frames spread evenly over the whole video, in one picture.
 // This is the main way for an agent to "watch" a video.
-export function sheet(input: string, output: string, count = 12, width = 320): { times: number[] } {
+export async function sheet(input: string, output: string, count = 12, width = 320): Promise<{ times: number[] }> {
   if (count < 1) throw new Error("--count must be 1 or more.");
   const details = requireVideo(input);
   // Take each frame from the middle of its slice of the video.
   const times = Array.from({ length: count }, (_, n) => ((n + 0.5) * details.duration) / count);
   const columns = Math.ceil(Math.sqrt(count));
   const title = `${basename(input)}   ${formatTime(details.duration)}   ${details.width}x${details.height}`;
-  frameGrid(input, output, times, columns, width, title);
+  await frameGrid(input, output, times, columns, width, title);
   return { times: times.map((t) => round(t)) };
 }
 
 // Filmstrip: `count` frames from a short part of the video, in one row.
 // Use it to check a cut, a transition or a moment closely.
-export function strip(input: string, output: string, start: number, end: number, count = 8, width = 240): { times: number[] } {
+export async function strip(input: string, output: string, start: number, end: number, count = 8, width = 240): Promise<{ times: number[] }> {
   if (end <= start) throw new Error("--end must be bigger than --start.");
   if (count < 2) throw new Error("--count must be 2 or more.");
   const details = requireVideo(input);
   // Stay a little before the very end, where there may be no frame to read.
   const last = Math.min(end, details.duration - 0.05);
   const times = Array.from({ length: count }, (_, n) => start + (n * (last - start)) / (count - 1));
-  frameGrid(input, output, times, count, width, `${basename(input)}   ${formatTime(start)} - ${formatTime(end)}`);
+  await frameGrid(input, output, times, count, width, `${basename(input)}   ${formatTime(start)} - ${formatTime(end)}`);
   return { times: times.map((t) => round(t)) };
 }
 
@@ -94,38 +123,37 @@ export function scenes(input: string, threshold = 0.3): { cuts: number[]; count:
 
 // Compare two pictures: saves them side by side with a third panel showing the differences in red.
 // difference: 0 = identical, 1 = completely different.
-export function compare(first: string, second: string, output: string): { difference: number; same: boolean } {
-  requireFile(first);
-  requireFile(second);
-  const { width, height } = picture.info(first);
-  return withTempDir((folder) => {
-    // Make the second picture the same size as the first so they can be compared.
-    const resized = join(folder, "second.png");
-    run("magick", [second, "-resize", `${width}x${height}!`, resized]);
+export async function compare(first: string, second: string, output: string): Promise<{ difference: number; same: boolean }> {
+  // Both as RGBA pixels at the first picture's size (so pictures of different sizes can be compared).
+  const a = await (await openPicture(first)).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+  const { width, height } = a.info;
+  const b = await (await openPicture(second)).resize(width, height, { fit: "fill" }).ensureAlpha().raw().toBuffer();
 
-    // `magick compare` exits with code 1 when the pictures differ, so it is run directly here.
-    const scored = spawnSync("magick", ["compare", "-metric", "RMSE", first, resized, "null:"], { encoding: "utf8" });
-    const match = scored.stderr.match(/\(([\d.e-]+)\)/);
-    if (!match) throw new Error(`Could not compare the pictures: ${scored.stderr.trim()}`);
-    const difference = round(Number(match[1]), 4);
+  // Root-mean-square difference of red, green and blue, from 0 to 1.
+  // The differences panel is the first picture faded out, with changed pixels in red.
+  let sum = 0;
+  const diff = Buffer.alloc(width * height * 4);
+  for (let i = 0; i < a.data.length; i += 4) {
+    let changed = false;
+    for (let c = 0; c < 3; c++) {
+      const d = a.data[i + c] - b[i + c];
+      sum += d * d;
+      if (Math.abs(d) > 8) changed = true;
+    }
+    const faded = 255 - (255 - (a.data[i] + a.data[i + 1] + a.data[i + 2]) / 3) * 0.2;
+    diff.set(changed ? [230, 30, 30, 255] : [faded, faded, faded, 255], i);
+  }
+  const difference = round(Math.sqrt(sum / (width * height * 3)) / 255, 4);
 
-    const diff = join(folder, "diff.png");
-    spawnSync("magick", ["compare", first, resized, diff]);
-    run("magick", [
-      "montage",
-      "-font", DEFAULT_FONT,
-      "-pointsize", "14",
-      "-fill", "white",
-      "-background", "#202020",
-      "-label", "first", first,
-      "-label", "second", resized,
-      "-label", "differences", diff,
-      "-tile", "3x",
-      "-geometry", "+4+4",
-      output,
-    ]);
-    return { difference, same: difference < 0.01 };
-  });
+  // Panels are shown at most 480 pixels wide.
+  const scale = Math.min(1, 480 / width);
+  const sharp = need("sharp");
+  const panel = async (pixels: Buffer, label: string): Promise<Tile> => {
+    const { data, info } = await sharp(pixels, { raw: { width, height, channels: 4 } }).resize(Math.round(width * scale)).raw().toBuffer({ resolveWithObject: true });
+    return { pixels: data, width: info.width, height: info.height, label };
+  };
+  await board([await panel(a.data, "first"), await panel(b, "second"), await panel(diff, "differences")], 3, output);
+  return { difference, same: difference < 0.01 };
 }
 
 const PICTURE_FILE = /\.(png|jpe?g|webp|gif|bmp|tiff?|heic)$/i;
@@ -137,7 +165,7 @@ export type Match = { file: string; time?: number; start?: number; end?: number;
 // Search pictures and videos by meaning: "a dog on a beach", "close-up of hands typing" (vision pack).
 // input: a video, a picture or a folder of them. Videos are sampled every `every` seconds.
 // Frames and their embeddings are cached in .joedit-cache/ next to the input, so the next search is fast.
-export function find(input: string, query: string, options: { top?: number; every?: number; sheet?: string } = {}) {
+export async function find(input: string, query: string, options: { top?: number; every?: number; sheet?: string } = {}) {
   requireFile(input);
   if (!query.trim()) throw new Error('Describe what to find with --query, e.g. --query "a red car".');
   const { top = 5, every = 1 } = options;
@@ -200,58 +228,78 @@ export function find(input: string, query: string, options: { top?: number; ever
   }));
 
   // Optional picture of the matches, best first, labelled with the file, time and score.
-  if (options.sheet) {
-    const labelled = chosen.flatMap((c) => [
-      "-label", `${basename(c.file)}${c.time === undefined ? "" : ` ${formatTime(c.start!)}-${formatTime(c.end!)}`}  ${round(c.score, 3)}`, c.picture,
-    ]);
-    run("magick", [
-      "montage", "-font", DEFAULT_FONT, "-pointsize", "14", "-fill", "white", "-background", "#202020",
-      ...labelled, "-tile", `${Math.min(chosen.length, 5)}x`, "-geometry", "320x+4+4", "-title", query, options.sheet,
-    ]);
+  if (options.sheet && chosen.length) {
+    const tiles = await Promise.all(chosen.map((c) =>
+      pictureTile(c.picture, 320, `${basename(c.file)}${c.time === undefined ? "" : ` ${formatTime(c.start!)}-${formatTime(c.end!)}`}  ${round(c.score, 3)}`),
+    ));
+    await board(tiles, Math.min(chosen.length, 5), options.sheet, query);
   }
   return { query, searched: candidates.length, matches, ...(options.sheet ? { sheet: options.sheet } : {}) };
 }
 
 // The main colors of a picture or video, biggest share first, as hex codes.
 // Useful to match text, titles and brand colors to the footage. swatch: optional picture of the palette.
-export function colors(input: string, count = 6, swatch?: string) {
+export async function colors(input: string, count = 6, swatch?: string) {
   requireFile(input);
-  return withTempDir((folder) => {
-    let source = input;
-    if (!PICTURE_FILE.test(input)) {
-      // A video: put 6 frames from across it side by side and read the colors of all of them.
-      const length = requireVideo(input).duration;
-      const frames = Array.from({ length: 6 }, (_, n) => {
-        const frame = join(folder, `frame${n}.png`);
-        ffmpeg(["-ss", String(((n + 0.5) * length) / 6), "-i", input, "-frames:v", "1", "-vf", "scale=240:-2", "-update", "1", frame]);
-        return frame;
-      }).filter((frame) => existsSync(frame));
-      source = join(folder, "frames.png");
-      run("magick", [...frames, "+append", source]);
+  // The pixels to read: a small copy of the picture, or 6 frames from across a video.
+  let pixels: Buffer[] = [];
+  if (PICTURE_FILE.test(input)) {
+    pixels.push(await (await openPicture(input)).resize(200, 200, { fit: "inside" }).removeAlpha().ensureAlpha().raw().toBuffer());
+  } else {
+    const length = requireVideo(input).duration;
+    const times = Array.from({ length: 6 }, (_, n) => ((n + 0.5) * length) / 6);
+    pixels = (await Promise.all(times.map((t) => grabFrame(input, t, 160)))).filter((f) => f !== null).map((f) => f!.pixels);
+  }
+  const points: number[][] = [];
+  for (const buffer of pixels) for (let i = 0; i < buffer.length; i += 4) points.push([buffer[i], buffer[i + 1], buffer[i + 2]]);
+
+  // k-means: start from colors far apart from each other, then move each to the average of its pixels.
+  const distance = (a: number[], b: number[]) => Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]);
+  const centres: number[][] = [points[0]];
+  while (centres.length < count) {
+    let far = points[0];
+    let best = -1;
+    for (const p of points) {
+      const d = Math.min(...centres.map((c) => distance(c, p)));
+      if (d > best) [best, far] = [d, p];
     }
-    // Shrink, then let ImageMagick pick `count` representative colors and count their pixels.
-    const histogram = run("magick", [source, "-resize", "200x200", "-alpha", "off", "+dither", "-colors", String(count), "-format", "%c", "histogram:info:-"]);
-    const found = [...histogram.matchAll(/^\s*(\d+):.*?(#[0-9A-F]{6})/gim)].map((m) => ({ hex: m[2].toUpperCase(), pixels: Number(m[1]) }));
-    const total = found.reduce((sum, c) => sum + c.pixels, 0);
-    // Merge colors that look the same (soft edges make near-copies) into the bigger one.
-    const rgb = (hex: string) => [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16));
-    const distance = (a: string, b: string) => Math.hypot(...rgb(a).map((v, i) => v - rgb(b)[i]));
-    const merged: typeof found = [];
-    for (const c of found.sort((a, b) => b.pixels - a.pixels)) {
-      const same = merged.find((m) => distance(m.hex, c.hex) < 20);
-      if (same) same.pixels += c.pixels;
-      else merged.push({ ...c });
+    if (best < 1) break; // fewer different colors than asked for
+    centres.push(far);
+  }
+  let sizes: number[] = [];
+  for (let step = 0; step < 10; step++) {
+    const sums = centres.map(() => [0, 0, 0]);
+    sizes = centres.map(() => 0);
+    for (const p of points) {
+      let nearest = 0;
+      for (let c = 1; c < centres.length; c++) if (distance(centres[c], p) < distance(centres[nearest], p)) nearest = c;
+      sizes[nearest]++;
+      for (let k = 0; k < 3; k++) sums[nearest][k] += p[k];
     }
-    const palette = merged.map((c) => ({ hex: c.hex, share: round(c.pixels / total, 3) }));
-    if (swatch) {
-      run("magick", [
-        ...palette.flatMap((c) => ["(", "-size", "160x120", `xc:${c.hex}`, "-gravity", "south", "-background", "#202020",
-          "-fill", "white", "-font", DEFAULT_FONT, "-pointsize", "16", "-splice", "0x28", "-annotate", "+0+4", c.hex, ")"]),
-        "+append", swatch,
-      ]);
-    }
-    return { colors: palette, ...(swatch ? { swatch } : {}) };
-  });
+    for (let n = 0; n < centres.length; n++) if (sizes[n]) centres[n] = sums[n].map((s) => s / sizes[n]);
+  }
+  const hex = (c: number[]) => `#${c.map((v) => Math.round(v).toString(16).padStart(2, "0")).join("").toUpperCase()}`;
+  // Merge colors that look the same (soft edges make near-copies) into the bigger one.
+  const merged: { color: number[]; pixels: number }[] = [];
+  for (const [n, c] of centres.entries()) {
+    if (!sizes[n]) continue;
+    const same = merged.find((m) => distance(m.color, c) < 20);
+    if (same) same.pixels += sizes[n];
+    else merged.push({ color: c, pixels: sizes[n] });
+  }
+  merged.sort((a, b) => b.pixels - a.pixels);
+  const palette = merged.map((m) => ({ hex: hex(m.color), share: round(m.pixels / points.length, 3) }));
+
+  if (swatch) {
+    const tiles = palette.map((c) => {
+      const tile = Buffer.alloc(160 * 120 * 4);
+      const rgb = [1, 3, 5].map((i) => parseInt(c.hex.slice(i, i + 2), 16));
+      for (let i = 0; i < tile.length; i += 4) tile.set([...rgb, 255], i);
+      return { pixels: tile, width: 160, height: 120, label: `${c.hex}  ${Math.round(c.share * 100)}%` };
+    });
+    await board(tiles, tiles.length, swatch);
+  }
+  return { colors: palette, ...(swatch ? { swatch } : {}) };
 }
 
 export const commands: Record<string, Command> = {

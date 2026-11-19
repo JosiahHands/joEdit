@@ -8,23 +8,10 @@
   "engines": {
     "node": ">=24"
   },
+  "scripts": {
+    "postinstall": "npm install --prefix libs --no-audit --no-fund"
+  },
   "devDependencies": {
     "@types/node": "^24.19.2"
-  },
-  "dependencies": {
-    "@huggingface/transformers": "^4.3.2",
-    "@napi-rs/canvas": "^1.1.1",
-    "@seydx/node-av-ffmpeg": "^7.1.0",
-    "koffi": "^3.3.8",
-    "kokoro-js": "^1.2.1",
-    "node-av": "^7.1.0",
-    "node-web-audio-api": "^2.2.0",
-    "onnxruntime-node": "1.30.0",
-    "sharp": "^0.35.5"
-  },
-  "overrides": {
-    "kokoro-js": {
-      "@huggingface/transformers": "$@huggingface/transformers"
-    }
   }
 }

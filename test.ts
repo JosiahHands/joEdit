@@ -2,7 +2,7 @@
 // Tests for every joEdit CLI: picture, video, sound, look, listen and joedit (doctor, check, packs).
 // Run with: node --test test.ts   (run `npm install` in lib/ first, for editor types)
 import { spawnSync, execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test, before, after, describe } from "node:test";
@@ -12,7 +12,7 @@ import * as video from "./lib/video.ts";
 import * as sound from "./lib/sound.ts";
 import * as graphics from "./lib/graphics.ts";
 import * as threeD from "./lib/3d.ts";
-import { FFMPEG, probe, readFrames, writeVideo } from "./lib/shared.ts";
+import { FFMPEG, need, probe, readFrames, writeVideo } from "./lib/shared.ts";
 
 type Tool = "picture" | "video" | "sound" | "look" | "listen" | "graphics" | "movie" | "voice" | "music" | "3d" | "joedit";
 
@@ -58,16 +58,36 @@ function ok(tool: Tool, args: string[]): string {
   return result.stdout;
 }
 
-// Color of one pixel, e.g. "srgb(255,0,0)".
-function pixel(path: string, x: number, y: number): string {
-  // Convert to sRGB first so gray pictures also print as "srgb(r,g,b)".
-  return execFileSync("magick", [path, "-colorspace", "sRGB", "-format", `%[pixel:p{${x},${y}}]`, "info:"], { encoding: "utf8" });
+// RGBA pixels of a picture, or of a region of it ("WIDTHxHEIGHT+X+Y"), read with joEdit's ffmpeg.
+function rgba(path: string, region?: string): Buffer {
+  const { width, height } = probe(path).streams[0];
+  const [w, h, x, y] = region ? region.match(/\d+/g)!.map(Number) : [width, height, 0, 0];
+  const args = ["-loglevel", "error", "-i", path, "-frames:v", "1", "-vf", `crop=${w}:${h}:${x}:${y},format=rgba`, "-f", "rawvideo", "-"];
+  return execFileSync(FFMPEG, args, { maxBuffer: 1 << 28 });
 }
 
-// Average brightness from 0 to 1.
-function mean(path: string): number {
-  return Number(execFileSync("magick", [path, "-format", "%[fx:mean]", "info:"], { encoding: "utf8" }));
+// Color of one pixel, e.g. "srgb(255,0,0)" (or "srgba(255,0,0,0.5)" when see-through).
+function pixel(path: string, x: number, y: number): string {
+  const [r, g, b, a] = rgba(path, `1x1+${x}+${y}`);
+  return a === 255 ? `srgb(${r},${g},${b})` : `srgba(${r},${g},${b},${Math.round((a / 255) * 100) / 100})`;
 }
+
+// Average brightness from 0 to 1 (of a region, if given).
+function mean(path: string, region?: string): number {
+  const data = rgba(path, region);
+  let sum = 0;
+  for (let i = 0; i < data.length; i += 4) sum += data[i] + data[i + 1] + data[i + 2];
+  return sum / ((data.length / 4) * 3 * 255);
+}
+
+// Make an exact test picture: color(x, y) gives [red, green, blue, alpha] for every pixel.
+async function paint(path: string, width: number, height: number, color: (x: number, y: number) => number[]): Promise<void> {
+  const data = Buffer.alloc(width * height * 4);
+  for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) data.set(color(x, y), (y * width + x) * 4);
+  await need("sharp")(data, { raw: { width, height, channels: 4 } }).png().toFile(path);
+}
+const RED = [255, 0, 0, 255], BLUE = [0, 0, 255, 255], WHITE = [255, 255, 255, 255], BLACK = [0, 0, 0, 255], CLEAR = [0, 0, 0, 0];
+const inCircle = (x: number, y: number, cx: number, cy: number, r: number) => Math.hypot(x + 0.5 - cx, y + 0.5 - cy) <= r;
 
 // Durations are checked with a small tolerance because of how video frames and audio samples line up.
 function near(actual: number, expected: number, tolerance = 0.15): void {
@@ -81,8 +101,11 @@ function frameAt(path: string, time: number, output: string): void {
 
 // How different the same region (e.g. "320x100+0+0") is in two pictures: 0 = same, 1 = opposite.
 function regionDiff(a: string, b: string, region: string): number {
-  const result = spawnSync("magick", ["compare", "-metric", "RMSE", "(", a, "-crop", region, ")", "(", b, "-crop", region, ")", "null:"], { encoding: "utf8" });
-  return Number(result.stderr.match(/\(([\d.e-]+)\)/)?.[1] ?? NaN);
+  const first = rgba(a, region);
+  const second = rgba(b, region);
+  let sum = 0;
+  for (let i = 0; i < first.length; i += 4) for (let c = 0; c < 3; c++) sum += (first[i + c] - second[i + c]) ** 2;
+  return Math.sqrt(sum / ((first.length / 4) * 3)) / 255;
 }
 
 // Average loudness in dB (closer to 0 = louder). `seconds` limits it to the start of the file.
@@ -95,9 +118,9 @@ function loudness(path: string, seconds = 0): number {
 }
 
 // Sample files are created once before all tests.
-before(() => {
+before(async () => {
   // 400x300 red picture with a blue top-right corner (so flips can be checked).
-  execFileSync("magick", ["-size", "400x300", "xc:red", "-fill", "blue", "-draw", "rectangle 200,0 399,149", file("in.png")]);
+  await paint(file("in.png"), 400, 300, (x, y) => (x >= 200 && y < 150 ? BLUE : RED));
   // 3 second 320x240 video with sound.
   execFileSync(FFMPEG, [
     "-loglevel", "error", "-y",
@@ -262,13 +285,13 @@ describe("picture", () => {
     assert.equal(cli("picture", ["upscale", file("small.png"), file("x.png"), "--scale", "5"]).code, 1);
   });
 
-  test("cutout removes the background", (t) => {
+  test("cutout removes the background", async (t) => {
     if (!hasPack("cutout")) return t.skip("cutout pack not installed");
-    execFileSync("magick", ["-size", "320x240", "xc:white", "-fill", "red", "-draw", "circle 160,120 160,50", file("subject.png")]);
+    await paint(file("subject.png"), 320, 240, (x, y) => (inCircle(x, y, 160, 120, 70) ? RED : WHITE));
     ok("picture", ["cutout", file("subject.png"), file("cut.png")]);
     // The ball stays, the white around it becomes see-through.
-    assert.match(execFileSync("magick", [file("cut.png"), "-format", "%[pixel:p{160,120}]", "info:"], { encoding: "utf8" }), /^srgba?\(25\d,/);
-    assert.equal(execFileSync("magick", [file("cut.png"), "-format", "%[fx:p{5,5}.a]", "info:"], { encoding: "utf8" }), "0");
+    assert.match(pixel(file("cut.png"), 160, 120), /^srgba?\(25\d,/);
+    assert.equal(rgba(file("cut.png"), "1x1+5+5")[3], 0);
     ok("picture", ["cutout", file("subject.png"), file("mask.png"), "--mask"]);
     assert.ok(mean(file("mask.png")) > 0.1 && mean(file("mask.png")) < 0.5);
   });
@@ -280,11 +303,11 @@ describe("picture", () => {
     assert.deepEqual(picture.info(file("depth.png")), { width: 320, height: 240, format: "PNG" });
   });
 
-  test("parallax moves near parts more than far parts", (t) => {
+  test("parallax moves near parts more than far parts", async (t) => {
     if (!hasChrome) return t.skip("Chrome not found");
     // A hand-made depth map: the top half is near (white), the bottom half far (black).
-    execFileSync("magick", ["-size", "400x150", "xc:white", "-size", "400x150", "xc:black", "-append", file("halves-depth.png")]);
-    execFileSync("magick", ["-size", "400x300", "pattern:checkerboard", "-scale", "400%", file("checks.png")]);
+    await paint(file("halves-depth.png"), 400, 300, (_, y) => (y < 150 ? WHITE : BLACK));
+    await paint(file("checks.png"), 400, 300, (x, y) => ((Math.floor(x / 32) + Math.floor(y / 32)) % 2 ? WHITE : [128, 128, 128, 255]));
     const result = JSON.parse(ok("picture", ["parallax", file("checks.png"), file("parallax.mp4"), "--depth", file("halves-depth.png"),
       "--motion", "pan-right", "--duration", "1", "--width", "320", "--height", "240"]));
     assert.equal(result.frames, 30);
@@ -294,6 +317,51 @@ describe("picture", () => {
     const farMove = regionDiff(file("px-start.png"), file("px-end.png"), "320x80+0+140");
     assert.ok(nearMove > farMove, `near ${nearMove} should move more than far ${farMove}`);
     assert.equal(cli("picture", ["parallax", file("checks.png"), file("x.mp4"), "--motion", "spin"]).code, 1);
+  });
+
+  test("fit crops to a shape without stretching", () => {
+    ok("picture", ["fit", file("in.png"), file("fit.png"), "--aspect", "9:16", "--focus", "right"]);
+    assert.deepEqual(picture.info(file("fit.png")), { width: 169, height: 300, format: "PNG" });
+    // Keeping the right side keeps the blue corner.
+    assert.equal(pixel(file("fit.png"), 160, 10), "srgb(0,0,255)");
+    ok("picture", ["fit", file("in.png"), file("fit-square.jpg"), "--aspect", "1:1", "--width", "100"]);
+    assert.deepEqual(picture.info(file("fit-square.jpg")), { width: 100, height: 100, format: "JPEG" });
+    assert.equal(cli("picture", ["fit", file("in.png"), file("x.png")]).code, 1); // no shape
+  });
+
+  test("text with stroke, box and wrapping", () => {
+    const result = JSON.parse(ok("picture", ["text", file("in.png"), file("styled.png"), "--text", "one two three four", "--max-width", "120",
+      "--box", "#000000", "--x", "200", "--y", "20", "--align", "center", "--stroke", "white"]));
+    assert.ok(result.height > 60, `wrapped onto lines: ${result.height}`);
+    assert.equal(pixel(file("styled.png"), 200, 22), "srgb(0,0,0)"); // inside the box
+  });
+
+  test("compose draws a design from layers", () => {
+    writeFileSync(file("design.json"), JSON.stringify({
+      width: 300, height: 200, background: "#FFFFFF",
+      layers: [
+        { image: "in.png", x: 0, y: 0, width: 150, height: 100 },
+        { color: "primary", x: 200, y: 150, width: 50, height: 30 },
+        { text: "Hi", x: 150, y: 120, size: 30, color: "#000000", align: "center" },
+      ],
+    }));
+    const result = JSON.parse(ok("picture", ["compose", file("design.json"), file("design.png")]));
+    assert.deepEqual([result.width, result.height, result.layers], [300, 200, 3]);
+    assert.equal(pixel(file("design.png"), 10, 90), "srgb(255,0,0)"); // the picture
+    assert.equal(pixel(file("design.png"), 250, 10), "srgb(255,255,255)"); // background
+    assert.equal(pixel(file("design.png"), 225, 165), "srgb(124,92,255)"); // brand primary color
+    writeFileSync(file("bad-design.json"), JSON.stringify({ layers: [{ x: 1 }] }));
+    assert.match(cli("picture", ["compose", file("bad-design.json"), file("x.png")]).stderr, /needs an image, a text or a color/);
+  });
+
+  test("batch converts a folder of pictures", async () => {
+    mkdirSync(file("batch-in"), { recursive: true });
+    await paint(file("batch-in/a.png"), 400, 200, () => RED);
+    await paint(file("batch-in/b.png"), 200, 400, () => BLUE);
+    const result = JSON.parse(ok("picture", ["batch", file("batch-in"), file("batch-out"), "--width", "100", "--format", "webp"]));
+    assert.equal(result.count, 2);
+    assert.deepEqual(picture.info(file("batch-out/a.webp")), { width: 100, height: 50, format: "WEBP" });
+    assert.deepEqual(picture.info(file("batch-out/b.webp")), { width: 100, height: 200, format: "WEBP" });
   });
 
   test("errors: missing file, missing flag, unknown command", () => {
@@ -457,10 +525,10 @@ describe("video", () => {
     assert.equal(cli("video", ["reframe", file("in.mp4"), file("x.mp4"), "--aspect", "wide"]).code, 1);
   });
 
-  test("reframe --follow keeps a moving subject in the crop", (t) => {
+  test("reframe --follow keeps a moving subject in the crop", async (t) => {
     if (!hasPack("cutout")) return t.skip("cutout pack not installed");
     // A red ball moving from the left to the right of a wide video.
-    execFileSync("magick", ["-size", "100x100", "xc:none", "-fill", "red", "-draw", "circle 50,50 50,5", file("ball-small.png")]);
+    await paint(file("ball-small.png"), 100, 100, (x, y) => (inCircle(x, y, 50, 50, 45) ? RED : CLEAR));
     execFileSync(FFMPEG, [
       "-loglevel", "error", "-y", "-f", "lavfi", "-i", "color=c=0xDDDDDD:s=640x360:r=30:d=3", "-i", file("ball-small.png"),
       "-filter_complex", "[0][1]overlay=x='20+t*170':y=130,format=yuv420p", file("moving.mp4"),
@@ -829,8 +897,7 @@ describe("3d", () => {
     assert.equal(result.output, file("title3d.png"));
     assert.deepEqual(picture.info(file("title3d.png")), { width: 320, height: 180, format: "PNG" });
     // The letters in the middle are brighter than the dark background in the corner.
-    const brightness = (region: string) => Number(execFileSync("magick", [file("title3d.png"), "-crop", region, "+repage", "-format", "%[fx:mean]", "info:"], { encoding: "utf8" }));
-    assert.ok(brightness("120x40+100+50") > brightness("40x30+0+0") + 0.05);
+    assert.ok(mean(file("title3d.png"), "120x40+100+50") > mean(file("title3d.png"), "40x30+0+0") + 0.05);
     assert.equal(cli("3d", ["title", file("x.png")]).code, 1); // no --text
   });
 
@@ -1067,10 +1134,10 @@ describe("look", () => {
     assert.ok(existsSync(file("swatch.png")));
   });
 
-  test("find locates the moment that matches a description", (t) => {
+  test("find locates the moment that matches a description", async (t) => {
     if (!hasPack("vision")) return t.skip("vision pack not installed");
     // 2s of blue sky color, 2s of a red ball on white, 2s of green: the ball is at 2-4s.
-    execFileSync("magick", ["-size", "320x240", "xc:white", "-fill", "red", "-draw", "circle 160,120 160,40", file("ball.png")]);
+    await paint(file("ball.png"), 320, 240, (x, y) => (inCircle(x, y, 160, 120, 80) ? RED : WHITE));
     execFileSync(FFMPEG, [
       "-loglevel", "error", "-y",
       "-f", "lavfi", "-i", "color=c=0x3B82F6:s=320x240:r=30:d=2",

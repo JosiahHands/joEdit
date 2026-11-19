@@ -6,9 +6,11 @@ import { execFileSync } from "node:child_process";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
-  DEFAULT_FONT,
   FFMPEG,
   analyze,
+  drawText,
+  saveCanvas,
+  skia,
   ffmpeg,
   formatTime,
   inOut,
@@ -16,7 +18,6 @@ import {
   requireFile,
   round,
   runPack,
-  run,
   runCli,
   withTempDir,
   type Command,
@@ -26,9 +27,9 @@ import * as sound from "./sound.ts";
 // ---------- Pictures of sound ----------
 
 // Waveform picture with a time ruler underneath. Loud parts are tall, silence is flat.
-export function wave(input: string, output: string, width = 1200, height = 240): void {
+export async function wave(input: string, output: string, width = 1200, height = 240): Promise<void> {
   const { duration } = sound.info(input);
-  withTempDir((folder) => {
+  await withTempDir(async (folder) => {
     const plain = join(folder, "wave.png");
     ffmpeg([
       "-i", input,
@@ -36,23 +37,18 @@ export function wave(input: string, output: string, width = 1200, height = 240):
       "-frames:v", "1",
       plain,
     ]);
-    // Time labels at the start, 1/4, 1/2, 3/4 and end.
-    const labels = [0, 0.25, 0.5, 0.75, 1].flatMap((part) => {
-      const x = Math.round(part * (width - 50));
-      return ["-annotate", `+${x}+${height + 4}`, formatTime(part * duration)];
-    });
-    run("magick", [
-      plain,
-      "-background", "#202020",
-      "-flatten",
-      "-extent", `${width}x${height + 24}`,
-      "-font", DEFAULT_FONT,
-      "-pointsize", "14",
-      "-fill", "white",
-      "-gravity", "NorthWest",
-      ...labels,
-      output,
-    ]);
+    // The wave on a dark background, with time labels at the start, 1/4, 1/2, 3/4 and end.
+    const { createCanvas, loadImage } = await skia();
+    const canvas = createCanvas(width, height + 24);
+    const ctx = canvas.getContext("2d");
+    ctx.fillStyle = "#202020";
+    ctx.fillRect(0, 0, width, height + 24);
+    ctx.drawImage(await loadImage(plain), 0, 0);
+    for (const part of [0, 0.25, 0.5, 0.75, 1]) {
+      const align = part === 0 ? "left" : part === 1 ? "right" : "center";
+      drawText(ctx, formatTime(part * duration), part * width + (part === 0 ? 4 : part === 1 ? -4 : 0), height + 4, { size: 14, weight: 500, align });
+    }
+    await saveCanvas(canvas, output);
   });
 }
 
@@ -247,7 +243,7 @@ export const commands: Record<string, Command> = {
     usage: "wave <sound> <output.png> [--width 1200] [--height 240]",
     run: (a) => {
       const { input, output } = inOut(a);
-      wave(input, output, optionalNumberFlag(a, "width", 1200), optionalNumberFlag(a, "height", 240));
+      return wave(input, output, optionalNumberFlag(a, "width", 1200), optionalNumberFlag(a, "height", 240));
     },
   },
   spectrum: {

@@ -9,6 +9,7 @@ import { join } from "node:path";
 import {
   DEFAULT_FONT,
   LIB,
+  LIBS,
   analyze,
   closest,
   formatTime,
@@ -76,7 +77,7 @@ function chrome(): Tool {
   }
 }
 
-// joEdit's engine: npm libraries that `npm install` puts in node_modules.
+// joEdit's engine: npm libraries that `npm install` puts in libs/.
 const LIBRARIES = [
   { name: "node-av", does: "reads media files; its FFmpeg 8 (@seydx/node-av-ffmpeg) encodes and decodes everything" },
   { name: "@seydx/node-av-ffmpeg", does: "the full FFmpeg 8 program (x264, x265, hardware encoders, libass, whisper)" },
@@ -92,7 +93,7 @@ const LIBRARIES = [
 // Is an npm library installed, and which version?
 function library(name: string): { name: string; found: boolean; version?: string; does: string } {
   const does = LIBRARIES.find((l) => l.name === name)!.does;
-  const file = join(LIB, "node_modules", name, "package.json");
+  const file = join(LIBS, "node_modules", name, "package.json");
   if (!existsSync(file)) return { name, found: false, does };
   return { name, found: true, version: JSON.parse(readFileSync(file, "utf8")).version, does };
 }
@@ -118,7 +119,6 @@ export function doctor() {
       fix: nodeMajor >= 24 ? undefined : "install Node.js 24 or newer: https://nodejs.org",
     },
     tool("ffmpeg", ["-version"], "video, sound, look, listen, check", `cd ${LIB} && npm install`),
-    tool("magick", ["-version"], "picture, look, text", mac ? "brew install imagemagick" : "install ImageMagick 7: https://imagemagick.org/script/download.php"),
     {
       name: "font",
       found: existsSync(DEFAULT_FONT),

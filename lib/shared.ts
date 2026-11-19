@@ -13,26 +13,17 @@ export const ASSETS = join(LIB, ".assets");
 export const MODELS = join(LIB, ".models");
 
 // ---------- Native libraries ----------
-// joEdit's engine is a set of npm libraries installed into node_modules by `npm install`:
+// joEdit's engine is a set of npm libraries kept in libs/ (libs/package.json, installed by `npm install` in lib/):
 // node-av (FFmpeg), sharp (pictures), @napi-rs/canvas (Skia drawing), node-web-audio-api (sound),
 // @huggingface/transformers + onnxruntime-node (AI models), kokoro-js (voices) and koffi (loads raylib for GPU effects).
 // They are loaded only when a command needs them, so a missing one only breaks its own commands.
-const require = createRequire(import.meta.url);
+export const LIBS = join(LIB, "libs");
+const requireLibrary = createRequire(join(LIBS, "package.json"));
 
-// Load a library by name, with a clear message if it is missing.
-export async function need<T = any>(name: string): Promise<T> {
+// Load a library from libs/ by name, with a clear message if it is missing.
+export function need(name: string): any {
   try {
-    return await import(name);
-  } catch (error: any) {
-    if (error.code === "ERR_MODULE_NOT_FOUND") throw new Error(`The "${name}" library is missing. Run: cd ${LIB} && npm install`);
-    throw error;
-  }
-}
-
-// The same for code that cannot wait (Node 24 can require ES modules).
-export function needNow<T = any>(name: string): T {
-  try {
-    return require(name);
+    return requireLibrary(name);
   } catch (error: any) {
     if (error.code === "MODULE_NOT_FOUND") throw new Error(`The "${name}" library is missing. Run: cd ${LIB} && npm install`);
     throw error;
@@ -43,7 +34,7 @@ export function needNow<T = any>(name: string): T {
 // libass, drawtext and whisper), or else one installed on this computer.
 export const FFMPEG: string = (() => {
   try {
-    return require("node-av/ffmpeg").ffmpegPath();
+    return requireLibrary("node-av/ffmpeg").ffmpegPath();
   } catch {
     return "ffmpeg";
   }
@@ -159,7 +150,7 @@ export function round(value: number, decimals = 2): number {
 // Width and height are as shown: a phone video recorded upright (rotated 90°) reports a tall size.
 export function probe(input: string): { streams: any[]; format: any } {
   requireFile(input);
-  const av = needNow("node-av");
+  const av = need("node-av");
   let demuxer: any;
   try {
     demuxer = av.Demuxer.openSync(input);
@@ -203,7 +194,11 @@ export type Frame = { time: number; pixels: Buffer; width: number; height: numbe
 
 // Read a video's frames as RGBA pixels, one at a time (memory stays small for long videos).
 // fps: take this many frames per second (default: every frame). width: scale down to this width.
-export async function* readFrames(input: string, options: { fps?: number; width?: number; start?: number; duration?: number } = {}): AsyncGenerator<Frame> {
+// start / duration / count: only part of the video (count = at most this many frames).
+export async function* readFrames(
+  input: string,
+  options: { fps?: number; width?: number; start?: number; duration?: number; count?: number } = {},
+): AsyncGenerator<Frame> {
   const video = probe(input).streams.find((s) => s.codec_type === "video");
   if (!video) throw new Error(`"${input}" has no picture.`);
   const width = options.width ? Math.round(options.width / 2) * 2 : video.width;
@@ -215,6 +210,7 @@ export async function* readFrames(input: string, options: { fps?: number; width?
     "-hide_banner", "-loglevel", "error",
     ...(options.start ? ["-ss", String(options.start)] : []), "-i", input,
     ...(options.duration ? ["-t", String(options.duration)] : []),
+    ...(options.count ? ["-frames:v", String(options.count)] : []),
     "-vf", filters.join(","), "-f", "rawvideo", "-",
   ], { stdio: ["ignore", "pipe", "pipe"] });
   let errors = "";
@@ -236,6 +232,12 @@ export async function* readFrames(input: string, options: { fps?: number; width?
     }
   }
   if ((await closed) !== 0) throw new Error(`ffmpeg failed: ${errors.trim()}`);
+}
+
+// One frame of a video at `time` seconds, as RGBA pixels (null if there is no frame there).
+export async function grabFrame(input: string, time: number, width?: number): Promise<Frame | null> {
+  for await (const frame of readFrames(input, { start: time, width, count: 1 })) return frame;
+  return null;
 }
 
 // Write RGBA frames into a video. Returns a writer: await write(pixels) for every frame, then await finish().
@@ -275,6 +277,182 @@ export function videoEncoder(output: string, options: { transparent?: boolean; d
   const h264 = ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", options.draft ? "ultrafast" : "medium", "-crf", options.draft ? "28" : "18"];
   // faststart lets a video start playing on the web before it has fully downloaded.
   return type === "mp4" || type === "m4v" || type === "mov" ? [...h264, "-movflags", "+faststart"] : h264;
+}
+
+// ---------- Pictures (sharp) ----------
+
+// Save a sharp picture in the format of the output's extension. quality: 1..100 for jpg, webp and avif.
+// Formats sharp cannot write (like .bmp) are converted by ffmpeg.
+export async function savePicture(image: any, output: string, quality?: number): Promise<void> {
+  const type = output.split(".").pop()?.toLowerCase() ?? "";
+  if (type === "jpg" || type === "jpeg") image = image.flatten({ background: "#ffffff" }).jpeg({ quality: quality || 90, mozjpeg: true });
+  else if (type === "png") image = image.png();
+  else if (type === "webp") image = image.webp({ quality: quality || 90 });
+  else if (type === "avif") image = image.avif({ quality: quality || 60 });
+  else if (type === "tif" || type === "tiff") image = image.tiff();
+  else if (type === "gif") image = image.gif();
+  else {
+    await withTempDir(async (folder) => {
+      const png = join(folder, "picture.png");
+      await image.png().toFile(png);
+      ffmpeg(["-i", png, output]);
+    });
+    return;
+  }
+  await image.toFile(output);
+}
+
+// Open a picture with sharp, turned upright (phone photos store their rotation separately).
+export async function openPicture(input: string): Promise<any> {
+  requireFile(input);
+  return need("sharp")(input).autoOrient();
+}
+
+// ---------- Drawing (Skia, via @napi-rs/canvas) ----------
+// Skia draws text, titles, captions and labels natively: fast, with color emoji, strokes and shadows.
+
+let canvasLibrary: any;
+
+// Load Skia with joEdit's fonts registered under their family names (system fonts work too).
+export async function skia(): Promise<any> {
+  if (canvasLibrary) return canvasLibrary;
+  canvasLibrary = need("@napi-rs/canvas");
+  for (const [file, family] of Object.entries(FONT_FAMILIES)) {
+    const path = join(ASSETS, "fonts", file);
+    if (existsSync(path)) canvasLibrary.GlobalFonts.registerFromPath(path, family);
+  }
+  return canvasLibrary;
+}
+
+export type TextStyle = {
+  size?: number; // font size in pixels (default 48)
+  font?: string; // font family, e.g. "Inter", "Bebas Neue", "Georgia" (default Inter)
+  weight?: number | string; // 100..900 or "bold" (default 700)
+  italic?: boolean;
+  color?: string; // fill color (default white)
+  stroke?: string; // outline color
+  strokeWidth?: number; // outline thickness in pixels (default size / 8)
+  shadow?: number; // soft shadow blur in pixels
+  shadowColor?: string; // default half-black
+  box?: string; // color of a rounded box behind the text, e.g. "#000000AA"
+  padding?: number; // space inside the box (default size / 3)
+  align?: "left" | "center" | "right";
+  maxWidth?: number; // wrap lines longer than this
+  lineHeight?: number; // line spacing as a multiple of size (default 1.2)
+  letterSpacing?: number; // extra pixels between letters
+};
+
+// The text style flags of picture text and video text, and how they become a TextStyle.
+export const TEXT_FLAGS = "[--size 32] [--color white] [--font Inter] [--weight 700] [--stroke black] [--stroke-width N] [--shadow N] [--box \"#000000AA\"] [--align left|center|right] [--max-width N]";
+
+export function textStyle(a: Args, size = 32): TextStyle {
+  const number = (name: string) => (a.flags[name] === undefined ? undefined : numberFlag(a, name));
+  return {
+    size: number("size") ?? size,
+    color: a.flags.color,
+    font: a.flags.font,
+    weight: a.flags.weight,
+    stroke: a.flags.stroke,
+    strokeWidth: number("stroke-width"),
+    shadow: number("shadow"),
+    box: a.flags.box,
+    align: a.flags.align as TextStyle["align"],
+    maxWidth: number("max-width"),
+  };
+}
+
+// Split text into lines that fit maxWidth (words are never cut).
+function wrapLines(ctx: any, text: string, maxWidth?: number): string[] {
+  const lines: string[] = [];
+  for (const paragraph of text.split("\n")) {
+    if (!maxWidth) {
+      lines.push(paragraph);
+      continue;
+    }
+    let line = "";
+    for (const word of paragraph.split(" ")) {
+      const next = line ? `${line} ${word}` : word;
+      if (line && ctx.measureText(next).width > maxWidth) {
+        lines.push(line);
+        line = word;
+      } else line = next;
+    }
+    lines.push(line);
+  }
+  return lines;
+}
+
+// Set the canvas font for a style.
+export function setFont(ctx: any, style: TextStyle): void {
+  ctx.font = `${style.italic ? "italic " : ""}${style.weight ?? 700} ${style.size ?? 48}px "${style.font ?? "Inter"}"`;
+  ctx.letterSpacing = `${style.letterSpacing ?? 0}px`;
+}
+
+// The size of a block of text (with its box padding) before drawing it.
+export function measureText(ctx: any, text: string, style: TextStyle = {}): { width: number; height: number; lines: string[] } {
+  setFont(ctx, style);
+  const size = style.size ?? 48;
+  const lines = wrapLines(ctx, text, style.maxWidth);
+  const pad = style.box ? (style.padding ?? size / 3) : 0;
+  const stroke = style.stroke ? (style.strokeWidth ?? size / 8) : 0;
+  const width = Math.max(...lines.map((line) => ctx.measureText(line).width)) + 2 * pad + stroke;
+  const height = (lines.length - 1) * size * (style.lineHeight ?? 1.2) + size * 1.15 + 2 * pad + stroke;
+  return { width, height, lines };
+}
+
+// Draw a block of text. (x, y) is the top of the block, and its left edge, centre or right edge
+// depending on align. Returns the block's size.
+export function drawText(ctx: any, text: string, x: number, y: number, style: TextStyle = {}): { width: number; height: number } {
+  const size = style.size ?? 48;
+  const align = style.align ?? "left";
+  const { width, height, lines } = measureText(ctx, text, style);
+  const left = align === "center" ? x - width / 2 : align === "right" ? x - width : x;
+  const pad = style.box ? (style.padding ?? size / 3) : 0;
+  const strokeWidth = style.stroke ? (style.strokeWidth ?? size / 8) : 0;
+  ctx.save();
+  if (style.box) {
+    ctx.fillStyle = style.box;
+    ctx.beginPath();
+    ctx.roundRect(left, y, width, height, Math.min(pad, size / 3));
+    ctx.fill();
+  }
+  ctx.textBaseline = "top";
+  ctx.textAlign = align;
+  ctx.lineJoin = "round";
+  const anchor = align === "center" ? left + width / 2 : align === "right" ? left + width - pad - strokeWidth / 2 : left + pad + strokeWidth / 2;
+  lines.forEach((line, n) => {
+    const lineY = y + pad + strokeWidth / 2 + n * size * (style.lineHeight ?? 1.2) + size * 0.05;
+    // The shadow goes with the first thing drawn only, so it is not doubled.
+    ctx.shadowColor = style.shadowColor ?? "rgba(0,0,0,0.5)";
+    ctx.shadowBlur = style.shadow ?? 0;
+    if (strokeWidth) {
+      ctx.strokeStyle = style.stroke;
+      ctx.lineWidth = strokeWidth;
+      ctx.strokeText(line, anchor, lineY);
+      ctx.shadowBlur = 0;
+    }
+    ctx.fillStyle = style.color ?? "#FFFFFF";
+    ctx.fillText(line, anchor, lineY);
+  });
+  ctx.restore();
+  return { width, height };
+}
+
+// A canvas holding a picture file (any format sharp reads).
+export async function pictureCanvas(input: string): Promise<{ canvas: any; ctx: any; width: number; height: number }> {
+  const { createCanvas, ImageData } = await skia();
+  const { data, info } = await (await openPicture(input)).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+  const canvas = createCanvas(info.width, info.height);
+  const ctx = canvas.getContext("2d");
+  ctx.putImageData(new ImageData(new Uint8ClampedArray(data.buffer, data.byteOffset, data.length), info.width, info.height), 0, 0);
+  return { canvas, ctx, width: info.width, height: info.height };
+}
+
+// Save a canvas as a picture file (any format: png, jpg, webp, avif ...).
+export async function saveCanvas(canvas: any, output: string, quality?: number): Promise<void> {
+  const sharp = need("sharp");
+  const pixels = canvas.getContext("2d").getImageData(0, 0, canvas.width, canvas.height).data;
+  await savePicture(sharp(Buffer.from(pixels.buffer, pixels.byteOffset, pixels.length), { raw: { width: canvas.width, height: canvas.height, channels: 4 } }), output, quality);
 }
 
 // Turn ["a.png", "--width", "100"] into { positional: ["a.png"], flags: { width: "100" } }.

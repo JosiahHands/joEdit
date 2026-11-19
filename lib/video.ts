@@ -4,15 +4,20 @@
 import { readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
-  DEFAULT_FONT,
+  drawText,
   ffmpeg,
   inOut,
+  need,
+  saveCanvas,
+  skia,
+  TEXT_FLAGS,
+  textStyle,
+  type TextStyle,
   numberFlag,
   optionalNumberFlag,
   probe,
   requireFile,
   round,
-  run,
   runCli,
   runPack,
   stringFlag,
@@ -150,28 +155,17 @@ export function gif(input: string, output: string, fps = 10, width = 480): void 
   ffmpeg(["-i", input, "-filter_complex", filter, output]);
 }
 
-// Put text on the whole video with its top-left corner at (x, y).
-// The text is drawn into a see-through PNG with ImageMagick, then laid over the video.
-export function text(
-  input: string,
-  output: string,
-  words: string,
-  x = 10,
-  y = 10,
-  size = 32,
-  color = "white",
-): void {
-  withTempDir((folder) => {
+// Put text on the whole video. (x, y) is the top of the text, and its left edge (or centre / right edge with align).
+// The text is drawn with Skia into a see-through picture the size of the video, then laid over it.
+export async function text(input: string, output: string, words: string, x = 10, y = 10, style: TextStyle = {}): Promise<void> {
+  const { width, height } = info(input);
+  const { createCanvas } = await skia();
+  const canvas = createCanvas(width, height);
+  drawText(canvas.getContext("2d"), words, x, y, { size: 32, ...style });
+  await withTempDir(async (folder) => {
     const picture = join(folder, "text.png");
-    run("magick", [
-      "-background", "none",
-      "-font", DEFAULT_FONT,
-      "-pointsize", String(size),
-      "-fill", color,
-      `label:${words}`,
-      picture,
-    ]);
-    ffmpeg(["-i", input, "-i", picture, "-filter_complex", `[0:v][1:v]overlay=${x}:${y}`, "-c:a", "copy", output]);
+    await saveCanvas(canvas, picture);
+    ffmpeg(["-i", input, "-i", picture, "-filter_complex", "[0:v][1:v]overlay=0:0", "-c:a", "copy", output]);
   });
 }
 
@@ -354,17 +348,20 @@ export function reframeFollow(input: string, output: string, aspect: string, eve
   const cropW = Math.floor(Math.min(width, height * a) / 2) * 2;
   const cropH = Math.floor(Math.min(height, width / a) / 2) * 2;
 
-  return withTempDir((folder) => {
+  return withTempDir(async (folder) => {
     // 1. Small frames, one every `every` seconds, and a subject mask for each (white = subject).
     ffmpeg(["-i", input, "-vf", `fps=1/${every},scale=384:-2`, join(folder, "%05d.png")]);
     const frames = readdirSync(folder).filter((name) => name.endsWith(".png")).sort().map((name) => join(folder, name));
     const { files: masks } = runPack("cutout", [join(folder, "masks"), ...frames, "--mask"]);
 
     // 2. The centre of each mask (0..1 across and down). Frames with no subject keep the last centre.
+    const sharp = need("sharp");
+    const w = 64, h = 64;
     let last = [0.5, 0.5];
-    const centres = (masks as string[]).map((mask) => {
-      // A tiny grayscale version as text (PGM): "P2 width height 255 value value ...".
-      const [, w, h, , ...values] = run("magick", [mask, "-resize", "64x64!", "-compress", "none", "pgm:-"]).trim().split(/\s+/).map(Number);
+    const centres: number[][] = [];
+    for (const mask of masks as string[]) {
+      // A tiny grayscale version: one brightness value per pixel.
+      const values: Buffer = await sharp(mask).resize(w, h, { fit: "fill" }).grayscale().raw().toBuffer();
       let total = 0, sumX = 0, sumY = 0;
       values.forEach((v, i) => {
         total += v;
@@ -372,8 +369,8 @@ export function reframeFollow(input: string, output: string, aspect: string, eve
         sumY += v * (Math.floor(i / w) + 0.5) / h;
       });
       if (total > 255 * 20) last = [sumX / total, sumY / total]; // at least ~20 subject pixels
-      return last;
-    });
+      centres.push(last);
+    }
 
     // 3. Smooth the path with a moving average, then turn centres into crop corners kept inside the frame.
     const reach = Math.max(1, Math.round(smooth / every / 2));
@@ -560,18 +557,10 @@ export const commands: Record<string, Command> = {
     },
   },
   text: {
-    usage: "text <input> <output> --text \"words\" [--x N] [--y N] [--size N] [--color name]",
+    usage: `text <input> <output> --text "words" [--x N] [--y N] ${TEXT_FLAGS}`,
     run: (a) => {
       const { input, output } = inOut(a);
-      text(
-        input,
-        output,
-        stringFlag(a, "text"),
-        optionalNumberFlag(a, "x", 10),
-        optionalNumberFlag(a, "y", 10),
-        optionalNumberFlag(a, "size", 32),
-        a.flags.color ?? "white",
-      );
+      return text(input, output, stringFlag(a, "text"), optionalNumberFlag(a, "x", 10), optionalNumberFlag(a, "y", 10), textStyle(a));
     },
   },
   grade: {

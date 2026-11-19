@@ -1,99 +1,314 @@
-// Picture editing, built on ImageMagick (`magick`).
-// CLI:     node picture.ts <command> <input> <output> [--flags]
+// Picture editing, built on sharp (libvips: fast, any format) and Skia (text and design).
+// CLI:     node joedit.ts picture <command> <input> <output> [--flags]
 // Library: import { resize } from "./joEdit/picture.ts"
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, join, parse, resolve } from "node:path";
 import {
   ASSETS,
-  DEFAULT_FONT,
+  drawText,
   ffmpeg,
   inOut,
+  loadBrand,
+  measureText,
+  need,
   numberFlag,
+  openPicture,
   optionalNumberFlag,
+  pictureCanvas,
+  probe,
   requireFile,
   run,
   runCli,
   runPack,
+  saveCanvas,
+  savePicture,
+  skia,
   stringFlag,
+  TEXT_FLAGS,
+  textStyle,
   withTempDir,
+  type Brand,
   type Command,
+  type TextStyle,
 } from "./shared.ts";
 import * as graphics from "./graphics.ts";
 import * as video from "./video.ts";
 
 export type PictureInfo = { width: number; height: number; format: string };
 
+// Format names for the codecs pictures are stored in.
+const FORMATS: Record<string, string> = { png: "PNG", mjpeg: "JPEG", webp: "WEBP", gif: "GIF", tiff: "TIFF", bmp: "BMP", av1: "AVIF", hevc: "HEIC" };
+
 // Width, height and format of a picture.
 export function info(input: string): PictureInfo {
-  requireFile(input);
-  const text = run("magick", ["identify", "-format", "%w %h %m\n", input]);
-  const [width, height, format] = text.trim().split("\n")[0].split(" ");
-  return { width: Number(width), height: Number(height), format };
+  const picture = probe(input).streams.find((s) => s.codec_type === "video");
+  if (!picture) throw new Error(`"${input}" is not a picture.`);
+  return { width: picture.width, height: picture.height, format: FORMATS[picture.codec_name] ?? String(picture.codec_name).toUpperCase() };
 }
 
 // Resize. Give width, height, or both. With one, the aspect ratio is kept.
-export function resize(input: string, output: string, width?: number, height?: number): void {
+export async function resize(input: string, output: string, width?: number, height?: number): Promise<void> {
   if (!width && !height) throw new Error("Give --width, --height, or both.");
-  const size = width && height ? `${width}x${height}!` : width ? `${width}x` : `x${height}`;
-  run("magick", [input, "-resize", size, output]);
+  const image = await openPicture(input);
+  // Both sizes: stretch to exactly that. One size: the other follows the picture's shape.
+  await savePicture(width && height ? image.resize(width, height, { fit: "fill" }) : image.resize(width || null, height || null), output);
 }
 
-// Cut out a rectangle starting at (x, y).
-export function crop(input: string, output: string, x: number, y: number, width: number, height: number): void {
-  run("magick", [input, "-crop", `${width}x${height}+${x}+${y}`, "+repage", output]);
+// Cut out a rectangle starting at (x, y). Parts outside the picture are left out.
+export async function crop(input: string, output: string, x: number, y: number, width: number, height: number): Promise<void> {
+  const { width: w, height: h } = info(input);
+  const left = Math.max(0, Math.min(x, w - 1));
+  const top = Math.max(0, Math.min(y, h - 1));
+  const image = await openPicture(input);
+  await savePicture(image.extract({ left, top, width: Math.min(width, w - left), height: Math.min(height, h - top) }), output);
 }
 
-// Rotate clockwise by any number of degrees.
-export function rotate(input: string, output: string, degrees: number): void {
-  run("magick", [input, "-rotate", String(degrees), output]);
+// Rotate clockwise by any number of degrees. Corners that open up are see-through (black in a jpg).
+export async function rotate(input: string, output: string, degrees: number): Promise<void> {
+  const sharp = need("sharp");
+  // Turn upright first, then rotate (two steps, so phone photos rotate from how they look).
+  const upright = await (await openPicture(input)).png().toBuffer();
+  await savePicture(sharp(upright).rotate(degrees, { background: { r: 0, g: 0, b: 0, alpha: 0 } }), output);
 }
 
 // Mirror the picture. direction: "horizontal" (left-right) or "vertical" (top-bottom).
-export function flip(input: string, output: string, direction: string): void {
-  if (direction === "horizontal") run("magick", [input, "-flop", output]);
-  else if (direction === "vertical") run("magick", [input, "-flip", output]);
-  else throw new Error('--direction must be "horizontal" or "vertical".');
+export async function flip(input: string, output: string, direction: string): Promise<void> {
+  if (direction !== "horizontal" && direction !== "vertical") throw new Error('--direction must be "horizontal" or "vertical".');
+  const image = await openPicture(input);
+  await savePicture(direction === "horizontal" ? image.flop() : image.flip(), output);
 }
 
 // Make the picture black and white.
-export function grayscale(input: string, output: string): void {
-  run("magick", [input, "-colorspace", "Gray", output]);
+export async function grayscale(input: string, output: string): Promise<void> {
+  await savePicture((await openPicture(input)).grayscale(), output);
 }
 
 // Change brightness. amount: -100 (darker) to 100 (brighter).
-export function brightness(input: string, output: string, amount: number): void {
-  run("magick", [input, "-brightness-contrast", `${amount}x0`, output]);
+export async function brightness(input: string, output: string, amount: number): Promise<void> {
+  await savePicture((await openPicture(input)).linear(1, (amount / 100) * 255), output);
 }
 
-// Change contrast. amount: -100 (less) to 100 (more).
-export function contrast(input: string, output: string, amount: number): void {
-  run("magick", [input, "-brightness-contrast", `0x${amount}`, output]);
+// Change contrast. amount: -100 (flat gray) to 100 (more), around middle gray.
+export async function contrast(input: string, output: string, amount: number): Promise<void> {
+  const slope = Math.max(0, Math.tan((Math.PI * (amount / 100 + 1)) / 4));
+  await savePicture((await openPicture(input)).linear(slope, 127.5 * (1 - slope)), output);
 }
 
 // Blur. Bigger radius = more blur.
-export function blur(input: string, output: string, radius: number): void {
-  run("magick", [input, "-blur", `0x${radius}`, output]);
+export async function blur(input: string, output: string, radius: number): Promise<void> {
+  const image = await openPicture(input);
+  await savePicture(radius >= 0.3 ? image.blur(radius) : image, output);
 }
 
-// Write text with its top-left corner at (x, y).
-export function text(
-  input: string,
-  output: string,
-  words: string,
-  x = 10,
-  y = 10,
-  size = 32,
-  color = "white",
-): void {
-  run("magick", [
-    input,
-    "-font", DEFAULT_FONT,
-    "-pointsize", String(size),
-    "-fill", color,
-    "-gravity", "NorthWest",
-    "-annotate", `+${x}+${y}`, words,
-    output,
-  ]);
+// Write text on a picture. (x, y) is the top of the text, and its left edge (or centre / right edge with align).
+// Any font family, color emoji, outline (stroke), shadow, a box behind it, and wrapping at maxWidth.
+export async function text(input: string, output: string, words: string, x = 10, y = 10, style: TextStyle = {}): Promise<{ width: number; height: number }> {
+  const { canvas, ctx } = await pictureCanvas(input);
+  const size = drawText(ctx, words, x, y, { size: 32, ...style });
+  await saveCanvas(canvas, output);
+  return { width: Math.round(size.width), height: Math.round(size.height) };
+}
+
+// Parse "9:16" (or "1.5") into a width / height ratio.
+export function parseAspect(aspect: string): number {
+  const [w, h] = aspect.split(":").map(Number);
+  const ratio = h ? w / h : w;
+  if (!ratio || ratio <= 0) throw new Error(`--aspect must look like 9:16 or 1.5, not "${aspect}".`);
+  return ratio;
+}
+
+export const FOCUS = ["smart", "center", "top", "bottom", "left", "right"];
+
+// Crop and resize to an exact shape without stretching: 9:16 for phones, 1:1 for posts, 16:9 for YouTube.
+// focus "smart" keeps the most interesting part (faces, detail, saturated color); others keep that side.
+export async function fit(input: string, output: string, options: { aspect?: string; width?: number; height?: number; focus?: string } = {}) {
+  const sharp = need("sharp");
+  const { width: w, height: h } = info(input);
+  const focus = options.focus ?? "smart";
+  if (!FOCUS.includes(focus)) throw new Error(`--focus must be one of: ${FOCUS.join(", ")}`);
+  let { width, height } = options;
+  if (options.aspect) {
+    const ratio = parseAspect(options.aspect);
+    if (width && !height) height = Math.round(width / ratio);
+    else if (height && !width) width = Math.round(height * ratio);
+    else if (!width && !height) {
+      // No size given: the biggest part of the picture with that shape.
+      width = Math.min(w, Math.round(h * ratio));
+      height = Math.min(h, Math.round(w / ratio));
+    }
+  }
+  if (!width || !height) throw new Error("Give --aspect (e.g. 9:16), or both --width and --height.");
+  const position = focus === "smart" ? sharp.strategy.attention : focus === "center" ? "centre" : focus;
+  await savePicture((await openPicture(input)).resize(width, height, { fit: "cover", position }), output);
+  return { width, height, focus };
+}
+
+// ---------- Compose: a designed picture from layers (thumbnails, posters, slides) ----------
+
+// One layer of a design. Exactly one of image, text or color says what it is (color alone = a rectangle).
+// x, y: top-left in pixels (for text: the anchor point, see align). width/height: the box to fill.
+export type Layer = TextStyle & {
+  image?: string;
+  text?: string;
+  color?: string;
+  x?: number;
+  y?: number;
+  width?: number;
+  height?: number;
+  fit?: "cover" | "contain" | "fill"; // how an image fills its box (default cover)
+  opacity?: number; // 0..1
+  blend?: string; // normal, multiply, screen, overlay, darken, lighten, soft-light, hard-light, difference, color-dodge ...
+  rotate?: number; // degrees clockwise, around the layer's centre
+  radius?: number; // rounded corners for images and rectangles
+};
+
+export type Design = { width?: number; height?: number; background?: string; layers: Layer[] };
+
+const BLENDS = ["normal", "multiply", "screen", "overlay", "darken", "lighten", "color-dodge", "color-burn", "hard-light", "soft-light", "difference", "exclusion", "hue", "saturation", "color", "luminosity"];
+
+// Brand names ("primary", "accent", "text", "background", "heading", "body") turn into the brand's colors and fonts.
+function branded(value: string | undefined, brand?: Brand): string | undefined {
+  if (!value || !brand) return value;
+  return (brand.colors as Record<string, string>)[value] ?? (brand.fonts as Record<string, string>)[value] ?? value;
+}
+
+// Load a picture file for drawing on a canvas.
+export async function loadPicture(path: string): Promise<any> {
+  const { loadImage } = await skia();
+  try {
+    return await loadImage(requireFile(path));
+  } catch {
+    // Formats Skia cannot read are turned into PNG first.
+    return loadImage(await (await openPicture(path)).png().toBuffer());
+  }
+}
+
+// Draw one layer. `folder` is where relative image paths start from.
+export async function drawLayer(ctx: any, layer: Layer, folder = ".", brand?: Brand): Promise<void> {
+  const blend = layer.blend ?? "normal";
+  if (!BLENDS.includes(blend)) throw new Error(`Unknown blend "${blend}". Blends: ${BLENDS.join(", ")}`);
+  const x = layer.x ?? 0;
+  const y = layer.y ?? 0;
+  ctx.save();
+  ctx.globalAlpha = layer.opacity ?? 1;
+  ctx.globalCompositeOperation = blend === "normal" ? "source-over" : blend;
+  const style: TextStyle = { ...layer, color: branded(layer.color, brand), stroke: branded(layer.stroke, brand), box: branded(layer.box, brand), font: branded(layer.font, brand), maxWidth: layer.maxWidth ?? layer.width };
+
+  // The layer's box, for rotation and shadows.
+  let box = { x, y, width: layer.width ?? 0, height: layer.height ?? 0 };
+  let picture: any;
+  if (layer.text !== undefined) {
+    const size = measureText(ctx, layer.text, style);
+    const left = style.align === "center" ? x - size.width / 2 : style.align === "right" ? x - size.width : x;
+    box = { x: left, y, width: size.width, height: size.height };
+  } else if (layer.image) {
+    picture = await loadPicture(resolve(folder, layer.image));
+    // A missing width or height keeps the picture's shape.
+    const width = layer.width ?? (layer.height ? (picture.width * layer.height) / picture.height : picture.width);
+    const height = layer.height ?? (picture.height * width) / picture.width;
+    box = { x, y, width, height };
+  }
+  if (layer.rotate) {
+    ctx.translate(box.x + box.width / 2, box.y + box.height / 2);
+    ctx.rotate((layer.rotate * Math.PI) / 180);
+    ctx.translate(-(box.x + box.width / 2), -(box.y + box.height / 2));
+  }
+
+  if (layer.text !== undefined) {
+    drawText(ctx, layer.text, x, y, style);
+  } else {
+    const path = () => {
+      ctx.beginPath();
+      ctx.roundRect(box.x, box.y, box.width, box.height, layer.radius ?? 0);
+    };
+    if (layer.shadow) {
+      // The shadow is drawn from the layer's shape, so it also works with rounded corners.
+      ctx.save();
+      ctx.shadowColor = layer.shadowColor ?? "rgba(0,0,0,0.5)";
+      ctx.shadowBlur = layer.shadow;
+      ctx.shadowOffsetY = layer.shadow / 4;
+      ctx.fillStyle = style.color ?? "#000000";
+      path();
+      ctx.fill();
+      ctx.restore();
+    }
+    if (picture) {
+      path();
+      ctx.clip();
+      const fitMode = layer.fit ?? "cover";
+      // cover: crop the picture to the box's shape. contain: show all of it inside the box. fill: stretch.
+      const scale = fitMode === "contain" ? Math.min(box.width / picture.width, box.height / picture.height) : Math.max(box.width / picture.width, box.height / picture.height);
+      if (fitMode === "fill") ctx.drawImage(picture, box.x, box.y, box.width, box.height);
+      else {
+        const w = picture.width * scale;
+        const h = picture.height * scale;
+        ctx.drawImage(picture, box.x + (box.width - w) / 2, box.y + (box.height - h) / 2, w, h);
+      }
+    } else if (style.color) {
+      ctx.fillStyle = style.color;
+      path();
+      ctx.fill();
+    } else {
+      throw new Error("Every layer needs an image, a text or a color.");
+    }
+  }
+  ctx.restore();
+}
+
+// Make a picture from a design (JSON): a background and layers of pictures, text and shapes.
+export async function compose(designFile: string, output: string, brandFile?: string) {
+  const design: Design = JSON.parse(readFileSync(requireFile(designFile), "utf8"));
+  if (!Array.isArray(design.layers)) throw new Error('A design needs "layers": [ ... ].');
+  const brand = loadBrand(brandFile); // the default brand when no file is given
+  const folder = dirname(resolve(designFile));
+  const background = branded(design.background, brand) ?? "#000000";
+  const isPicture = /\.(png|jpe?g|webp|avif|gif|bmp|tiff?|heic)$/i.test(background);
+  // The size comes from the design, else from a background picture, else 1920x1080.
+  const backgroundPicture = isPicture ? await loadPicture(resolve(folder, background)) : undefined;
+  const width = design.width ?? backgroundPicture?.width ?? 1920;
+  const height = design.height ?? backgroundPicture?.height ?? 1080;
+  const { createCanvas } = await skia();
+  const canvas = createCanvas(width, height);
+  const ctx = canvas.getContext("2d");
+  if (backgroundPicture) await drawLayer(ctx, { image: resolve(folder, background), width, height });
+  else if (background !== "none") {
+    ctx.fillStyle = background;
+    ctx.fillRect(0, 0, width, height);
+  }
+  for (const layer of design.layers) await drawLayer(ctx, layer, folder, brand);
+  await saveCanvas(canvas, output);
+  return { width, height, layers: design.layers.length };
+}
+
+const PICTURE_FILE = /\.(png|jpe?g|webp|avif|gif|bmp|tiff?|heic)$/i;
+
+// Do the same thing to every picture in a folder: fit a shape, resize, change format.
+export async function batch(
+  folder: string,
+  outFolder: string,
+  options: { width?: number; height?: number; aspect?: string; format?: string; quality?: number } = {},
+) {
+  requireFile(folder);
+  const files = readdirSync(folder).filter((name) => PICTURE_FILE.test(name)).sort();
+  if (files.length === 0) throw new Error("No pictures in this folder.");
+  mkdirSync(outFolder, { recursive: true });
+  const made: string[] = [];
+  // A few at a time: sharp already uses several cores for each picture.
+  for (let i = 0; i < files.length; i += 4) {
+    await Promise.all(files.slice(i, i + 4).map(async (name) => {
+      const input = join(folder, name);
+      const output = join(outFolder, `${parse(name).name}.${options.format ?? parse(name).ext.slice(1)}`);
+      if (options.aspect) {
+        await fit(input, output, { aspect: options.aspect, width: options.width, height: options.height });
+      } else {
+        let image = await openPicture(input);
+        if (options.width || options.height) image = image.resize(options.width || null, options.height || null, { fit: "inside", withoutEnlargement: true });
+        await savePicture(image, output, options.quality);
+      }
+      made.push(output);
+    }));
+  }
+  return { count: made.length, folder: outFolder };
 }
 
 export const MOTIONS = ["zoom-in", "zoom-out", "pan-left", "pan-right", "pan-up", "pan-down", "none"];
@@ -145,32 +360,32 @@ export function animateArgs(
 // Make a picture from a description (image pack: Z-Image Turbo). Same seed + prompt = same picture.
 export function generate(output: string, prompt: string, options: { width?: number; height?: number; steps?: number; seed?: number } = {}) {
   if (!prompt.trim()) throw new Error('Describe the picture with --prompt, e.g. --prompt "a lighthouse at dawn, film photo".');
-  return withTempDir((folder) => {
+  return withTempDir(async (folder) => {
     const made = join(folder, "made.png");
     const args = [made, "--prompt", prompt, "--width", String(options.width ?? 1024), "--height", String(options.height ?? 1024), "--steps", String(options.steps ?? 9)];
     if (options.seed !== undefined) args.push("--seed", String(options.seed));
     const result = runPack("image", args);
-    run("magick", [made, output]);
+    await convert(made, output);
     return result;
   });
 }
 
 // Make a picture bigger with AI-restored detail (upscaler asset, Real-ESRGAN). scale: 2, 3 or 4.
 // style: "photo" for real-world pictures, "art" for drawings, anime and graphics.
-export function upscale(input: string, output: string, scale = 4, style = "photo") {
+export async function upscale(input: string, output: string, scale = 4, style = "photo") {
   requireFile(input);
   const program = join(ASSETS, "upscaler", process.platform === "win32" ? "realesrgan-ncnn-vulkan.exe" : "realesrgan-ncnn-vulkan");
   if (!existsSync(program)) throw new Error("Upscaling needs the upscaler. Run: node joedit.ts install upscaler");
   if (![2, 3, 4].includes(scale)) throw new Error("--scale must be 2, 3 or 4.");
   const model = style === "art" ? "realesrgan-x4plus-anime" : "realesrgan-x4plus";
   const { width, height } = info(input);
-  withTempDir((folder) => {
+  await withTempDir(async (folder) => {
     const source = join(folder, "in.png");
     const big = join(folder, "big.png");
-    run("magick", [input, source]);
+    await convert(input, source);
     // The models make 4x; smaller scales are resized down from that, which keeps the restored detail.
     run(program, ["-i", source, "-o", big, "-n", model, "-s", "4", "-m", join(ASSETS, "upscaler", "models")]);
-    run("magick", [big, "-resize", `${width * scale}x${height * scale}!`, output]);
+    await resize(big, output, width * scale, height * scale);
   });
   return { width: width * scale, height: height * scale, model };
 }
@@ -180,9 +395,9 @@ export function upscale(input: string, output: string, scale = 4, style = "photo
 export function cutout(input: string, output: string, mask = false) {
   requireFile(input);
   if (!/\.(png|webp)$/i.test(output) && !mask) throw new Error("Use a .png (or .webp) output so the background can be see-through.");
-  return withTempDir((folder) => {
+  return withTempDir(async (folder) => {
     const result = runPack("cutout", [folder, input, ...(mask ? ["--mask"] : [])]);
-    run("magick", [result.files[0], output]);
+    await convert(result.files[0], output);
     return { model: result.model };
   });
 }
@@ -190,10 +405,10 @@ export function cutout(input: string, output: string, mask = false) {
 // Depth map (depth pack): near = white, far = black. Useful for parallax, fog, focus effects and masks.
 export function depth(input: string, output: string) {
   requireFile(input);
-  return withTempDir((folder) => {
+  return withTempDir(async (folder) => {
     const made = join(folder, "depth.png");
     const result = runPack("depth", [made, input]);
-    run("magick", [made, output]);
+    await convert(made, output);
     return result;
   });
 }
@@ -214,16 +429,16 @@ export async function parallax(
     let map = options.depthMap;
     if (!map) {
       map = join(folder, "depth.png");
-      depth(input, map);
+      await depth(input, map);
     }
     // Pictures go into the page as data URLs: WebGL may not read pictures from local files.
-    const asDataUrl = (file: string, format: string) => {
-      const out = join(folder, `page-${format}-${Math.random().toString(36).slice(2)}.${format}`);
-      run("magick", [file, "-resize", "2560x2560>", ...(format === "jpg" ? ["-quality", "92"] : ["-colorspace", "Gray"]), out]);
-      return `data:image/${format === "jpg" ? "jpeg" : "png"};base64,${readFileSync(out).toString("base64")}`;
+    const asDataUrl = async (file: string, format: string) => {
+      const image = (await openPicture(file)).resize(2560, 2560, { fit: "inside", withoutEnlargement: true });
+      const bytes = format === "jpg" ? await image.flatten().jpeg({ quality: 92 }).toBuffer() : await image.grayscale().png().toBuffer();
+      return `data:image/${format === "jpg" ? "jpeg" : "png"};base64,${bytes.toString("base64")}`;
     };
     const page = join(folder, "parallax.html");
-    writeFileSync(page, parallaxHtml(asDataUrl(input, "jpg"), asDataUrl(map, "png"), motion, amount));
+    writeFileSync(page, parallaxHtml(await asDataUrl(input, "jpg"), await asDataUrl(map, "png"), motion, amount));
     const result = await graphics.render(page, output, { duration, width, height, fps });
     return { ...result, motion };
   });
@@ -301,10 +516,9 @@ window.joedit.render = (time) => {
 </script></body></html>`;
 }
 
-// Change format based on the output file extension (e.g. .png -> .jpg).
-export function convert(input: string, output: string, quality?: number): void {
-  const options = quality ? ["-quality", String(quality)] : [];
-  run("magick", [input, ...options, output]);
+// Change format based on the output file extension (e.g. .png -> .jpg, .webp, .avif).
+export async function convert(input: string, output: string, quality?: number): Promise<void> {
+  await savePicture(await openPicture(input), output, quality);
 }
 
 export const commands: Record<string, Command> = {
@@ -316,71 +530,97 @@ export const commands: Record<string, Command> = {
     usage: "resize <input> <output> [--width N] [--height N]",
     run: (a) => {
       const { input, output } = inOut(a);
-      resize(input, output, optionalNumberFlag(a, "width", 0), optionalNumberFlag(a, "height", 0));
+      return resize(input, output, optionalNumberFlag(a, "width", 0), optionalNumberFlag(a, "height", 0));
     },
   },
   crop: {
     usage: "crop <input> <output> --x N --y N --width N --height N",
     run: (a) => {
       const { input, output } = inOut(a);
-      crop(input, output, numberFlag(a, "x"), numberFlag(a, "y"), numberFlag(a, "width"), numberFlag(a, "height"));
+      return crop(input, output, numberFlag(a, "x"), numberFlag(a, "y"), numberFlag(a, "width"), numberFlag(a, "height"));
     },
   },
   rotate: {
     usage: "rotate <input> <output> --degrees N",
     run: (a) => {
       const { input, output } = inOut(a);
-      rotate(input, output, numberFlag(a, "degrees"));
+      return rotate(input, output, numberFlag(a, "degrees"));
     },
   },
   flip: {
     usage: "flip <input> <output> --direction horizontal|vertical",
     run: (a) => {
       const { input, output } = inOut(a);
-      flip(input, output, stringFlag(a, "direction"));
+      return flip(input, output, stringFlag(a, "direction"));
     },
   },
   grayscale: {
     usage: "grayscale <input> <output>",
     run: (a) => {
       const { input, output } = inOut(a);
-      grayscale(input, output);
+      return grayscale(input, output);
     },
   },
   brightness: {
     usage: "brightness <input> <output> --amount -100..100",
     run: (a) => {
       const { input, output } = inOut(a);
-      brightness(input, output, numberFlag(a, "amount"));
+      return brightness(input, output, numberFlag(a, "amount"));
     },
   },
   contrast: {
     usage: "contrast <input> <output> --amount -100..100",
     run: (a) => {
       const { input, output } = inOut(a);
-      contrast(input, output, numberFlag(a, "amount"));
+      return contrast(input, output, numberFlag(a, "amount"));
     },
   },
   blur: {
     usage: "blur <input> <output> --radius N",
     run: (a) => {
       const { input, output } = inOut(a);
-      blur(input, output, numberFlag(a, "radius"));
+      return blur(input, output, numberFlag(a, "radius"));
     },
   },
   text: {
-    usage: "text <input> <output> --text \"words\" [--x N] [--y N] [--size N] [--color name]",
+    usage: `text <input> <output> --text "words" [--x N] [--y N] ${TEXT_FLAGS}`,
+
     run: (a) => {
       const { input, output } = inOut(a);
-      text(
-        input,
-        output,
-        stringFlag(a, "text"),
-        optionalNumberFlag(a, "x", 10),
-        optionalNumberFlag(a, "y", 10),
-        optionalNumberFlag(a, "size", 32),
-        a.flags.color ?? "white",
-      );
+      return text(input, output, stringFlag(a, "text"), optionalNumberFlag(a, "x", 10), optionalNumberFlag(a, "y", 10), textStyle(a));
+    },
+  },
+  fit: {
+    usage: `fit <input> <output> [--aspect 9:16] [--width N] [--height N] [--focus ${FOCUS.join("|")}]`,
+    run: (a) => {
+      const { input, output } = inOut(a);
+      return fit(input, output, {
+        aspect: a.flags.aspect,
+        width: a.flags.width ? numberFlag(a, "width") : undefined,
+        height: a.flags.height ? numberFlag(a, "height") : undefined,
+        focus: a.flags.focus,
+      });
+    },
+  },
+  compose: {
+    usage: "compose <design.json> <output> [--brand brand.json]  (layers of pictures, text and shapes)",
+    run: (a) => {
+      const { input, output } = inOut(a);
+      return compose(input, output, a.flags.brand);
+    },
+  },
+  batch: {
+    usage: "batch <folder> <out-folder> [--width N] [--height N] [--aspect 1:1] [--format webp|jpg|png|avif] [--quality 1..100]",
+    run: (a) => {
+      const [folder, outFolder] = a.positional;
+      if (!folder || !outFolder) throw new Error("Give a folder of pictures and an output folder.");
+      return batch(folder, outFolder, {
+        width: a.flags.width ? numberFlag(a, "width") : undefined,
+        height: a.flags.height ? numberFlag(a, "height") : undefined,
+        aspect: a.flags.aspect,
+        format: a.flags.format,
+        quality: a.flags.quality ? numberFlag(a, "quality") : undefined,
+      });
     },
   },
   animate: {
@@ -464,7 +704,7 @@ export const commands: Record<string, Command> = {
     usage: "convert <input> <output> [--quality 1..100]",
     run: (a) => {
       const { input, output } = inOut(a);
-      convert(input, output, optionalNumberFlag(a, "quality", 0));
+      return convert(input, output, optionalNumberFlag(a, "quality", 0));
     },
   },
 };
