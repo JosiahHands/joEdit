@@ -3,9 +3,10 @@
 // CLI:     node joedit.ts movie <command> ...
 // Library: import { renderMovie } from "./joEdit/movie.ts"
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { cpus } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
-import { ffmpeg, listAssets, listPacks, loadBrand, requireFile, round, runCli, withTempDir, type Brand, type Command } from "./shared.ts";
+import { ffmpeg, ffmpegAsync, listAssets, listPacks, loadBrand, requireFile, round, runCli, withTempDir, type Brand, type Command } from "./shared.ts";
 import * as graphics from "./graphics.ts";
 import * as listen from "./listen.ts";
 import * as music from "./music.ts";
@@ -101,6 +102,8 @@ const MOVIE_KEYS = ["size", "fps", "brand", "look", "lookStrength", "effects", "
 const TRACK_KEYS = ["file", "at", "volume", "from", "to", "fadeIn", "fadeOut", "loop", "duck"];
 const DEFAULT_DURATION = 3;
 const CACHE_VERSION = 1; // bump to throw away old cached scenes after changing how scenes render
+// How many scenes render at the same time (each encode already uses several cores).
+const SCENES_AT_ONCE = Math.min(4, Math.max(1, Math.floor(cpus().length / 4)));
 
 // Read a movie file. Paths inside it are relative to the movie file.
 export function loadMovie(file: string): { movie: Movie; base: string } {
@@ -333,13 +336,13 @@ async function renderScene(scene: Scene, n: number, duration: number, ctx: Conte
       const motion = scene.motion === "parallax" ? "dolly" : scene.motion.slice("parallax-".length);
       await picture.parallax(pathFrom(ctx.base, scene.image!), made, { duration, motion, width, height, fps });
     } else if (scene.image) {
-      picture.animate(pathFrom(ctx.base, scene.image), made, { duration, motion: scene.motion ?? "zoom-in", width, height, fps });
+      await ffmpegAsync(picture.animateArgs(pathFrom(ctx.base, scene.image), made, { duration, motion: scene.motion ?? "zoom-in", width, height, fps }).args);
     } else if (scene.title !== undefined) {
       await graphics.title(made, { text: scene.title, subtitle: scene.subtitle, duration, width, height, fps, brand: ctx.brand });
     } else if (scene.html) {
       await graphics.render(pathFrom(ctx.base, scene.html), made, { duration, width, height, fps, data: scene.data });
     } else {
-      ffmpeg(["-f", "lavfi", "-i", `color=c=${scene.color}:s=${width}x${height}:r=${fps}:d=${duration}`, "-pix_fmt", "yuv420p", made]);
+      await ffmpegAsync(["-f", "lavfi", "-i", `color=c=${scene.color}:s=${width}x${height}:r=${fps}:d=${duration}`, "-pix_fmt", "yuv420p", made]);
     }
     inputs.push("-i", made, ...SILENCE);
     graph += `[0:v]${fitFilter(ctx)}[base];[1:a]${AUDIO_FORMAT}[a]`;
@@ -362,7 +365,10 @@ async function renderScene(scene: Scene, n: number, duration: number, ctx: Conte
   // 3. The scene's own color grade.
   graph += scene.look ? `;${video.gradeGraph(scene.look, 1, label, "v")}` : `;[${label}]null[v]`;
 
-  ffmpeg([...inputs, "-filter_complex", graph, "-map", "[v]", "-map", "[a]", ...encoder(ctx), "-r", String(fps), "-t", String(duration), output]);
+  // Encode to a temporary name first, so a failed or interrupted render never leaves a broken file in the cache.
+  const partial = join(ctx.temp, `partial-${n}.mp4`);
+  await ffmpegAsync([...inputs, "-filter_complex", graph, "-map", "[v]", "-map", "[a]", ...encoder(ctx), "-r", String(fps), "-t", String(duration), partial]);
+  renameSync(partial, output);
   return { file: output, cached: false };
 }
 
@@ -512,14 +518,18 @@ export async function renderMovie(file: string, output: string, draft = false) {
     if (typeof movie.beatSync === "string") beats = listen.beats(pathFrom(base, movie.beatSync)).beats;
     const lengths = planTimes(movie, base, fps, beats);
 
-    // 1. Every scene (reusing cached ones).
-    const segments: string[] = [];
-    let cached = 0;
-    for (const [n, scene] of movie.scenes.entries()) {
-      const result = await renderScene(scene, n, lengths[n], ctx);
-      segments.push(result.file);
-      if (result.cached) cached++;
-    }
+    // 1. Every scene (reusing cached ones), a few at the same time.
+    const results: { file: string; cached: boolean }[] = [];
+    let next = 0;
+    const worker = async () => {
+      while (next < movie.scenes.length) {
+        const n = next++;
+        results[n] = await renderScene(movie.scenes[n], n, lengths[n], ctx);
+      }
+    };
+    await Promise.all(Array.from({ length: SCENES_AT_ONCE }, worker));
+    const segments = results.map((r) => r.file);
+    const cached = results.filter((r) => r.cached).length;
 
     // 2. Join, 3. mix the sound.
     const joined = join(temp, "joined.mp4");
@@ -582,8 +592,14 @@ export async function renderMovie(file: string, output: string, draft = false) {
       graph += `[${label}][2:v]overlay=0:0:eof_action=pass[cap];`;
       label = "cap";
     }
-    graph += `[${label}]format=yuv420p[v]`;
-    ffmpeg([...inputs, "-filter_complex", graph, "-map", "[v]", "-map", "1:a", ...encoder(ctx), "-movflags", "+faststart", "-t", String(round(length, 3)), output]);
+    const finish = ["-movflags", "+faststart", "-t", String(round(length, 3)), output];
+    if (label === "0:v") {
+      // Nothing to draw on the picture: keep the joined video as it is (no re-encoding), add the sound.
+      ffmpeg([...inputs, "-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", ...finish]);
+    } else {
+      graph += `[${label}]format=yuv420p[v]`;
+      ffmpeg([...inputs, "-filter_complex", graph, "-map", "[v]", "-map", "1:a", ...encoder(ctx), ...finish]);
+    }
 
     // 6. Quality check (loaded here because joedit.ts also loads this file).
     const { check } = await import("./joedit.ts");

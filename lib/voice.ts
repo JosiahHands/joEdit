@@ -162,7 +162,7 @@ export const commands: Record<string, Command> = {
     run: () => voices(),
   },
   clone: {
-    usage: 'clone <output.wav> --sample voice.wav --text "..." --consent "who agreed, and when" [--emotion 0.5] [--pace 0.5]',
+    usage: 'clone <output.wav> --sample voice.wav --text "..." [--file script.txt] --consent "who agreed, and when" [--emotion 0.5] [--pace 0.5]',
     run: (a) => {
       if (!a.positional[0]) throw new Error("Missing output path.");
       if (!a.flags.sample) throw new Error("Give a voice sample with --sample (5-20 seconds of clear speech).");
@@ -170,7 +170,7 @@ export const commands: Record<string, Command> = {
     },
   },
   stems: {
-    usage: "stems <input> <output-folder> [--only vocals|drums|bass|other]  (vocals.wav, drums.wav, bass.wav, other.wav)",
+    usage: "stems <input> <output-folder> [--only vocals|drums|bass|other] [--model htdemucs]  (vocals.wav, drums.wav, bass.wav, other.wav)",
     run: (a) => {
       const [input, folder] = a.positional;
       if (!input || !folder) throw new Error("Give the music file and a folder for the stems.");

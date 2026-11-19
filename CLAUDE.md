@@ -20,6 +20,7 @@ Run a tool: `node lib/joedit.ts <area> <command> ...` (Node 24+ runs .ts directl
 Run tests: `node --test test.ts` (tests that need a pack, an asset or Chrome are skipped when it is missing).
 Roadmap: ~/.claude/plans/i-have-vision-to-zazzy-leaf.md (Phase 1 done: eyes, ears & one CLI. Phase 2 done: graphics, captions, looks, sound effects. Phase 3 done: movie.json, remove-silence, reframe, pip, interpolate, animate. Phase 4 done: voice. Phase 5 done: music. Phase 6 done: generate, upscale, cutout, depth, parallax, look find/colors, reframe --follow, video generate. Phase 7 done: 3d (Blender) and the three asset).
 Every command must stay reachable through joedit.ts (a test checks this).
+runCli refuses flags that are not in a command's usage string, so every flag a command reads must appear in its usage. Commands whose usage has `<output…>` get folder creation, safe in-place edits and a `made` summary automatically.
 ---
 The 3 top layer files are for development.
 ## Core Rules

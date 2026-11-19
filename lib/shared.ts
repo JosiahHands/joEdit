@@ -1,9 +1,9 @@
 // Shared helpers used by every joEdit module: running programs, reading arguments, the CLI,
 // packs (local AI tools), assets (downloaded fonts and tools) and the brand kit.
-import { execFileSync, spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 // The folder joEdit lives in, and where downloaded assets go.
@@ -59,6 +59,17 @@ export function hasProgram(program: string): boolean {
 // Run ffmpeg quietly, always overwriting the output. Used by video.ts and sound.ts.
 export function ffmpeg(args: string[]): void {
   run("ffmpeg", ["-hide_banner", "-loglevel", "error", "-y", ...args]);
+}
+
+// The same, without waiting: other work (more scenes, Chrome renders) keeps going while ffmpeg runs.
+export function ffmpegAsync(args: string[]): Promise<void> {
+  return new Promise((done, fail) => {
+    const child = spawn("ffmpeg", ["-hide_banner", "-loglevel", "error", "-y", ...args], { stdio: ["ignore", "ignore", "pipe"] });
+    let errors = "";
+    child.stderr.on("data", (chunk) => (errors += chunk));
+    child.on("error", (error: any) => fail(error.code === "ENOENT" ? new Error('"ffmpeg" is not installed. Run: node joedit.ts doctor') : error));
+    child.on("close", (code) => (code === 0 ? done() : fail(new Error(`ffmpeg failed: ${errors.trim()}`))));
+  });
 }
 
 // Run an ffmpeg analysis filter over a file and return ffmpeg's log text.
@@ -117,7 +128,11 @@ export function parseArgs(argv: string[]): Args {
   const flags: Record<string, string> = {};
   for (let i = 0; i < argv.length; i++) {
     const item = argv[i];
-    if (item.startsWith("--")) {
+    if (item.startsWith("--") && item.includes("=")) {
+      // --width=100 works the same as --width 100.
+      const [name, ...value] = item.slice(2).split("=");
+      flags[name] = value.join("=");
+    } else if (item.startsWith("--")) {
       const name = item.slice(2);
       const next = argv[i + 1];
       // A flag with no value (or followed by another flag) counts as "true".
@@ -170,25 +185,96 @@ export function stringFlag(args: Args, name: string): string {
   return value;
 }
 
+// The closest name to a typo ("trimm" → "trim"), or undefined when nothing is close.
+export function closest(word: string, names: string[]): string | undefined {
+  // Edit distance: how many letters to add, remove or change to turn one word into the other.
+  const distance = (a: string, b: string) => {
+    let row = Array.from({ length: b.length + 1 }, (_, j) => j);
+    for (let i = 1; i <= a.length; i++) {
+      const next = [i];
+      for (let j = 1; j <= b.length; j++) next[j] = Math.min(row[j] + 1, next[j - 1] + 1, row[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+      row = next;
+    }
+    return row[b.length];
+  };
+  const ranked = names.map((name) => ({ name, d: distance(word.toLowerCase(), name.toLowerCase()) })).sort((x, y) => x.d - y.d);
+  const best = ranked[0];
+  return best && best.d <= Math.max(2, Math.floor(word.length / 3)) ? best.name : undefined;
+}
+
+// Facts about a media file that was just made, so the result shows what came out without another command.
+function describeMade(file: string): Record<string, unknown> | undefined {
+  if (!/\.(mp4|mov|m4v|mkv|webm|gif|avi|mp3|wav|m4a|aac|flac|ogg|opus|png|jpe?g|webp|tiff?|bmp)$/i.test(file)) return undefined;
+  if (!existsSync(file) || !statSync(file).isFile()) return undefined;
+  try {
+    const { streams, format } = probe(file);
+    const picture = streams.find((s: any) => s.codec_type === "video");
+    const sound = streams.some((s: any) => s.codec_type === "audio");
+    const still = /\.(png|jpe?g|webp|tiff?|bmp)$/i.test(file);
+    const made: Record<string, unknown> = {};
+    if (!still && format.duration) made.duration = round(Number(format.duration));
+    if (picture) Object.assign(made, { width: picture.width, height: picture.height });
+    if (!still) made.hasAudio = sound;
+    const bytes = statSync(file).size;
+    made.size = bytes < 1024 * 1024 ? `${Math.ceil(bytes / 1024)} KB` : `${round(bytes / 1024 / 1024, 1)} MB`;
+    return made;
+  } catch {
+    return undefined;
+  }
+}
+
 // Run the command named in argv[0], or print help. Exits with code 1 on error.
-// On success it prints one line of JSON, e.g. {"ok":true,"output":"out.mp4"}.
-// "output" is added automatically for commands whose usage has an <output...> argument (always the last file).
+// On success it prints one line of JSON, e.g. {"ok":true,"output":"out.mp4","made":{"duration":8,...}}.
+// For commands whose usage has an <output...> argument (always the last file):
+//   - "output" is added to the result, plus "made": the length, size and sound of the new file;
+//   - missing folders in the output path are created;
+//   - the output may be the same file as the input: the edit goes to a temporary file that then replaces it.
+// Flags not in the usage are refused (with a suggestion), so a typo never fails silently.
 export async function runCli(title: string, commands: Record<string, Command>, argv: string[]): Promise<void> {
   const [name, ...rest] = argv;
   const command = name ? commands[name] : undefined;
   if (!command) {
-    if (name && name !== "help") console.error(`Unknown command: ${name}\n`);
+    if (name && name !== "help") {
+      const guess = closest(name, Object.keys(commands));
+      console.error(`Unknown command: ${name}.${guess ? ` Did you mean "${guess}"?` : ""}\n`);
+    }
     console.log(`${title}\n\nCommands:`);
     for (const c of Object.values(commands)) console.log(`  ${c.usage}`);
     process.exitCode = name && name !== "help" ? 1 : 0;
     return;
   }
+  const args = parseArgs(rest);
+  if (args.flags.help !== undefined) {
+    console.log(`Usage: ${command.usage}`);
+    return;
+  }
+  const producesFile = command.usage.includes("<output");
+  const output = producesFile ? args.positional[args.positional.length - 1] : undefined;
+  let temporary: string | undefined;
   try {
-    const args = parseArgs(rest);
+    // Refuse flags this command does not have.
+    const known = new Set([...command.usage.matchAll(/--([A-Za-z][\w-]*)/g)].map((m) => m[1]));
+    for (const flag of Object.keys(args.flags)) {
+      if (known.has(flag)) continue;
+      const guess = closest(flag, [...known]);
+      const all = known.size ? ` This command's flags: ${[...known].map((k) => `--${k}`).join(" ")}` : " This command has no flags.";
+      throw new Error(`Unknown flag --${flag}.${guess ? ` Did you mean --${guess}?` : ""}${all}`);
+    }
+    if (output) {
+      mkdirSync(dirname(resolve(output)), { recursive: true });
+      // Editing a file in place: write to a temporary file next to it, then swap.
+      const inputs = args.positional.slice(0, -1).map((p) => resolve(p));
+      if (inputs.includes(resolve(output))) {
+        temporary = join(dirname(output), `.joedit-${Date.now()}-${basename(output)}`);
+        args.positional[args.positional.length - 1] = temporary;
+      }
+    }
     const result = (await command.run(args)) ?? {};
-    const output = command.usage.includes("<output") ? { output: args.positional[args.positional.length - 1] } : {};
-    console.log(JSON.stringify({ ok: true, ...output, ...result }));
+    if (temporary && existsSync(temporary)) renameSync(temporary, output!);
+    const made = output ? describeMade(output) : undefined;
+    console.log(JSON.stringify({ ok: true, ...(output ? { output } : {}), ...result, ...(made ? { made } : {}) }));
   } catch (error: any) {
+    if (temporary && existsSync(temporary)) rmSync(temporary, { force: true });
     console.error(`Error: ${error.message}`);
     console.error(`Usage: ${command.usage}`);
     process.exitCode = 1;

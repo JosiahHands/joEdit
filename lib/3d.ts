@@ -192,7 +192,7 @@ export const commands: Record<string, Command> = {
     },
   },
   title: {
-    usage: `title <output.mp4|.png> --text "TITLE" [--subtitle "..."] [--color "#7C5CFF"] [--background "#0B0B0F"] [--font BebasNeue] [--brand brand.json] [--duration 4] ${RENDER_FLAGS}`,
+    usage: `title <output.mp4|.png> --text "TITLE" [--subtitle "..."] [--color "#7C5CFF"] [--background "#0B0B0F"] [--font BebasNeue] [--brand brand.json] [--duration 4] [--frame 60] ${RENDER_FLAGS}`,
     run: (a) => {
       if (!a.positional[0]) throw new Error("Missing output path.");
       return title(a.positional[0], {

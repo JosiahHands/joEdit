@@ -10,8 +10,9 @@ node joedit.ts doctor                    shows what this computer has installed
 Paths here are written as if you are in this folder. From elsewhere, use `node joEdit/joedit.ts ...`.
 
 ## How it works
-- **Output:** every command prints one line of JSON, e.g. `{"ok":true,"output":"out.mp4"}`, often with extra facts (times, sizes, scores). Errors exit with code 1 and print `Error: ...` and the correct usage to stderr.
-- **Files:** each edit reads an input and writes a new output file. The output's extension picks the format (`.mp4 .webm .gif .png .jpg .mp3 .wav`, …).
+- **Output:** every command prints one line of JSON, often with extra facts (times, sizes, scores). Commands that make a file also describe it under `made`, e.g. `{"ok":true,"output":"out.mp4","made":{"duration":8,"width":1920,"height":1080,"hasAudio":true,"size":"4.1 MB"}}`, so you know what came out without another command. Errors exit with code 1 and print `Error: ...` and the correct usage to stderr.
+- **Files:** each edit reads an input and writes an output file. The output's extension picks the format (`.mp4 .webm .gif .png .jpg .mp3 .wav`, …). Missing folders in the output path are created. The output can be the input itself (`video trim a.mp4 a.mp4 ...`): the edit is made safely on a copy that then replaces it.
+- **Flags:** `--width 100` or `--width=100`. A flag a command doesn't have is refused with the closest match ("Did you mean --strength?"), so a typo never passes silently. `<area> <command> --help` prints that command's usage; a command in the wrong area says where it lives.
 - **Units:** times are in seconds (`1.5`). Positions are in pixels from the top-left corner.
 - **Setup:** `doctor` lists installed tools and gives the install command for anything missing. Optional AI **packs** (open models that run locally) and **assets** (fonts, a headless browser) are installed with `install <name>`.
 - **Brand:** commands with `--brand brand.json` (titles, captions, templates) take their colors and fonts from that file. Any part can be left out and gets a default:
@@ -227,7 +228,7 @@ validate <movie.json>                       → every problem, each with a hint 
 templates                                   → starting points: short, ad, explainer, slideshow, lyric, podcast
 template <name> <movie.json>                writes one; replace its placeholder files (validate lists them)
 ```
-A movie file describes the film; joEdit does the cutting, transitions, text, sound mix, captions and look. Each scene is cached in `.joedit-cache/` next to the movie file, so after changing one scene only that scene renders again. `--draft` renders at a third of the size, quickly, for checking timing and layout before the final render. Paths are relative to the movie file.
+A movie file describes the film; joEdit does the cutting, transitions, text, sound mix, captions and look. Scenes render several at a time and each is cached in `.joedit-cache/` next to the movie file, so after changing one scene only that scene renders again. `--draft` renders at a third of the size, quickly, for checking timing and layout before the final render. Paths are relative to the movie file.
 ```json
 {
   "size": "1920x1080",                     // or "1080x1920" (phone), "1080x1080" (square). Default 1920x1080

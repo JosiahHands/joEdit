@@ -8,6 +8,7 @@ import { existsSync } from "node:fs";
 import {
   DEFAULT_FONT,
   analyze,
+  closest,
   formatTime,
   install,
   listAssets,
@@ -222,13 +223,23 @@ function help(): void {
 
 if (import.meta.main) {
   const [first, ...rest] = process.argv.slice(2);
-  if (first && areas[first]) {
+  // A command asked for in the wrong area, e.g. "video sheet": say where it lives.
+  const home = (command: string) => Object.keys(areas).filter((area) => areas[area][command]);
+  if (first && areas[first] && rest[0] && !areas[first][rest[0]] && home(rest[0]).length) {
+    console.error(`"${rest[0]}" is not a ${first} command. Try: ${home(rest[0]).map((area) => `node joedit.ts ${area} ${rest[0]}`).join("  or  ")}`);
+    process.exitCode = 1;
+  } else if (first && areas[first]) {
     runCli(`joEdit ${first}: node joedit.ts ${first} <command> ...`, areas[first], rest);
   } else if (first && tools[first]) {
     runCli("joEdit", tools, [first, ...rest]);
+  } else if (first && home(first).length) {
+    // A command name without its area, e.g. "trim": show the full command.
+    console.error(`"${first}" needs its area. Try: ${home(first).map((area) => `node joedit.ts ${area} ${first}`).join("  or  ")}`);
+    process.exitCode = 1;
   } else {
     if (first && first !== "help") {
-      console.error(`Unknown area or command: ${first}\n`);
+      const guess = closest(first, [...Object.keys(areas), ...Object.keys(tools)]);
+      console.error(`Unknown area or command: ${first}.${guess ? ` Did you mean "${guess}"?` : ""}\n`);
       process.exitCode = 1;
     }
     help();

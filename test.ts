@@ -1146,9 +1146,48 @@ describe("joedit", () => {
     assert.ok(existsSync(file("gray2.png")));
   });
 
-  test("every edit prints JSON with the output path", () => {
+  test("every edit prints JSON with the output path and what was made", () => {
     const result = JSON.parse(ok("joedit", ["sound", "volume", file("sound.mp3"), file("louder2.mp3"), "--factor", "2"]));
-    assert.deepEqual(result, { ok: true, output: file("louder2.mp3") });
+    assert.equal(result.output, file("louder2.mp3"));
+    near(result.made.duration, 5);
+    assert.equal(result.made.hasAudio, true);
+    assert.match(result.made.size, /^\d+(\.\d)? (KB|MB)$/);
+    const still = JSON.parse(ok("joedit", ["picture", "resize", file("in.png"), file("half.png"), "--width", "200"]));
+    assert.deepEqual([still.made.width, still.made.height], [200, 150]);
+  });
+
+  test("a mistyped flag is refused with a suggestion, never ignored", () => {
+    const result = cli("joedit", ["video", "grade", file("in.mp4"), file("x.mp4"), "--look", "noir", "--strenght", "0.5"]);
+    assert.equal(result.code, 1);
+    assert.match(result.stderr, /Unknown flag --strenght\. Did you mean --strength\?/);
+  });
+
+  test("--name=value works like --name value", () => {
+    const result = JSON.parse(ok("joedit", ["picture", "resize", file("in.png"), file("eq.png"), "--width=100"]));
+    assert.equal(result.made.width, 100);
+  });
+
+  test("missing output folders are created", () => {
+    ok("joedit", ["picture", "resize", file("in.png"), file("new/deeper/small.png"), "--width", "50"]);
+    assert.ok(existsSync(file("new/deeper/small.png")));
+  });
+
+  test("a file can be edited in place", () => {
+    execFileSync("cp", [file("in.mp4"), file("inplace.mp4")]);
+    const result = JSON.parse(ok("joedit", ["video", "trim", file("inplace.mp4"), file("inplace.mp4"), "--start", "0", "--end", "1"]));
+    near(result.made.duration, 1);
+    near(video.info(file("inplace.mp4")).duration, 1);
+  });
+
+  test("--help shows a command's usage", () => {
+    assert.match(ok("joedit", ["video", "trim", "--help"]), /Usage: trim <input> <output> --start/);
+  });
+
+  test("wrong areas and typos point to the right command", () => {
+    assert.match(cli("joedit", ["video", "sheet", "a.mp4", "b.png"]).stderr, /node joedit\.ts look sheet/);
+    assert.match(cli("joedit", ["trim"]).stderr, /node joedit\.ts video trim/);
+    assert.match(cli("joedit", ["video", "trimm"]).stderr, /Did you mean "trim"\?/);
+    assert.match(cli("joedit", ["vidoe"]).stderr, /Did you mean "video"\?/);
   });
 
   test("help lists every area, unknown names fail", () => {

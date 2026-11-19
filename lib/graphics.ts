@@ -570,31 +570,32 @@ function outputArg(a: Args): string {
   return a.positional[0];
 }
 
+const SIZE = "[--width 1920] [--height 1080] [--fps 30]";
+
 export const commands: Record<string, Command> = {
   render: {
-    usage: "render <page.html> <output.mp4|.mov|.webm|.gif> --duration S [--width 1920] [--height 1080] [--fps 30] [--transparent] [--data file.json] [--audio sound]",
+    usage: `render <page.html> <output.mp4|.mov|.webm|.gif> --duration S ${SIZE} [--transparent] [--data file.json] [--audio sound]`,
     run: async (a) => {
       const { input, output } = inOut(a);
       return render(input, output, { ...sizeFlags(a), duration: numberFlag(a, "duration"), data: dataFlag(a), audio: a.flags.audio });
     },
   },
   still: {
-    usage: "still <page.html> <output.png> --time S [--width 1920] [--height 1080] [--transparent] [--data file.json]",
-    run: async (a) => {
+    usage: "still <page.html> <output.png> --time S [--width 1920] [--height 1080] [--transparent] [--data file.json]",    run: async (a) => {
       const { input, output } = inOut(a);
       await still(input, output, numberFlag(a, "time"), { ...sizeFlags(a), data: dataFlag(a) });
     },
   },
   title: {
-    usage: 'title <output.mp4|.png> --text "Big title" [--subtitle "..."] [--duration 4] [--brand brand.json] [--transparent] [--width --height]',
+    usage: `title <output.mp4|.png> --text "Big title" [--subtitle "..."] [--duration 4] [--brand brand.json] [--transparent] ${SIZE}`,
     run: (a) => title(outputArg(a), { ...sizeFlags(a), text: stringFlag(a, "text"), subtitle: a.flags.subtitle, duration: optionalNumberFlag(a, "duration", 4) }),
   },
   "lower-third": {
-    usage: 'lower-third <output.mov|.png> --text "Name" [--subtitle "Role"] [--duration 5] [--brand brand.json]  (see-through)',
+    usage: `lower-third <output.mov|.png> --text "Name" [--subtitle "Role"] [--duration 5] [--brand brand.json] ${SIZE}  (see-through)`,
     run: (a) => lowerThird(outputArg(a), { ...sizeFlags(a), transparent: true, text: stringFlag(a, "text"), subtitle: a.flags.subtitle, duration: optionalNumberFlag(a, "duration", 5) }),
   },
   counter: {
-    usage: 'counter <output.mp4|.png> --to N [--from 0] [--text "label"] [--prefix "$"] [--suffix "%"] [--duration 3]',
+    usage: `counter <output.mp4|.png> --to N [--from 0] [--text "label"] [--prefix "$"] [--suffix "%"] [--duration 3] [--brand brand.json] [--transparent] ${SIZE}`,
     run: (a) =>
       counter(outputArg(a), {
         ...sizeFlags(a),

@@ -589,7 +589,7 @@ export const commands: Record<string, Command> = {
     },
   },
   captions: {
-    usage: "captions <input> <output> [--transcript words.json] [--style karaoke|pop|bold|minimal] [--position bottom|center|top] [--brand brand.json]",
+    usage: "captions <input> <output> [--transcript words.json] [--style karaoke|pop|bold|minimal] [--position bottom|center|top] [--brand brand.json] [--model base]",
     run: (a) => {
       const { input, output } = inOut(a);
       return captions(input, output, {

@@ -105,6 +105,17 @@ export function animate(
   output: string,
   options: { duration?: number; motion?: string; width?: number; height?: number; fps?: number; amount?: number } = {},
 ): { frames: number } {
+  const { args, frames } = animateArgs(input, output, options);
+  ffmpeg(args);
+  return { frames };
+}
+
+// The ffmpeg arguments for animate (movie.ts runs them in the background, several scenes at once).
+export function animateArgs(
+  input: string,
+  output: string,
+  options: { duration?: number; motion?: string; width?: number; height?: number; fps?: number; amount?: number } = {},
+): { args: string[]; frames: number } {
   requireFile(input);
   const { duration = 5, motion = "zoom-in", width = 1920, height = 1080, fps = 30, amount = 0.15 } = options;
   const frames = Math.max(1, Math.round(duration * fps));
@@ -126,8 +137,7 @@ export function animate(
   // Work at 4x size so the slow movement is smooth (no 1-pixel jumps).
   const big = `scale=${width * 4}:${height * 4}:force_original_aspect_ratio=increase,crop=${width * 4}:${height * 4},setsar=1`;
   const zoompan = `zoompan=z='${move.z}':x='${move.x}':y='${move.y}':d=${frames}:s=${width}x${height}:fps=${fps}`;
-  ffmpeg(["-i", input, "-vf", `${big},${zoompan},format=yuv420p`, "-frames:v", String(frames), "-c:v", "libx264", "-crf", "18", output]);
-  return { frames };
+  return { args: ["-i", input, "-vf", `${big},${zoompan},format=yuv420p`, "-frames:v", String(frames), "-c:v", "libx264", "-crf", "18", output], frames };
 }
 
 // ---------- AI: make, enlarge, cut out, measure depth ----------
@@ -421,7 +431,7 @@ export const commands: Record<string, Command> = {
     },
   },
   parallax: {
-    usage: `parallax <picture> <output.mp4> [--motion ${PARALLAX_MOTIONS.join("|")}] [--duration 5] [--amount 1] [--depth depth.png] [--width 1920] [--height 1080]  (needs: install depth, Chrome)`,
+    usage: `parallax <picture> <output.mp4> [--motion ${PARALLAX_MOTIONS.join("|")}] [--duration 5] [--amount 1] [--depth depth.png] [--width 1920] [--height 1080] [--fps 30]  (needs: install depth, Chrome)`,
     run: (a) => {
       const { input, output } = inOut(a);
       return parallax(input, output, {
