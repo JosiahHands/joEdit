@@ -4,8 +4,13 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, parse, resolve } from "node:path";
 import {
+  AI_MODELS,
   ASSETS,
   drawText,
+  loadModel,
+  onnxModel,
+  requireModel,
+  transformers,
   ffmpeg,
   inOut,
   loadBrand,
@@ -390,27 +395,76 @@ export async function upscale(input: string, output: string, scale = 4, style = 
   return { width: width * scale, height: height * scale, model };
 }
 
-// Remove the background (cutout pack). Output is a PNG with a see-through background,
-// or with mask = true a black and white picture (white = the subject).
-export function cutout(input: string, output: string, mask = false) {
-  requireFile(input);
-  if (!/\.(png|webp)$/i.test(output) && !mask) throw new Error("Use a .png (or .webp) output so the background can be see-through.");
-  return withTempDir(async (folder) => {
-    const result = runPack("cutout", [folder, input, ...(mask ? ["--mask"] : [])]);
-    await convert(result.files[0], output);
-    return { model: result.model };
-  });
+// A picture's pixels, upright, as RGB bytes.
+async function rgbPixels(input: string): Promise<{ data: Buffer; width: number; height: number }> {
+  const { data, info } = await (await openPicture(requireFile(input))).removeAlpha().raw().toBuffer({ resolveWithObject: true });
+  return { data, width: info.width, height: info.height };
 }
 
-// Depth map (depth pack): near = white, far = black. Useful for parallax, fog, focus effects and masks.
-export function depth(input: string, output: string) {
+// Where the subject is: one byte per pixel, 255 = subject, 0 = background, soft in between.
+// Uses BiRefNet (the cutout model), prepared the same way rembg does it.
+export async function subjectMask(input: string): Promise<{ mask: Buffer; width: number; height: number }> {
+  const SIZE = 1024;
+  const sharp = need("sharp");
+  const ort = need("onnxruntime-node");
+  const session = await onnxModel("cutout");
+  const { data, width, height } = await rgbPixels(input);
+  // The model sees 1024x1024, scaled by the brightest value, minus the ImageNet averages, as planes of R, G and B.
+  const small = await sharp(data, { raw: { width, height, channels: 3 } }).resize(SIZE, SIZE, { fit: "fill", kernel: "lanczos3" }).raw().toBuffer();
+  let brightest = 1;
+  for (const v of small) brightest = Math.max(brightest, v);
+  const mean = [0.485, 0.456, 0.406];
+  const spread = [0.229, 0.224, 0.225];
+  const pixels = new Float32Array(3 * SIZE * SIZE);
+  for (let i = 0; i < SIZE * SIZE; i++) for (let c = 0; c < 3; c++) pixels[c * SIZE * SIZE + i] = (small[i * 3 + c] / brightest - mean[c]) / spread[c];
+  const result = await session.run({ [session.inputNames[0]]: new ort.Tensor("float32", pixels, [1, 3, SIZE, SIZE]) });
+  const scores = result[session.outputNames[0]].data as Float32Array;
+  // Scores become 0..1 (sigmoid), stretched to the full range, then sized back to the picture.
+  const chance = new Float32Array(SIZE * SIZE);
+  let low = Infinity;
+  let high = -Infinity;
+  for (let i = 0; i < chance.length; i++) {
+    chance[i] = 1 / (1 + Math.exp(-scores[i]));
+    low = Math.min(low, chance[i]);
+    high = Math.max(high, chance[i]);
+  }
+  const bytes = Buffer.alloc(SIZE * SIZE);
+  for (let i = 0; i < chance.length; i++) bytes[i] = Math.round(((chance[i] - low) / Math.max(1e-6, high - low)) * 255);
+  const mask = await sharp(bytes, { raw: { width: SIZE, height: SIZE, channels: 1 } })
+    .resize(width, height, { fit: "fill", kernel: "lanczos3" })
+    .extractChannel(0)
+    .raw()
+    .toBuffer();
+  return { mask, width, height };
+}
+
+// Remove the background. Output is a PNG with a see-through background,
+// or with mask = true a black and white picture (white = the subject).
+export async function cutout(input: string, output: string, mask = false) {
   requireFile(input);
-  return withTempDir(async (folder) => {
-    const made = join(folder, "depth.png");
-    const result = runPack("depth", [made, input]);
-    await convert(made, output);
-    return result;
-  });
+  if (!/\.(png|webp)$/i.test(output) && !mask) throw new Error("Use a .png (or .webp) output so the background can be see-through.");
+  const sharp = need("sharp");
+  const { mask: alpha, width, height } = await subjectMask(input);
+  const gray = { raw: { width, height, channels: 1 } };
+  if (mask) {
+    await savePicture(sharp(alpha, gray), output);
+  } else {
+    const { data } = await rgbPixels(input);
+    await savePicture(sharp(data, { raw: { width, height, channels: 3 } }).joinChannel(alpha, gray), output);
+  }
+  return { model: "cutout (BiRefNet lite)", width, height };
+}
+
+// Depth map (Depth Anything V2): near = white, far = black. Useful for parallax, fog, focus effects and masks.
+export async function depth(input: string, output: string) {
+  requireModel("depth");
+  const library = transformers();
+  const estimate = await loadModel<any>("depth", () => library.pipeline("depth-estimation", AI_MODELS.depth.repo));
+  const { data, width, height } = await rgbPixels(input);
+  const { depth: map } = await estimate(new library.RawImage(data, width, height, 3));
+  const image = need("sharp")(Buffer.from(map.data), { raw: { width: map.width, height: map.height, channels: 1 } }).resize(width, height, { fit: "fill" });
+  await savePicture(image, output);
+  return { width, height };
 }
 
 export const PARALLAX_MOTIONS = ["dolly", "orbit", "pan-left", "pan-right", "rise", "fall"];

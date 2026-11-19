@@ -15,6 +15,7 @@ import {
   formatTime,
   install,
   listAssets,
+  listModels,
   listPacks,
   probe,
   requireFile,
@@ -151,11 +152,13 @@ export function doctor() {
       memoryGB: round(totalmem() / 1024 ** 3, 1),
       gpu: gpu(),
     },
-    packs: listPacks(),
+    models: listModels(),
     assets: listAssets(),
+    packs: listPacks(),
     next: [
       ready ? "Everything needed is installed. Read AGENTS.md to start." : "Install what is missing (see each 'fix'), then run doctor again.",
-      "Optional programs, packs and assets unlock extra features: install one only when a task needs it (node joedit.ts install <name> for packs and assets).",
+      "AI models, assets, packs and optional programs unlock extra features. Everything runs offline on this computer;",
+      "add one only when a task needs it (node joedit.ts install <name> for models, assets and packs).",
     ].join(" "),
   };
 }
@@ -238,8 +241,8 @@ export function check(file: string): Report {
 const tools: Record<string, Command> = {
   doctor: { usage: "doctor", run: () => doctor() },
   check: { usage: "check <file>", run: (a) => check(requireFile(a.positional[0])) },
-  packs: { usage: "packs", run: () => ({ packs: listPacks(), assets: listAssets() }) },
-  install: { usage: "install <pack or asset>", run: (a) => install(a.positional[0] ?? "") },
+  packs: { usage: "packs  → AI models, assets and packs, and which are installed", run: () => ({ models: listModels(), assets: listAssets(), packs: listPacks() }) },
+  install: { usage: "install <model, asset or pack>", run: (a) => install(a.positional[0] ?? "") },
 };
 
 // The full command list, one line each.

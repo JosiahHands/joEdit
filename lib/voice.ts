@@ -1,14 +1,33 @@
 // Voices: speak text, speak in a cloned voice (with consent), and split music into stems.
-// Uses the optional packs tts (Kokoro), clone (Chatterbox) and stems (Demucs), or macOS `say`.
+// speak runs Kokoro inside Node (or macOS `say`); clone (Chatterbox) and stems (Demucs) are optional Python packs.
 // CLI:     node joedit.ts voice <command> ...
 // Library: import { speak } from "./joEdit/voice.ts"
 import { createHash } from "node:crypto";
 import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
-import { ffmpeg, hasProgram, optionalNumberFlag, requireFile, run, runCli, runPack, withTempDir, type Args, type Command } from "./shared.ts";
+import {
+  AI_MODELS,
+  ffmpeg,
+  hasProgram,
+  loadModel,
+  need,
+  requireModel,
+  optionalNumberFlag,
+  requireFile,
+  round,
+  run,
+  runCli,
+  runPack,
+  transformers,
+  withTempDir,
+  type Args,
+  type Command,
+} from "./shared.ts";
+import * as listen from "./listen.ts";
+import * as sound from "./sound.ts";
 
 // Kokoro voices. The first letter is the language (a = American English, b = British English,
-// e = Spanish, f = French, h = Hindi, i = Italian, p = Brazilian Portuguese), the second is f(emale) or m(ale).
+// e = Spanish, f = French, i = Italian, p = Brazilian Portuguese), the second is f(emale) or m(ale).
 export const VOICES: Record<string, string> = {
   af_heart: "American woman, warm (best quality)",
   af_bella: "American woman, bright and lively",
@@ -41,8 +60,6 @@ export const VOICES: Record<string, string> = {
   ef_dora: "Spanish woman",
   em_alex: "Spanish man",
   ff_siwis: "French woman",
-  hf_alpha: "Hindi woman",
-  hm_omega: "Hindi man",
   if_sara: "Italian woman",
   im_nicola: "Italian man",
   pf_dora: "Brazilian Portuguese woman",
@@ -56,24 +73,108 @@ export type SpeakOptions = {
   words?: string; // also save the time of every word here (kokoro), for captions
 };
 
+// ---------- Kokoro (runs inside Node) ----------
+
+// Languages other than English are turned into sounds (phonemes) by espeak-ng, like Kokoro does in Python.
+const ESPEAK: Record<string, string> = { e: "es", f: "fr-fr", i: "it", p: "pt-br" };
+// The language code of each voice's first letter (for finding word times).
+const LANGUAGE: Record<string, string> = { a: "en", b: "en", e: "es", f: "fr", i: "it", p: "pt" };
+
+// The sounds (IPA phonemes) of some words in a language, from espeak-ng.
+async function phonemes(text: string, language: string): Promise<string> {
+  const espeak = await need("espeak-ng").default({
+    arguments: ["--phonout", "out.txt", "-q", "-b=1", "--ipa", "-v", language, "-f", "in.txt"],
+    preRun: [(module: any) => module.FS.writeFile("in.txt", text)],
+  });
+  return espeak.FS.readFile("out.txt", { encoding: "utf8" }).trim().replace(/\s+/g, " ");
+}
+
+function kokoro(): Promise<any> {
+  requireModel("kokoro");
+  return loadModel("kokoro", () => {
+    transformers(); // read the model from .models/ only (kokoro-js uses the same Transformers.js)
+    return need("kokoro-js").KokoroTTS.from_pretrained(AI_MODELS.kokoro.repo, { dtype: "fp32", device: "cpu" });
+  });
+}
+
+// Kokoro says up to about 500 sounds at once, so long text is spoken in pieces: paragraphs, then sentences.
+function pieces(text: string): string[] {
+  const result: string[] = [];
+  for (const paragraph of text.split(/\n+/).map((p) => p.trim()).filter(Boolean)) {
+    let current = "";
+    for (const sentence of paragraph.split(/(?<=[.!?…])\s+/)) {
+      if (current && current.length + sentence.length > 250) {
+        result.push(current);
+        current = "";
+      }
+      current = current ? `${current} ${sentence}` : sentence;
+    }
+    if (current) result.push(current);
+  }
+  return result;
+}
+
+// Speak text with a Kokoro voice. Returns 24000-per-second mono sound.
+async function kokoroSpeak(text: string, voice: string, speed: number): Promise<Float32Array> {
+  const tts = await kokoro();
+  const parts: Float32Array[] = [];
+  for (const piece of pieces(text)) {
+    let spoken;
+    const language = ESPEAK[voice[0]];
+    if (language) {
+      // Punctuation stays as it is (it shapes the pauses); the words become espeak sounds.
+      const chunks = piece.split(/([.,;:!?¡¿—…"«»“”()]+\s*)/);
+      const sounds: string[] = [];
+      for (const [n, chunk] of chunks.entries()) sounds.push(n % 2 || !chunk.trim() ? chunk : await phonemes(chunk, language));
+      const { input_ids } = tts.tokenizer(sounds.join("").trim(), { truncation: true });
+      spoken = await tts.generate_from_ids(input_ids, { voice, speed });
+    } else {
+      spoken = await tts.generate(piece, { voice, speed });
+    }
+    parts.push(spoken.audio, new Float32Array(Math.round(24000 * 0.15))); // a short breath between pieces
+  }
+  const all = new Float32Array(parts.reduce((sum, part) => sum + part.length, 0));
+  let at = 0;
+  for (const part of parts) {
+    all.set(part, at);
+    at += part.length;
+  }
+  return all;
+}
+
+// The time of every word: Whisper listens to the speech, then the script's own spelling is used when the words line up.
+async function wordTimes(speech: string, text: string, voice: string, output: string): Promise<number> {
+  await listen.transcribe(speech, output, "base", LANGUAGE[voice[0]] ?? "en");
+  const transcript = JSON.parse(readFileSync(output, "utf8"));
+  const script = text.split(/\s+/).filter(Boolean);
+  if (script.length === transcript.words.length) {
+    transcript.words.forEach((word: listen.Word, n: number) => (word.word = script[n]));
+    transcript.text = script.join(" ");
+    writeFileSync(output, JSON.stringify(transcript, null, 2));
+  }
+  return transcript.words.length;
+}
+
 // Turn text into speech. Any sound format works for the output (.wav, .mp3, …).
-export function speak(output: string, text: string, options: SpeakOptions = {}) {
+export async function speak(output: string, text: string, options: SpeakOptions = {}) {
   if (!text.trim()) throw new Error("Give the words to say with --text (or --file script.txt).");
   const engine = options.engine ?? "kokoro";
   const speed = options.speed ?? 1;
-  return withTempDir((folder) => {
+  return withTempDir(async (folder) => {
     const raw = join(folder, engine === "say" ? "speech.aiff" : "speech.wav");
     let result: Record<string, unknown> = {};
     if (engine === "say") {
-      if (!hasProgram("say")) throw new Error("The say engine is only on macOS. Use the kokoro engine: node joedit.ts install tts");
+      if (!hasProgram("say")) throw new Error("The say engine is only on macOS. Use the kokoro engine (the default).");
       const voice = options.voice ? ["-v", options.voice] : [];
       run("say", [...voice, "-r", String(Math.round(180 * speed)), "-o", raw, text]);
       result = { voice: options.voice ?? "default" };
     } else {
       const voice = options.voice ?? "af_heart";
       if (!VOICES[voice]) throw new Error(`Unknown voice "${voice}". See: node joedit.ts voice voices`);
-      const words = options.words ? ["--words", options.words] : [];
-      result = runPack("tts", [raw, "--text", text, "--voice", voice, "--speed", String(speed), ...words]);
+      const speech = await kokoroSpeak(text, voice, speed);
+      sound.writeWav(raw, [speech], 24000);
+      result = { voice, duration: round(speech.length / 24000) };
+      if (options.words) result.words = await wordTimes(raw, text, voice, options.words);
     }
     ffmpeg(["-i", raw, output]);
     return { engine, ...result };
@@ -158,7 +259,7 @@ export const commands: Record<string, Command> = {
     },
   },
   voices: {
-    usage: "voices  → Kokoro voices (tts pack) and macOS say voices",
+    usage: "voices  → Kokoro voices and macOS say voices",
     run: () => voices(),
   },
   clone: {

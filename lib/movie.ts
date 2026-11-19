@@ -209,9 +209,6 @@ export function validate(movie: Movie, base: string): { valid: boolean; errors: 
       if (scene.image) file(where, scene.image);
       if (scene.html) file(where, scene.html);
       if (scene.motion && !IMAGE_MOTIONS.includes(scene.motion)) errors.push(`${where}: unknown motion "${scene.motion}". Motions: ${IMAGE_MOTIONS.join(", ")}.`);
-      if (scene.motion?.startsWith("parallax") && !listPacks().find((p) => p.name === "depth")?.installed) {
-        errors.push(`${where}: "${scene.motion}" needs the depth pack. Run: node joedit.ts install depth`);
-      }
       if (scene.duration !== undefined && !(scene.duration > 0)) errors.push(`${where}: duration must be more than 0 seconds.`);
       if (scene.look && !video.LOOKS[scene.look]) errors.push(`${where}: unknown look "${scene.look}". Looks: ${Object.keys(video.LOOKS).join(", ")}.`);
       const transition = transitionOf(scene);
@@ -248,7 +245,6 @@ export function validate(movie: Movie, base: string): { valid: boolean; errors: 
   if (movie.voiceover) {
     if (!movie.voiceover.text) errors.push('voiceover: add "text" (the words to speak).');
     if (movie.voiceover.voice && !voice.VOICES[movie.voiceover.voice]) errors.push(`voiceover: unknown voice "${movie.voiceover.voice}". See: node joedit.ts voice voices`);
-    if (!listPacks().find((p) => p.name === "tts")?.installed) errors.push("voiceover: needs the tts pack. Run: node joedit.ts install tts");
   }
   return { valid: errors.length === 0, errors };
 }
@@ -449,12 +445,12 @@ async function makeMusic(spec: MusicSpec, ctx: Context): Promise<{ file: string;
 }
 
 // Speak the voice-over (cached like scenes). Returns the sound file and the time of every word.
-function makeVoiceover(spec: NonNullable<Movie["voiceover"]>, ctx: Context): { file: string; words: graphics.CaptionWord[] } {
+async function makeVoiceover(spec: NonNullable<Movie["voiceover"]>, ctx: Context): Promise<{ file: string; words: graphics.CaptionWord[] }> {
   const key = createHash("sha256").update(JSON.stringify({ text: spec.text, voice: spec.voice, speed: spec.speed })).digest("hex").slice(0, 16);
   const file = join(ctx.cache, `voice-${key}.wav`);
   const wordsFile = join(ctx.cache, `voice-${key}.json`);
   if (!existsSync(file) || !existsSync(wordsFile)) {
-    voice.speak(file, spec.text, { voice: spec.voice, speed: spec.speed, words: wordsFile });
+    await voice.speak(file, spec.text, { voice: spec.voice, speed: spec.speed, words: wordsFile });
   }
   return { file, words: JSON.parse(readFileSync(wordsFile, "utf8")).words ?? [] };
 }
@@ -506,7 +502,7 @@ export async function renderMovie(file: string, output: string, draft = false) {
       const m = movie.music!;
       tracks.push({ file: backing.file, volume: m.volume ?? 0.8, duck: m.duck ?? true, loop: m.loop, fadeIn: m.fadeIn, fadeOut: m.fadeOut ?? 2 });
     }
-    const spoken = movie.voiceover ? makeVoiceover(movie.voiceover, ctx) : undefined;
+    const spoken = movie.voiceover ? await makeVoiceover(movie.voiceover, ctx) : undefined;
     if (spoken) tracks.push({ file: spoken.file, at: movie.voiceover!.at ?? 0, volume: movie.voiceover!.volume ?? 1 });
     const mixed = join(temp, "mix-final.wav");
     await mixSound(movie, tracks, joined, length, mixed, ctx);
@@ -533,7 +529,7 @@ export async function renderMovie(file: string, output: string, draft = false) {
         words = spoken.words.map((w) => ({ word: w.word, start: w.start + at, end: w.end + at }));
       } else {
         const transcript = join(temp, "words.json");
-        listen.transcribe(mixed, transcript, options.model ?? "base");
+        await listen.transcribe(mixed, transcript, options.model ?? "base");
         words = JSON.parse(readFileSync(transcript, "utf8")).words ?? [];
       }
       if (words.length) {

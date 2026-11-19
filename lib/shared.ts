@@ -683,6 +683,118 @@ export function runPack(name: string, args: string[]): any {
   return JSON.parse(lastLine);
 }
 
+// ---------- AI models ----------
+// Open AI models that run inside Node (Transformers.js and ONNX Runtime): no Python, no API keys, no internet.
+// Models live in .models/<repo>/ inside joEdit. Each one is added once, when a task needs it, with
+// `node joedit.ts install <name>`; after that every command runs fully offline.
+
+export type AiModel = { repo: string; files: string[]; does: string; license: string };
+
+// The files of a Whisper model (the encoder hears, the decoder writes the words).
+const whisperFiles = (encoder: string) => [
+  "config.json", "generation_config.json", "preprocessor_config.json", "tokenizer.json", "tokenizer_config.json",
+  `onnx/${encoder}.onnx`, "onnx/decoder_model_merged_q4.onnx",
+];
+
+export const AI_MODELS: Record<string, AiModel> = {
+  whisper: {
+    repo: "onnx-community/whisper-base_timestamped",
+    files: whisperFiles("encoder_model"),
+    does: "listen transcribe, captions: speech to text with the time of every word (~100 languages). 210 MB",
+    license: "MIT",
+  },
+  "whisper-tiny": { repo: "onnx-community/whisper-tiny_timestamped", files: whisperFiles("encoder_model"), does: "transcribe --model tiny: fastest, rougher. 120 MB", license: "MIT" },
+  "whisper-small": { repo: "onnx-community/whisper-small_timestamped", files: whisperFiles("encoder_model"), does: "transcribe --model small: more accurate. 590 MB", license: "MIT" },
+  "whisper-turbo": { repo: "onnx-community/whisper-large-v3-turbo_timestamped", files: whisperFiles("encoder_model_q4"), does: "transcribe --model turbo: most accurate. 760 MB", license: "MIT" },
+  kokoro: {
+    repo: "onnx-community/Kokoro-82M-v1.0-ONNX",
+    files: ["config.json", "tokenizer.json", "tokenizer_config.json", "onnx/model.onnx"],
+    does: "voice speak, movie voiceover: natural voices in English, Spanish, French, Italian and Portuguese. 330 MB",
+    license: "Apache-2.0",
+  },
+  cutout: {
+    repo: "onnx-community/BiRefNet_lite-ONNX",
+    files: ["config.json", "onnx/model.onnx"],
+    does: "picture cutout, video reframe --follow: remove the background. 225 MB",
+    license: "MIT",
+  },
+  depth: {
+    repo: "onnx-community/depth-anything-v2-small",
+    files: ["config.json", "preprocessor_config.json", "onnx/model.onnx"],
+    does: "picture depth, picture parallax: how far away everything is. 100 MB",
+    license: "Apache-2.0",
+  },
+  vision: {
+    repo: "onnx-community/siglip2-base-patch16-224-ONNX",
+    files: [
+      "config.json", "preprocessor_config.json", "tokenizer.json", "tokenizer_config.json", "special_tokens_map.json",
+      "onnx/vision_model.onnx", "onnx/text_model_quantized.onnx",
+    ],
+    does: "look find, look index: search pictures and video by meaning (SigLIP 2). 660 MB",
+    license: "Apache-2.0",
+  },
+};
+
+// The folder a model lives in.
+export function modelFolder(name: string): string {
+  const model = AI_MODELS[name];
+  if (!model) throw new Error(`Unknown AI model "${name}". Models: ${Object.keys(AI_MODELS).join(", ")}`);
+  return join(MODELS, model.repo);
+}
+
+export function isModelInstalled(name: string): boolean {
+  return AI_MODELS[name].files.every((file) => existsSync(join(modelFolder(name), file)));
+}
+
+// The model's folder, or a clear message saying how to add it.
+export function requireModel(name: string): string {
+  if (!isModelInstalled(name)) throw new Error(`This needs the "${name}" AI model. Add it once with: node joedit.ts install ${name}`);
+  return modelFolder(name);
+}
+
+export function listModels() {
+  return Object.entries(AI_MODELS).map(([name, m]) => ({ name, does: m.does, license: m.license, installed: isModelInstalled(name) }));
+}
+
+// Add a model to .models/ (the only step that goes online). Files arrive under a temporary name first,
+// so a stopped download never looks installed.
+export async function installModel(name: string): Promise<{ model: string; installed: boolean }> {
+  const folder = modelFolder(name);
+  for (const file of AI_MODELS[name].files) {
+    const target = join(folder, file);
+    if (existsSync(target)) continue;
+    process.stderr.write(`Adding ${name}: ${file}\n`);
+    const response = await fetch(`https://huggingface.co/${AI_MODELS[name].repo}/resolve/main/${file}`);
+    if (!response.ok) throw new Error(`Getting ${file} for ${name} failed (${response.status}).`);
+    mkdirSync(dirname(target), { recursive: true });
+    writeFileSync(`${target}.part`, Buffer.from(await response.arrayBuffer()));
+    renameSync(`${target}.part`, target);
+  }
+  return { model: name, installed: true };
+}
+
+// Transformers.js, set to read models only from .models/ (never from the internet).
+export function transformers(): any {
+  const library = need("@huggingface/transformers");
+  library.env.allowRemoteModels = false;
+  library.env.allowLocalModels = true;
+  library.env.localModelPath = MODELS;
+  return library;
+}
+
+// Load each model once per run, even when many frames or files use it.
+const loadedModels = new Map<string, Promise<any>>();
+export function loadModel<T>(key: string, load: () => Promise<T>): Promise<T> {
+  if (!loadedModels.has(key)) loadedModels.set(key, load());
+  return loadedModels.get(key)!;
+}
+
+// One ONNX file of an installed model, ready to run with ONNX Runtime.
+export function onnxModel(name: string, file = "onnx/model.onnx"): Promise<any> {
+  const path = join(requireModel(name), file);
+  return loadModel(`onnx:${path}`, () => need("onnxruntime-node").InferenceSession.create(path));
+}
+
 // ---------- Assets ----------
 // Assets are free downloads (fonts, instrument sounds, helper programs) saved in .assets/<name>.
 // Install one with: node joedit.ts install <name>
@@ -795,8 +907,9 @@ export async function installAsset(name: string): Promise<{ asset: string; insta
   return { asset: name, installed: true };
 }
 
-// Install a pack or an asset by name.
+// Install an AI model, an asset or a pack by name.
 export async function install(name: string): Promise<Result> {
+  if (AI_MODELS[name]) return installModel(name);
   if (ASSET_LIST.some((a) => a.name === name)) return installAsset(name);
   return installPack(name);
 }

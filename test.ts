@@ -2,7 +2,7 @@
 // Tests for every joEdit CLI: picture, video, sound, look, listen and joedit (doctor, check, packs).
 // Run with: node --test test.ts   (run `npm install` in lib/ first, for editor types)
 import { spawnSync, execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test, before, after, describe } from "node:test";
@@ -12,7 +12,7 @@ import * as video from "./lib/video.ts";
 import * as sound from "./lib/sound.ts";
 import * as graphics from "./lib/graphics.ts";
 import * as threeD from "./lib/3d.ts";
-import { FFMPEG, need, probe, readFrames, writeVideo } from "./lib/shared.ts";
+import { FFMPEG, isModelInstalled, need, probe, readFrames, writeVideo } from "./lib/shared.ts";
 
 type Tool = "picture" | "video" | "sound" | "look" | "listen" | "graphics" | "movie" | "voice" | "music" | "3d" | "joedit";
 
@@ -25,12 +25,13 @@ const hasChrome = (() => {
   }
 })();
 
-// Tests that need an AI pack are skipped when it is not installed.
+// Tests that need an AI model or pack are skipped when it is not installed.
 function hasPack(name: string): boolean {
   const packs = JSON.parse(ok("joedit", ["packs"])).packs;
   return Boolean(packs.find((p: any) => p.name === name)?.installed);
 }
-const hasWhisper = () => hasPack("whisper");
+const hasModel = (name: string) => isModelInstalled(name);
+const hasWhisper = () => hasModel("whisper");
 const hasAsset = (name: string) => existsSync(join("lib", ".assets", name));
 
 // 3D tests need Blender; they are skipped on machines without it.
@@ -286,7 +287,7 @@ describe("picture", () => {
   });
 
   test("cutout removes the background", async (t) => {
-    if (!hasPack("cutout")) return t.skip("cutout pack not installed");
+    if (!hasModel("cutout")) return t.skip("cutout model not installed");
     await paint(file("subject.png"), 320, 240, (x, y) => (inCircle(x, y, 160, 120, 70) ? RED : WHITE));
     ok("picture", ["cutout", file("subject.png"), file("cut.png")]);
     // The ball stays, the white around it becomes see-through.
@@ -297,7 +298,7 @@ describe("picture", () => {
   });
 
   test("depth makes a near-white, far-black map", (t) => {
-    if (!hasPack("depth")) return t.skip("depth pack not installed");
+    if (!hasModel("depth")) return t.skip("depth model not installed");
     const result = JSON.parse(ok("picture", ["depth", file("subject.png"), file("depth.png")]));
     assert.deepEqual([result.width, result.height], [320, 240]);
     assert.deepEqual(picture.info(file("depth.png")), { width: 320, height: 240, format: "PNG" });
@@ -526,7 +527,7 @@ describe("video", () => {
   });
 
   test("reframe --follow keeps a moving subject in the crop", async (t) => {
-    if (!hasPack("cutout")) return t.skip("cutout pack not installed");
+    if (!hasModel("cutout")) return t.skip("cutout model not installed");
     // A red ball moving from the left to the right of a wide video.
     await paint(file("ball-small.png"), 100, 100, (x, y) => (inCircle(x, y, 50, 50, 45) ? RED : CLEAR));
     execFileSync(FFMPEG, [
@@ -683,16 +684,27 @@ describe("movie", () => {
 describe("voice", () => {
   const sentence = "The quick brown fox jumps over the lazy dog.";
 
-  test("speak with Kokoro says the words, with word times (needs the tts pack)", (t) => {
-    if (!hasPack("tts")) return t.skip("tts pack not installed");
+  test("speak with Kokoro says the words, with word times (needs the kokoro and whisper models)", (t) => {
+    if (!hasModel("kokoro") || !hasWhisper()) return t.skip("kokoro or whisper model not installed");
     const result = JSON.parse(ok("voice", ["speak", file("spoken.wav"), "--text", sentence, "--voice", "am_michael", "--words", file("spoken.json")]));
     assert.ok(result.duration > 1.5);
     assert.ok(result.words >= 9);
-    if (hasWhisper()) {
-      const heard = JSON.parse(ok("listen", ["transcribe", file("spoken.wav"), file("heard.json"), "--model", "base"]));
-      assert.match(heard.text.toLowerCase(), /quick brown fox/);
-    }
+    // The word times use the script's own spelling.
+    const words = JSON.parse(readFileSync(file("spoken.json"), "utf8")).words;
+    assert.equal(words.at(-1).word, "dog.");
+    assert.ok(words.at(-1).end <= result.duration + 0.1);
+    const heard = JSON.parse(ok("listen", ["transcribe", file("spoken.wav"), file("heard.json"), "--model", "base"]));
+    assert.match(heard.text.toLowerCase(), /quick brown fox/);
+    assert.equal(heard.language, "en");
     assert.equal(cli("voice", ["speak", file("x.wav"), "--text", "hi", "--voice", "zz_nobody"]).code, 1);
+  });
+
+  test("speak in Spanish (espeak sounds) and transcribe finds the language", (t) => {
+    if (!hasModel("kokoro") || !hasWhisper()) return t.skip("kokoro or whisper model not installed");
+    ok("voice", ["speak", file("hola.wav"), "--text", "Hola a todos. Bienvenidos a nuestro estudio.", "--voice", "ef_dora"]);
+    const heard = JSON.parse(ok("listen", ["transcribe", file("hola.wav"), file("hola.json")]));
+    assert.equal(heard.language, "es");
+    assert.match(heard.text.toLowerCase(), /bienvenidos/);
   });
 
   test("speak with macOS say (no pack needed)", (t) => {
@@ -735,8 +747,8 @@ describe("voice", () => {
     assert.ok(loudness(join(file("stems"), "vocals.wav"), 1.8) < loudness(join(file("stems"), "vocals.wav")) - 10);
   });
 
-  test("a movie voice-over is spoken, mixed and captioned (needs the tts pack and Chrome)", (t) => {
-    if (!hasPack("tts") || !hasChrome) return t.skip("tts pack or Chrome missing");
+  test("a movie voice-over is spoken, mixed and captioned (needs the kokoro and whisper models, and Chrome)", (t) => {
+    if (!hasModel("kokoro") || !hasWhisper() || !hasChrome) return t.skip("kokoro/whisper model or Chrome missing");
     writeFileSync(file("vo.json"), JSON.stringify({
       size: "320x180",
       scenes: [{ color: "#203040", duration: 4 }],
@@ -1203,7 +1215,7 @@ describe("look", () => {
   });
 
   test("find locates the moment that matches a description", async (t) => {
-    if (!hasPack("vision")) return t.skip("vision pack not installed");
+    if (!hasModel("vision")) return t.skip("vision model not installed");
     // 2s of blue sky color, 2s of a red ball on white, 2s of green: the ball is at 2-4s.
     await paint(file("ball.png"), 320, 240, (x, y) => (inCircle(x, y, 160, 120, 80) ? RED : WHITE));
     execFileSync(FFMPEG, [
@@ -1265,10 +1277,10 @@ describe("listen", () => {
     assert.equal(cli("listen", ["beats", file("short.wav")]).code, 1);
   });
 
-  test("transcribe gives words with times (needs the whisper pack)", (t) => {
-    if (!hasWhisper()) return t.skip("whisper pack not installed");
+  test("transcribe gives words with times (needs the whisper model)", (t) => {
+    if (!hasWhisper() || process.platform !== "darwin") return t.skip("whisper model not installed (or not macOS)");
     execFileSync("say", ["-o", file("speech.aiff"), "Hello world. This is a test."]);
-    const result = JSON.parse(ok("listen", ["transcribe", file("speech.aiff"), file("speech.json"), "--model", "tiny"]));
+    const result = JSON.parse(ok("listen", ["transcribe", file("speech.aiff"), file("speech.json")]));
     assert.match(result.text.toLowerCase(), /hello/);
     assert.ok(result.words >= 5);
   });

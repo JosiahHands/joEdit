@@ -3,9 +3,13 @@
 // CLI:     node joedit.ts look <command> ...
 // Library: import { sheet } from "./joEdit/look.ts"
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import {
+  AI_MODELS,
+  loadModel,
+  requireModel,
+  transformers,
   analyze,
   drawText,
   ffmpeg,
@@ -20,7 +24,6 @@ import {
   requireFile,
   round,
   runCli,
-  runPack,
   saveCanvas,
   skia,
   type Command,
@@ -162,7 +165,75 @@ const VIDEO_FILE = /\.(mp4|mov|m4v|mkv|webm|avi)$/i;
 // time: the best frame; start / end: the whole moment that matches (videos only).
 export type Match = { file: string; time?: number; start?: number; end?: number; score: number };
 
-// Search pictures and videos by meaning: "a dog on a beach", "close-up of hands typing" (vision pack).
+// ---------- Meaning (SigLIP 2) ----------
+// Pictures and words become vectors (lists of 768 numbers); a picture and a description that mean
+// the same thing point the same way. score = sigmoid(similarity * SCALE + BIAS), SigLIP 2's own trained values.
+const SIGLIP_SCALE = 112.6689;
+const SIGLIP_BIAS = -16.7717;
+
+function visionModel(): Promise<any> {
+  requireModel("vision");
+  const library = transformers();
+  const repo = AI_MODELS.vision.repo;
+  return loadModel("vision", async () => ({
+    processor: await library.AutoProcessor.from_pretrained(repo),
+    tokenizer: await library.AutoTokenizer.from_pretrained(repo),
+    pictures: await library.SiglipVisionModel.from_pretrained(repo, { dtype: "fp32" }),
+    words: await library.SiglipTextModel.from_pretrained(repo, { dtype: "q8" }),
+  }));
+}
+
+// Make a vector length 1, so comparing two is just multiplying.
+function unit(vector: Float32Array): Float32Array {
+  let length = 0;
+  for (const v of vector) length += v * v;
+  length = Math.sqrt(length) || 1;
+  return vector.map((v) => v / length);
+}
+
+// One vector per picture. With cacheFile, vectors are saved and reused when the same pictures are searched again.
+export async function pictureVectors(pictures: string[], cacheFile?: string): Promise<Float32Array[]> {
+  const names = pictures.map((p) => basename(p));
+  if (cacheFile && existsSync(cacheFile)) {
+    const saved = JSON.parse(readFileSync(cacheFile, "utf8"));
+    if (JSON.stringify(saved.names) === JSON.stringify(names)) {
+      const all = new Float32Array(new Uint8Array(Buffer.from(saved.vectors, "base64")).buffer);
+      return names.map((_, n) => all.subarray(n * saved.size, (n + 1) * saved.size));
+    }
+  }
+  const model = await visionModel();
+  const { RawImage } = transformers();
+  const vectors: Float32Array[] = [];
+  for (let start = 0; start < pictures.length; start += 16) {
+    const batch = await Promise.all(pictures.slice(start, start + 16).map((p) => RawImage.read(p)));
+    const { pooler_output } = await model.pictures(await model.processor(batch));
+    const size = pooler_output.dims[1];
+    for (let n = 0; n < batch.length; n++) vectors.push(unit(pooler_output.data.slice(n * size, (n + 1) * size)));
+  }
+  if (cacheFile && vectors.length) {
+    const all = new Float32Array(vectors.length * vectors[0].length);
+    vectors.forEach((v, n) => all.set(v, n * v.length));
+    writeFileSync(cacheFile, JSON.stringify({ names, size: vectors[0].length, vectors: Buffer.from(all.buffer).toString("base64") }));
+  }
+  return vectors;
+}
+
+// The vector of a description. SigLIP 2 was trained on lowercase text padded to 64 tokens.
+export async function wordsVector(text: string): Promise<Float32Array> {
+  const model = await visionModel();
+  const inputs = model.tokenizer([text.toLowerCase()], { padding: "max_length", max_length: 64, truncation: true });
+  const { pooler_output } = await model.words(inputs);
+  return unit(pooler_output.data);
+}
+
+// How well a picture matches a description, 0..1.
+export function matchScore(picture: Float32Array, words: Float32Array): number {
+  let similarity = 0;
+  for (let i = 0; i < picture.length; i++) similarity += picture[i] * words[i];
+  return 1 / (1 + Math.exp(-(similarity * SIGLIP_SCALE + SIGLIP_BIAS)));
+}
+
+// Search pictures and videos by meaning: "a dog on a beach", "close-up of hands typing" (vision model).
 // input: a video, a picture or a folder of them. Videos are sampled every `every` seconds.
 // Frames and their embeddings are cached in .joedit-cache/ next to the input, so the next search is fast.
 export async function find(input: string, query: string, options: { top?: number; every?: number; sheet?: string } = {}) {
@@ -199,7 +270,9 @@ export async function find(input: string, query: string, options: { top?: number
 
   mkdirSync(cacheRoot, { recursive: true });
   const cacheKey = createHash("sha256").update(candidates.map((c) => resolve(c.picture)).join("|")).digest("hex").slice(0, 16);
-  const { scores } = runPack("vision", ["--query", query, "--cache", join(cacheRoot, `${cacheKey}.npz`), ...candidates.map((c) => c.picture)]);
+  const vectors = await pictureVectors(candidates.map((c) => c.picture), join(cacheRoot, `${cacheKey}.json`));
+  const words = await wordsVector(query);
+  const scores = vectors.map((vector) => matchScore(vector, words));
 
   // Best first. For a video, a match grows into a moment (start - end) over the neighbouring frames
   // that also match well, and frames inside a moment already found are skipped.

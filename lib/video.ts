@@ -264,7 +264,7 @@ export async function captions(
     let transcript = options.transcript;
     if (!transcript) {
       transcript = join(folder, "words.json");
-      listen.transcribe(input, transcript, options.model ?? "base");
+      await listen.transcribe(input, transcript, options.model ?? "base");
     }
     const words = JSON.parse(readFileSync(requireFile(transcript), "utf8")).words ?? [];
     if (!words.length) throw new Error("The transcript has no words.");
@@ -338,7 +338,7 @@ export function reframe(input: string, output: string, aspect: string, x = 0.5, 
   ffmpeg(["-i", input, "-vf", filter, "-c:a", "copy", output]);
 }
 
-// Crop to a new shape while following the main subject (a person, a product) as it moves (cutout pack).
+// Crop to a new shape while following the main subject (a person, a product) as it moves (cutout model).
 // The subject is found every `every` seconds, its path is smoothed like a camera operator would,
 // and the crop glides along it. smooth: seconds of smoothing (bigger = calmer camera).
 export function reframeFollow(input: string, output: string, aspect: string, every = 0.5, smooth = 2) {
@@ -349,26 +349,23 @@ export function reframeFollow(input: string, output: string, aspect: string, eve
   const cropH = Math.floor(Math.min(height, width / a) / 2) * 2;
 
   return withTempDir(async (folder) => {
-    // 1. Small frames, one every `every` seconds, and a subject mask for each (white = subject).
+    // 1. Small frames, one every `every` seconds.
     ffmpeg(["-i", input, "-vf", `fps=1/${every},scale=384:-2`, join(folder, "%05d.png")]);
     const frames = readdirSync(folder).filter((name) => name.endsWith(".png")).sort().map((name) => join(folder, name));
-    const { files: masks } = runPack("cutout", [join(folder, "masks"), ...frames, "--mask"]);
 
-    // 2. The centre of each mask (0..1 across and down). Frames with no subject keep the last centre.
-    const sharp = need("sharp");
-    const w = 64, h = 64;
+    // 2. The centre of the subject in each frame (0..1 across and down). Frames with no subject keep the last centre.
+    const { subjectMask } = await import("./picture.ts");
     let last = [0.5, 0.5];
     const centres: number[][] = [];
-    for (const mask of masks as string[]) {
-      // A tiny grayscale version: one brightness value per pixel.
-      const values: Buffer = await sharp(mask).resize(w, h, { fit: "fill" }).grayscale().raw().toBuffer();
+    for (const frame of frames) {
+      const { mask, width: w, height: h } = await subjectMask(frame); // 255 = subject
       let total = 0, sumX = 0, sumY = 0;
-      values.forEach((v, i) => {
+      mask.forEach((v, i) => {
         total += v;
-        sumX += v * ((i % w) + 0.5) / w;
-        sumY += v * (Math.floor(i / w) + 0.5) / h;
+        sumX += (v * ((i % w) + 0.5)) / w;
+        sumY += (v * (Math.floor(i / w) + 0.5)) / h;
       });
-      if (total > 255 * 20) last = [sumX / total, sumY / total]; // at least ~20 subject pixels
+      if (total > 255 * w * h * 0.002) last = [sumX / total, sumY / total]; // the subject covers at least 0.2% of the frame
       centres.push(last);
     }
 

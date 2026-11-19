@@ -17,9 +17,12 @@ import {
   optionalNumberFlag,
   requireFile,
   round,
-  runPack,
   runCli,
   withTempDir,
+  AI_MODELS,
+  loadModel,
+  requireModel,
+  transformers,
   type Command,
 } from "./shared.ts";
 import * as sound from "./sound.ts";
@@ -222,17 +225,82 @@ export type Transcript = {
   segments: { start: number; end: number; text: string }[];
 };
 
-// Speech to text with the time of every word. Needs the whisper pack: node joedit.ts install whisper
-// model: tiny, base, small, medium or large-v3 (bigger = better but slower).
-export function transcribe(input: string, output: string, model = "base", language = ""): { language: string; words: number; text: string } {
+// Mono sound as numbers at `rate` per second (AI models want 16000 or 48000). Works on video files too.
+export function monoSamples(input: string, rate: number, from = 0, to?: number): Float32Array {
   requireFile(input);
-  const transcript: Transcript = withTempDir((folder) => {
-    // Whisper wants 16 kHz mono sound. This also makes video files work.
-    const speech = join(folder, "speech.wav");
-    ffmpeg(["-i", input, "-vn", "-ac", "1", "-ar", "16000", speech]);
-    const options = language ? ["--language", language] : [];
-    return runPack("whisper", [speech, "--model", model, ...options]);
+  const bytes = execFileSync(FFMPEG, [
+    "-hide_banner", "-loglevel", "error", ...(from ? ["-ss", String(from)] : []), "-i", input,
+    ...(to !== undefined ? ["-t", String(Math.max(0.01, to - from))] : []),
+    "-vn", "-ac", "1", "-ar", String(rate), "-f", "f32le", "-",
+  ], { maxBuffer: 4 * 1024 * 1024 * 1024 });
+  return new Float32Array(new Uint8Array(bytes).buffer);
+}
+
+// Whisper sizes (each is an AI model to install): bigger is more accurate but slower. All understand about 100 languages.
+export const WHISPER_MODELS: Record<string, string> = { tiny: "whisper-tiny", base: "whisper", small: "whisper-small", turbo: "whisper-turbo" };
+
+function whisper(size: string): Promise<any> {
+  const name = WHISPER_MODELS[size];
+  if (!name) throw new Error(`Unknown model "${size}". Models: ${Object.keys(WHISPER_MODELS).join(", ")}`);
+  requireModel(name);
+  // The encoder stays exact (good word times, except turbo, which is huge); the decoder is compressed (fast, same words).
+  const dtype = { encoder_model: size === "turbo" ? "q4" : "fp32", decoder_model_merged: "q4" };
+  return loadModel(`whisper:${size}`, () => transformers().pipeline("automatic-speech-recognition", AI_MODELS[name].repo, { dtype }));
+}
+
+// Which language is spoken (e.g. "en", "fr"): Whisper's first guess after hearing up to 30 seconds.
+async function detectLanguage(transcriber: any, audio: Float32Array): Promise<string> {
+  const { Tensor } = transformers();
+  const { input_features } = await transcriber.processor(audio.subarray(0, 16000 * 30));
+  const config = transcriber.model.generation_config;
+  const start = new Tensor("int64", [BigInt(config.decoder_start_token_id)], [1, 1]);
+  const { logits } = await transcriber.model({ input_features, decoder_input_ids: start });
+  const vocabulary = logits.dims.at(-1);
+  let best = "en";
+  let score = -Infinity;
+  for (const [token, id] of Object.entries(config.lang_to_id as Record<string, number>)) {
+    const value = logits.data[logits.data.length - vocabulary + id];
+    if (value > score) [best, score] = [token.slice(2, -2), value]; // "<|fr|>" -> "fr"
+  }
+  return best;
+}
+
+// Group words into sentences: a new one after . ? ! or a pause longer than 0.8 s.
+function sentences(words: Word[]): Transcript["segments"] {
+  const segments: Transcript["segments"] = [];
+  let current: Word[] = [];
+  words.forEach((word, n) => {
+    current.push(word);
+    const next = words[n + 1];
+    if (!next || /[.?!]$/.test(word.word) || next.start - word.end > 0.8 || current.length >= 30) {
+      segments.push({ start: current[0].start, end: word.end, text: current.map((w) => w.word).join(" ") });
+      current = [];
+    }
   });
+  return segments;
+}
+
+// Speech to text with the time of every word, with Whisper running inside Node.
+// model: tiny, base, small or turbo (bigger = better but slower). language: a code or name ("fr", "french"), or found automatically.
+export async function transcribe(input: string, output: string, model = "base", language = ""): Promise<{ language: string; words: number; text: string }> {
+  const audio = monoSamples(input, 16000);
+  const transcriber = await whisper(model);
+  const spoken = language || (await detectLanguage(transcriber, audio));
+  const result = await transcriber(audio, { return_timestamps: "word", chunk_length_s: 30, language: spoken, task: "transcribe" });
+  const words: Word[] = [];
+  for (const chunk of result.chunks ?? []) {
+    const text: string = chunk.text;
+    const start = round(chunk.timestamp[0] ?? 0);
+    const end = round(chunk.timestamp[1] ?? chunk.timestamp[0] ?? 0);
+    if (!text.trim()) continue;
+    // A piece without a space in front continues the word before it ("word" + "-level", "aujourd" + "'hui").
+    const last = words.at(-1);
+    if (last && !/^\s/.test(text)) {
+      last.word += text.trim();
+      last.end = end;
+    } else words.push({ word: text.trim(), start, end });
+  }
+  const transcript: Transcript = { language: spoken, text: words.map((w) => w.word).join(" "), words, segments: sentences(words) };
   writeFileSync(output, JSON.stringify(transcript, null, 2));
   const preview = transcript.text.length > 200 ? `${transcript.text.slice(0, 200)}...` : transcript.text;
   return { language: transcript.language, words: transcript.words.length, text: preview };
@@ -266,7 +334,7 @@ export const commands: Record<string, Command> = {
     run: (a) => beats(requireFile(a.positional[0])),
   },
   transcribe: {
-    usage: "transcribe <sound> <output.json> [--model base] [--language en]  (needs: install whisper)",
+    usage: `transcribe <sound> <output.json> [--model ${Object.keys(WHISPER_MODELS).join("|")}] [--language en]  (language is found automatically if not given)`,
     run: (a) => {
       const { input, output } = inOut(a);
       return transcribe(input, output, a.flags.model ?? "base", a.flags.language ?? "");
