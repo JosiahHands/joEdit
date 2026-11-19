@@ -12,7 +12,7 @@ import * as video from "./lib/video.ts";
 import * as sound from "./lib/sound.ts";
 import * as graphics from "./lib/graphics.ts";
 
-type Tool = "picture" | "video" | "sound" | "look" | "listen" | "graphics" | "joedit";
+type Tool = "picture" | "video" | "sound" | "look" | "listen" | "graphics" | "movie" | "joedit";
 
 // Graphics tests need Chrome; they are skipped on machines without it.
 const hasChrome = (() => {
@@ -220,6 +220,18 @@ describe("picture", () => {
     assert.equal(cli("picture", ["effects", file("in.png"), file("x.png")]).code, 1);
   });
 
+  test("animate turns a picture into a video with a camera move", () => {
+    const result = JSON.parse(ok("picture", ["animate", file("in.png"), file("kb.mp4"), "--duration", "2", "--motion", "pan-right", "--width", "320", "--height", "180", "--amount", "0.5"]));
+    assert.equal(result.frames, 60);
+    const details = video.info(file("kb.mp4"));
+    assert.deepEqual([details.width, details.height], [320, 180]);
+    // Panning moves the edge between red and blue, so the start and end frames differ.
+    frameAt(file("kb.mp4"), 0, file("kb-start.png"));
+    frameAt(file("kb.mp4"), 1.95, file("kb-end.png"));
+    assert.ok(regionDiff(file("kb-start.png"), file("kb-end.png"), "320x180+0+0") > 0.05);
+    assert.equal(cli("picture", ["animate", file("in.png"), file("x.mp4"), "--motion", "spin"]).code, 1);
+  });
+
   test("errors: missing file, missing flag, unknown command", () => {
     assert.equal(cli("picture", ["resize", file("nope.png"), file("x.png"), "--width", "10"]).code, 1);
     assert.equal(cli("picture", ["crop", file("in.png"), file("x.png"), "--x", "1"]).code, 1);
@@ -364,6 +376,37 @@ describe("video", () => {
     assert.ok(r < 30 && g < 30 && b < 30, `top bar not black: ${r},${g},${b}`);
   });
 
+  test("remove-silence cuts out the pause", () => {
+    // 7s video whose sound is: 2s tone, 3s silence, 2s tone.
+    execFileSync("ffmpeg", ["-loglevel", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=320x240:rate=30", "-i", file("gap.wav"), "-t", "7", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", file("gap.mp4")]);
+    const result = JSON.parse(ok("video", ["remove-silence", file("gap.mp4"), file("tight.mp4"), "--min", "1"]));
+    assert.equal(result.cuts, 1);
+    // 2s + 2s of tone, plus 0.1s of pause kept on each side.
+    near(video.info(file("tight.mp4")).duration, 4.2, 0.2);
+  });
+
+  test("reframe crops to a phone shape", () => {
+    ok("video", ["reframe", file("in.mp4"), file("tall.mp4"), "--aspect", "9:16"]);
+    const details = video.info(file("tall.mp4"));
+    assert.equal(details.height, 240);
+    near(details.width / details.height, 9 / 16, 0.02);
+    assert.equal(cli("video", ["reframe", file("in.mp4"), file("x.mp4"), "--aspect", "wide"]).code, 1);
+  });
+
+  test("pip puts a small video in a corner", () => {
+    ok("video", ["pip", file("in.mp4"), file("silent.mp4"), file("pip.mp4"), "--corner", "top-left", "--size", "0.4"]);
+    assert.equal(video.info(file("pip.mp4")).width, 320);
+    frameAt(file("in.mp4"), 1, file("pip-before.png"));
+    frameAt(file("pip.mp4"), 1, file("pip-after.png"));
+    assert.ok(regionDiff(file("pip-before.png"), file("pip-after.png"), "100x60+20+20") > 0.05, "top-left corner unchanged");
+    assert.ok(regionDiff(file("pip-before.png"), file("pip-after.png"), "100x60+210+170") < 0.03, "bottom-right corner changed");
+  });
+
+  test("interpolate raises the frame rate", () => {
+    ok("video", ["interpolate", file("silent.mp4"), file("smooth.mp4"), "--fps", "60"]);
+    assert.equal(video.info(file("smooth.mp4")).fps, 60);
+  });
+
   test("captions from a transcript appear at the bottom (needs Chrome)", (t) => {
     if (!hasChrome) return t.skip("Chrome not found");
     const words = [
@@ -386,6 +429,100 @@ describe("video", () => {
     assert.equal(cli("video", ["trim", file("nope.mp4"), file("x.mp4"), "--start", "0", "--end", "1"]).code, 1);
     assert.equal(cli("video", ["trim", file("in.mp4"), file("x.mp4"), "--start", "2", "--end", "1"]).code, 1);
     assert.equal(cli("video", []).code, 0);
+  });
+});
+
+describe("movie", () => {
+  // Movies made only of color, picture and video scenes, so these tests do not need Chrome.
+  const write = (name: string, movie: object) => writeFileSync(file(name), JSON.stringify(movie));
+  const basic = {
+    size: "320x180",
+    scenes: [
+      { color: "red", duration: 1.5 },
+      { image: "in.png", motion: "zoom-in", duration: 1.5, transition: "fade" },
+      { video: "in.mp4", from: 0.5, to: 2.5, transition: { type: "wipeleft", duration: 0.5 } },
+    ],
+    audio: [{ file: "sound.mp3", volume: 0.5, duck: true, fadeOut: 1 }],
+    sfx: [{ type: "whoosh", at: 1 }],
+    look: "warm",
+    effects: { vignette: 0.3 },
+  };
+
+  test("validate lists every problem with a hint", () => {
+    write("bad.json", {
+      size: "big",
+      scenes: [
+        { color: "red", duration: 1, transition: "fade" },
+        { video: "missing.mp4" },
+        { image: "in.png", motion: "spin", durration: 2 },
+        { title: "x", color: "blue" },
+        { color: "blue", transition: "teleport" },
+      ],
+      sfx: [{ type: "kazoo", at: 1 }],
+    });
+    const result = JSON.parse(ok("movie", ["validate", file("bad.json")]));
+    assert.equal(result.valid, false);
+    const all = result.errors.join("\n");
+    for (const hint of [/size/, /first scene/, /missing\.mp4/, /motion "spin"/, /unknown key "durration"/, /exactly one of/, /transition "teleport"/, /kazoo/]) {
+      assert.match(all, hint);
+    }
+    // Rendering a broken movie fails with the same list.
+    const render = cli("movie", ["render", file("bad.json"), file("x.mp4")]);
+    assert.equal(render.code, 1);
+    assert.match(render.stderr, /missing\.mp4/);
+  });
+
+  test("templates write starting movies that name their placeholder files", () => {
+    const list = JSON.parse(ok("movie", ["templates"])).templates;
+    assert.ok(list.length >= 6);
+    ok("movie", ["template", "slideshow", file("slides.json")]);
+    const result = JSON.parse(ok("movie", ["validate", file("slides.json")]));
+    assert.match(result.errors.join("\n"), /photo1\.jpg/);
+  });
+
+  test("render joins scenes with transitions, mixes sound, and checks the result", () => {
+    write("basic.json", basic);
+    const result = JSON.parse(ok("movie", ["render", file("basic.json"), file("movie.mp4")]));
+    assert.equal(result.rendered, 3);
+    // 1.5 + 1.5 + 2 seconds, minus the two transitions (0.5 each).
+    near(result.duration, 4, 0.1);
+    const details = video.info(file("movie.mp4"));
+    assert.deepEqual([details.width, details.height], [320, 180]);
+    assert.ok(details.hasAudio);
+    near(details.duration, 4, 0.15);
+    // The sound is made the online standard loudness.
+    const level = JSON.parse(ok("listen", ["loudness", file("movie.mp4")]));
+    assert.ok(Math.abs(level.lufs + 14) < 1.5, `lufs ${level.lufs}`);
+    assert.ok("passed" in result.check);
+  });
+
+  test("render reuses unchanged scenes and drafts are smaller", () => {
+    write("basic.json", basic);
+    assert.equal(JSON.parse(ok("movie", ["render", file("basic.json"), file("movie2.mp4")])).cached, 3);
+    // Change one scene: only that scene renders again.
+    const changed = structuredClone(basic);
+    changed.scenes[0].color = "blue";
+    write("basic.json", changed);
+    const again = JSON.parse(ok("movie", ["render", file("basic.json"), file("movie3.mp4")]));
+    assert.deepEqual([again.rendered, again.cached], [1, 2]);
+    const draft = JSON.parse(ok("movie", ["render", file("basic.json"), file("draft.mp4"), "--draft"]));
+    assert.equal(draft.size, "106x60");
+  });
+
+  test("beatSync moves cuts onto the beat", () => {
+    // The click track beats every 0.5s, so cuts at 1.3s and 2.6s move to about 1.5s and 2.5s.
+    write("beats.json", {
+      size: "160x90",
+      beatSync: "click120.wav",
+      scenes: [{ color: "red", duration: 1.3 }, { color: "blue", duration: 1.3 }, { color: "lime", duration: 1 }],
+    });
+    ok("movie", ["render", file("beats.json"), file("beats.mp4")]);
+    const cuts = JSON.parse(ok("look", ["scenes", file("beats.mp4")])).cuts;
+    assert.equal(cuts.length, 2);
+    for (const cut of cuts) {
+      const offBeat = Math.abs(cut - Math.round(cut * 2) / 2);
+      assert.ok(offBeat < 0.08, `cut at ${cut} is not on a beat`);
+    }
   });
 });
 

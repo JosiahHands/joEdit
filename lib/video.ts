@@ -11,6 +11,7 @@ import {
   optionalNumberFlag,
   probe,
   requireFile,
+  round,
   run,
   runCli,
   stringFlag,
@@ -199,16 +200,19 @@ function applyGraph(input: string, output: string, graph: string): void {
   ffmpeg(["-i", input, "-filter_complex", graph, "-map", "[out]", ...extra, output]);
 }
 
-// Apply a color grade. strength 0..1 mixes it with the original.
-export function grade(input: string, output: string, look: string, strength = 1): void {
+// The filter graph for a color grade, from label `from` to label `to` (used by grade and by movie.ts).
+export function gradeGraph(look: string, strength: number, from: string, to: string): string {
   const filter = LOOKS[look];
   if (!filter) throw new Error(`Unknown look "${look}". Looks: ${Object.keys(LOOKS).join(", ")}`);
   const amount = Math.min(1, Math.max(0, strength));
-  const graph =
-    amount >= 1
-      ? `[0:v]${filter}[out]`
-      : `[0:v]format=gbrp,split[a][b];[b]${filter},format=gbrp[g];[a][g]blend=all_mode=normal:all_opacity=${amount}[out]`;
-  applyGraph(input, output, graph);
+  return amount >= 1
+    ? `[${from}]${filter}[${to}]`
+    : `[${from}]format=gbrp,split[ga][gb];[gb]${filter},format=gbrp[gg];[ga][gg]blend=all_mode=normal:all_opacity=${amount}[${to}]`;
+}
+
+// Apply a color grade. strength 0..1 mixes it with the original.
+export function grade(input: string, output: string, look: string, strength = 1): void {
+  applyGraph(input, output, gradeGraph(look, strength, "0:v", "out"));
 }
 
 export type Effects = {
@@ -220,10 +224,10 @@ export type Effects = {
   sharpen?: number; // 0..1
 };
 
-// Add film effects. Each effect is only applied if given.
-export function effects(input: string, output: string, chosen: Effects): void {
+// The filter graph for film effects, from label `from` to label `to` (used by effects and by movie.ts).
+export function effectsGraph(chosen: Effects, from: string, to: string): string {
   const steps: string[] = [];
-  let label = "0:v";
+  let label = from;
   let n = 0;
   const add = (filter: string) => {
     steps.push(`[${label}]${filter}[e${n}]`);
@@ -242,8 +246,13 @@ export function effects(input: string, output: string, chosen: Effects): void {
     add(`drawbox=x=0:y=0:w=iw:h=${bar}:color=black:t=fill,drawbox=x=0:y=ih-${bar}:w=iw:h=${bar}:color=black:t=fill`);
   }
   if (!steps.length) throw new Error("Give at least one effect: --grain, --vignette, --letterbox, --glow, --chromatic, --sharpen");
-  steps.push(`[${label}]null[out]`);
-  applyGraph(input, output, steps.join(";"));
+  steps.push(`[${label}]null[${to}]`);
+  return steps.join(";");
+}
+
+// Add film effects. Each effect is only applied if given.
+export function effects(input: string, output: string, chosen: Effects): void {
+  applyGraph(input, output, effectsGraph(chosen, "0:v", "out"));
 }
 
 // ---------- Captions ----------
@@ -282,6 +291,80 @@ export async function captions(
     ]);
     return { words: words.length, groups: made.groups };
   });
+}
+
+// ---------- Cutting and framing ----------
+
+// Automatic jump cuts: remove every pause longer than `min` seconds.
+// db: how quiet counts as a pause. pad: seconds of pause kept on each side so words are not clipped.
+export function removeSilence(input: string, output: string, min = 0.6, db = -35, pad = 0.1) {
+  const details = info(input);
+  if (!details.hasAudio) throw new Error("This video has no sound to find pauses in.");
+  const { silences } = listen.silences(input, db, min);
+  // Keep everything except the middle of each pause.
+  const keep: [number, number][] = [];
+  let start = 0;
+  for (const s of silences) {
+    const cutFrom = s.start <= 0 ? 0 : s.start + pad;
+    const cutTo = s.end >= details.duration ? details.duration : s.end - pad;
+    if (cutTo - cutFrom < 0.05) continue;
+    if (cutFrom > start) keep.push([start, cutFrom]);
+    start = cutTo;
+  }
+  if (start < details.duration) keep.push([start, details.duration]);
+  if (!keep.length) throw new Error("The whole file is silent. Try a lower --db (e.g. -50).");
+
+  // select keeps the frames inside the ranges; setpts closes the gaps.
+  const ranges = keep.map(([a, b]) => `between(t,${a.toFixed(3)},${b.toFixed(3)})`).join("+");
+  const filters = details.width
+    ? ["-vf", `select='${ranges}',setpts=N/FRAME_RATE/TB`, "-af", `aselect='${ranges}',asetpts=N/SR/TB`]
+    : ["-af", `aselect='${ranges}',asetpts=N/SR/TB`];
+  ffmpeg(["-i", input, ...filters, output]);
+  const kept = keep.reduce((sum, [a, b]) => sum + b - a, 0);
+  return { cuts: silences.length, before: round(details.duration), after: round(kept), removed: round(details.duration - kept) };
+}
+
+// Parse "9:16" or "1.78" into a number (width / height).
+export function parseAspect(aspect: string): number {
+  const [w, h] = aspect.split(":").map(Number);
+  const value = h ? w / h : w;
+  if (!value || value <= 0) throw new Error(`Aspect "${aspect}" should look like 9:16, 1:1, 16:9 or 1.78.`);
+  return value;
+}
+
+// Crop to a new shape, e.g. 9:16 for phones. x: where to crop across, 0 = left, 0.5 = middle, 1 = right.
+export function reframe(input: string, output: string, aspect: string, x = 0.5, y = 0.5): void {
+  const a = parseAspect(aspect);
+  // The largest even-sized box of that shape that fits.
+  const w = `trunc(min(iw\\,ih*${a})/2)*2`;
+  const h = `trunc(min(ih\\,iw/${a})/2)*2`;
+  const filter = `crop=${w}:${h}:(iw-${w})*${x}:(ih-${h})*${y},setsar=1`;
+  if (PICTURE_TYPES.test(output)) return void ffmpeg(["-i", input, "-vf", filter, "-frames:v", "1", "-update", "1", output]);
+  ffmpeg(["-i", input, "-vf", filter, "-c:a", "copy", output]);
+}
+
+// Picture-in-picture: a small video in a corner of the main one. Sound comes from the main video.
+// size: width of the small video as a part of the main width. corner: top-left|top-right|bottom-left|bottom-right.
+export function pip(main: string, small: string, output: string, corner = "bottom-right", size = 0.3, margin = 0.03): void {
+  requireFile(small);
+  const { width, height } = info(main);
+  const w = Math.round((width * size) / 2) * 2;
+  const m = Math.round(Math.min(width, height) * margin);
+  const positions: Record<string, string> = {
+    "top-left": `${m}:${m}`,
+    "top-right": `W-w-${m}:${m}`,
+    "bottom-left": `${m}:H-h-${m}`,
+    "bottom-right": `W-w-${m}:H-h-${m}`,
+  };
+  const position = positions[corner];
+  if (!position) throw new Error(`--corner must be one of: ${Object.keys(positions).join(", ")}`);
+  const graph = `[1:v]scale=${w}:-2,setsar=1[s];[0:v][s]overlay=${position}:eof_action=pass[v]`;
+  ffmpeg(["-i", main, "-i", small, "-filter_complex", graph, "-map", "[v]", "-map", "0:a?", "-c:a", "copy", "-pix_fmt", "yuv420p", output]);
+}
+
+// Smooth slow motion or higher frame rates by inventing in-between frames (motion interpolation).
+export function interpolate(input: string, output: string, fps = 60): void {
+  ffmpeg(["-i", input, "-vf", `minterpolate=fps=${fps}:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1`, "-c:a", "copy", output]);
 }
 
 // Change format based on the output file extension (e.g. .mov -> .mp4).
@@ -432,6 +515,35 @@ export const commands: Record<string, Command> = {
         model: a.flags.model,
         brand: a.flags.brand,
       });
+    },
+  },
+  "remove-silence": {
+    usage: "remove-silence <input> <output> [--min 0.6] [--db -35] [--pad 0.1]  (automatic jump cuts)",
+    run: (a) => {
+      const { input, output } = inOut(a);
+      return removeSilence(input, output, optionalNumberFlag(a, "min", 0.6), optionalNumberFlag(a, "db", -35), optionalNumberFlag(a, "pad", 0.1));
+    },
+  },
+  reframe: {
+    usage: "reframe <input> <output> --aspect 9:16|1:1|4:5|16:9 [--x 0..1] [--y 0..1]  (0.5 = centre)",
+    run: (a) => {
+      const { input, output } = inOut(a);
+      reframe(input, output, stringFlag(a, "aspect"), optionalNumberFlag(a, "x", 0.5), optionalNumberFlag(a, "y", 0.5));
+    },
+  },
+  pip: {
+    usage: "pip <main> <small> <output> [--corner bottom-right] [--size 0.3]",
+    run: (a) => {
+      if (a.positional.length < 3) throw new Error("Give the main video, the small video and the output.");
+      const [main, small, output] = a.positional;
+      pip(requireFile(main), small, output, a.flags.corner ?? "bottom-right", optionalNumberFlag(a, "size", 0.3));
+    },
+  },
+  interpolate: {
+    usage: "interpolate <input> <output> [--fps 60]  (smooth motion by inventing in-between frames)",
+    run: (a) => {
+      const { input, output } = inOut(a);
+      interpolate(input, output, optionalNumberFlag(a, "fps", 60));
     },
   },
   convert: {

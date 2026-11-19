@@ -3,7 +3,7 @@
 joEdit is a toolkit for editing pictures, video and sound, making motion graphics, and **seeing and hearing the results**. It runs entirely on this computer: no API keys, no cost per edit. Use it however suits the job: one command at a time, chained in a script, or imported as TypeScript functions. When joEdit doesn't do something, `ffmpeg`, `ffprobe` and `magick` are installed too, so call them directly or extend joEdit.
 
 ```
-node joedit.ts <area> <command> ...      areas: picture, video, sound, look, listen, graphics
+node joedit.ts <area> <command> ...      areas: picture, video, sound, look, listen, graphics, movie
 node joedit.ts                           prints every command
 node joedit.ts doctor                    shows what this computer has installed
 ```
@@ -40,6 +40,8 @@ flip <in> <out> --direction horizontal|vertical
 grayscale | brightness --amount -100..100 | contrast --amount -100..100 | blur --radius N   (all: <in> <out>)
 text <in> <out> --text "words" [--x 10] [--y 10] [--size 32] [--color white]
 grade | effects                             same looks and effects as video (below)
+animate <in> <out.mp4> [--duration 5] [--motion zoom-in|zoom-out|pan-left|pan-right|pan-up|pan-down|none] [--amount 0.15] [--width 1920] [--height 1080]
+                                            slow camera move over a still ("Ken Burns")
 convert <in> <out> [--quality 1..100]       e.g. .png → .jpg
 ```
 
@@ -61,6 +63,10 @@ convert <in> <out>
 grade <in> <out> --look cinematic|teal-orange|noir|vintage|warm|cool|bleach|vivid [--strength 0..1]
 effects <in> <out> [--grain 0..1] [--vignette 0..1] [--letterbox 2.39] [--glow 0..1] [--chromatic PX] [--sharpen 0..1]
 captions <in> <out> [--transcript words.json] [--style karaoke|pop|bold|minimal] [--position bottom|center|top] [--brand brand.json]
+remove-silence <in> <out> [--min 0.6] [--db -35] [--pad 0.1]   automatic jump cuts: removes every pause longer than --min
+reframe <in> <out> --aspect 9:16|1:1|4:5|16:9 [--x 0..1] [--y 0..1]   crop to a new shape; --x 0 = keep left, 1 = keep right
+pip <main> <small> <out> [--corner bottom-right] [--size 0.3]   picture-in-picture (sound from main)
+interpolate <in> <out> [--fps 60]           invents in-between frames: smoother motion, or slow motion with `speed`
 ```
 `captions` makes its own transcript (whisper pack) when none is given. A transcript is any JSON with `{"words": [{"word", "start", "end"}]}`, so you can fix spellings in it, or write one by hand, before burning it in. Styles: `karaoke` lights each word as it is spoken, `pop` grows the spoken word, `bold` is big uppercase lines, `minimal` is plain subtitles.
 
@@ -117,6 +123,48 @@ beats <sound>                               → bpm and the time of every beat
 transcribe <sound> <out.json> [--model base] [--language en]   → every word with its time (whisper pack)
 ```
 
+**movie**: a whole film from one JSON file
+```
+render <movie.json> <out.mp4> [--draft]     → duration, scenes rendered/cached, time taken, and a quality check
+validate <movie.json>                       → every problem, each with a hint to fix it
+templates                                   → starting points: short, ad, explainer, slideshow, lyric, podcast
+template <name> <movie.json>                writes one; replace its placeholder files (validate lists them)
+```
+A movie file describes the film; joEdit does the cutting, transitions, text, sound mix, captions and look. Each scene is cached in `.joedit-cache/` next to the movie file, so after changing one scene only that scene renders again. `--draft` renders at a third of the size, quickly, for checking timing and layout before the final render. Paths are relative to the movie file.
+```json
+{
+  "size": "1920x1080",                     // or "1080x1920" (phone), "1080x1080" (square). Default 1920x1080
+  "fps": 30,
+  "brand": "brand.json",                   // colors and fonts for titles, text and captions
+  "look": "cinematic", "lookStrength": 0.8, // color grade for the whole film (see video grade)
+  "effects": {"grain": 0.2, "vignette": 0.3},  // see video effects
+  "scenes": [
+    {"title": "Big title", "subtitle": "small line", "duration": 3},
+    {"video": "clip.mp4", "from": 2, "to": 8, "volume": 1, "fit": "cover"},
+    {"image": "photo.jpg", "motion": "zoom-in", "duration": 4, "transition": "fade"},
+    {"html": "chart.html", "data": {"values": [1, 2]}, "duration": 5, "transition": {"type": "slideleft", "duration": 0.6}},
+    {"color": "#000000", "duration": 1},
+    {"video": "b.mp4", "look": "noir", "text": [
+      {"text": "Ada Lovelace", "subtitle": "Engineer", "at": 0.5, "duration": 3},
+      {"text": "Chapter 2", "style": "title", "at": 4}]}
+  ],
+  "audio": [
+    {"file": "voice.wav", "at": 0.5},
+    {"file": "music.mp3", "volume": 0.5, "duck": true, "loop": true, "fadeIn": 1, "fadeOut": 2, "from": 10}
+  ],
+  "sfx": [{"type": "whoosh", "at": 2.9}, {"type": "boom", "at": 0, "volume": 1}],
+  "captions": {"style": "karaoke", "position": "bottom"},   // or {"transcript": "words.json"}; true = defaults
+  "beatSync": "music.mp3",                 // move every cut to the nearest beat
+  "notes": "free text for yourself"
+}
+```
+(Comments above are explanations; JSON itself has no comments.)
+- **Scenes** are one of `title`, `video`, `image`, `html` (any page you write, rendered like `graphics render`) or `color`. Non-video scenes last 3 seconds unless `duration` is given. Video scenes use `from`/`to` (or `duration`) and `fit`: `cover` fills the frame and crops the edges, `contain` shows the whole clip on a blurred copy of itself (good for wide clips in a phone video).
+- **Transitions** belong to the scene they lead into: `fade`, `fadeblack`, `fadewhite`, `dissolve`, `wipeleft/right/up/down`, `slideleft/right/up/down`, `smoothleft/right/up/down`, `circleopen`, `circleclose`, `radial`, `pixelize`, `zoomin`, `hblur`, `squeezeh`, `coverleft`, `revealright` and more (`validate` lists them all). Each transition overlaps the two scenes, so the film gets shorter by its duration.
+- **Sound:** scene sound, `audio` tracks and `sfx` are mixed together and set to -14 LUFS. Tracks with `"duck": true` go quiet whenever the other sound (speech) is loud. `at` is seconds from the start of the film.
+- **Captions** transcribe the final mix (whisper pack) unless a transcript is given.
+- After rendering, the result includes `check` (black frames, silence, loudness). An intended black ending will show up there, which is fine.
+
 **top level**
 ```
 doctor                                      installed tools, machine, packs
@@ -128,13 +176,34 @@ install <name>                              a pack (e.g. whisper, needs uv) or a
 ## Examples
 Ideas for combining commands, not fixed recipes.
 
-**Tighten a talk by removing a long pause**
+**Tighten a talk**
 ```
+node joedit.ts video remove-silence talk.mp4 tight.mp4 --min 0.6     (every pause at once)
+or by hand, for one pause:
 node joedit.ts listen silences talk.mp4 --min 1.5      → silence 12.4–15.9
 node joedit.ts video trim talk.mp4 a.mp4 --start 0 --end 12.4
 node joedit.ts video trim talk.mp4 b.mp4 --start 15.9 --end 60
 node joedit.ts video concat a.mp4 b.mp4 tight.mp4
 node joedit.ts look strip tight.mp4 cut.png --start 11.5 --end 13.5
+```
+
+**A finished film from a template**
+```
+node joedit.ts movie template short movie.json
+(edit movie.json: your clips, words and music)
+node joedit.ts movie validate movie.json
+node joedit.ts movie render movie.json draft.mp4 --draft
+node joedit.ts look sheet draft.mp4 sheet.png
+(adjust, then the full render reuses every unchanged scene)
+node joedit.ts movie render movie.json final.mp4
+```
+
+**Podcast to phone clip**
+```
+node joedit.ts video trim podcast.mp4 part.mp4 --start 754 --end 812
+node joedit.ts video remove-silence part.mp4 tight.mp4
+node joedit.ts video reframe tight.mp4 tall.mp4 --aspect 9:16 --x 0.3      (keep the speaker on the left)
+node joedit.ts video captions tall.mp4 final.mp4 --style karaoke
 ```
 
 **Cut a montage to the music**

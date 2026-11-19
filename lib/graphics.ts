@@ -358,7 +358,7 @@ export function lowerThirdHtml(o: Required<Omit<TemplateOptions, "subtitle">> & 
   const unit = Math.min(o.width, o.height * 1.78) / 100;
   return `<!doctype html><html><head><style>
   html,body{margin:0;width:100%;height:100%;overflow:hidden;background:${o.transparent ? "transparent" : colors.background}}
-  .box{position:absolute;left:${unit * 5}px;bottom:${o.height * 0.12}px;display:flex;align-items:stretch;
+  .box{position:absolute;left:${unit * 5}px;bottom:${o.height * 0.24}px;display:flex;align-items:stretch;
     animation:out .5s ease-in ${Math.max(0, o.duration - 0.5)}s forwards}
   .accent{width:${unit * 0.6}px;background:${colors.primary};transform-origin:bottom;animation:grow .4s cubic-bezier(.2,.8,.2,1) both}
   .text{background:rgba(10,10,15,.72);padding:${unit * 1}px ${unit * 1.8}px;clip-path:inset(0 100% 0 0);animation:reveal .7s .15s cubic-bezier(.2,.8,.2,1) forwards}

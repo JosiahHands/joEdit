@@ -3,6 +3,7 @@
 // Library: import { resize } from "./joEdit/picture.ts"
 import {
   DEFAULT_FONT,
+  ffmpeg,
   inOut,
   numberFlag,
   optionalNumberFlag,
@@ -89,6 +90,40 @@ export function text(
   ]);
 }
 
+export const MOTIONS = ["zoom-in", "zoom-out", "pan-left", "pan-right", "pan-up", "pan-down", "none"];
+
+// Turn a still picture into a video with a slow camera move (the "Ken Burns" effect).
+// amount: how far it zooms or pans (0.15 = 15%). The picture is cropped to fill width x height.
+export function animate(
+  input: string,
+  output: string,
+  options: { duration?: number; motion?: string; width?: number; height?: number; fps?: number; amount?: number } = {},
+): { frames: number } {
+  requireFile(input);
+  const { duration = 5, motion = "zoom-in", width = 1920, height = 1080, fps = 30, amount = 0.15 } = options;
+  const frames = Math.max(1, Math.round(duration * fps));
+  // p goes from 0 to 1, starting and ending gently (ease in and out).
+  const p = `(0.5-0.5*cos(PI*on/${Math.max(1, frames - 1)}))`;
+  const zoomed = `${1 + amount}`;
+  const center = { x: "(iw-iw/zoom)/2", y: "(ih-ih/zoom)/2" };
+  const moves: Record<string, { z: string; x: string; y: string }> = {
+    "zoom-in": { z: `1+${amount}*${p}`, ...center },
+    "zoom-out": { z: `1+${amount}*(1-${p})`, ...center },
+    "pan-left": { z: zoomed, x: `(iw-iw/zoom)*(1-${p})`, y: center.y },
+    "pan-right": { z: zoomed, x: `(iw-iw/zoom)*${p}`, y: center.y },
+    "pan-up": { z: zoomed, x: center.x, y: `(ih-ih/zoom)*(1-${p})` },
+    "pan-down": { z: zoomed, x: center.x, y: `(ih-ih/zoom)*${p}` },
+    none: { z: "1", x: "0", y: "0" },
+  };
+  const move = moves[motion];
+  if (!move) throw new Error(`Unknown motion "${motion}". Motions: ${MOTIONS.join(", ")}`);
+  // Work at 4x size so the slow movement is smooth (no 1-pixel jumps).
+  const big = `scale=${width * 4}:${height * 4}:force_original_aspect_ratio=increase,crop=${width * 4}:${height * 4},setsar=1`;
+  const zoompan = `zoompan=z='${move.z}':x='${move.x}':y='${move.y}':d=${frames}:s=${width}x${height}:fps=${fps}`;
+  ffmpeg(["-i", input, "-vf", `${big},${zoompan},format=yuv420p`, "-frames:v", String(frames), "-c:v", "libx264", "-crf", "18", output]);
+  return { frames };
+}
+
 // Change format based on the output file extension (e.g. .png -> .jpg).
 export function convert(input: string, output: string, quality?: number): void {
   const options = quality ? ["-quality", String(quality)] : [];
@@ -169,6 +204,20 @@ export const commands: Record<string, Command> = {
         optionalNumberFlag(a, "size", 32),
         a.flags.color ?? "white",
       );
+    },
+  },
+  animate: {
+    usage: `animate <picture> <output.mp4> [--duration 5] [--motion ${MOTIONS.join("|")}] [--amount 0.15] [--width 1920] [--height 1080] [--fps 30]`,
+    run: (a) => {
+      const { input, output } = inOut(a);
+      return animate(input, output, {
+        duration: optionalNumberFlag(a, "duration", 5),
+        motion: a.flags.motion ?? "zoom-in",
+        amount: optionalNumberFlag(a, "amount", 0.15),
+        width: optionalNumberFlag(a, "width", 1920),
+        height: optionalNumberFlag(a, "height", 1080),
+        fps: optionalNumberFlag(a, "fps", 30),
+      });
     },
   },
   // Looks and effects are shared with video.ts (ffmpeg works on single pictures too).

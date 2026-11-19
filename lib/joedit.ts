@@ -1,5 +1,5 @@
 // joEdit: one entry point for every tool.
-// Usage: node joedit.ts <area> <command> ...   (areas: picture, video, sound, look, listen, graphics)
+// Usage: node joedit.ts <area> <command> ...   (areas: picture, video, sound, look, listen, graphics, movie)
 //        node joedit.ts doctor | check <file> | packs | install <pack or asset>
 //        node joedit.ts            (lists every command)
 // This file also holds the top-level commands: doctor and check.
@@ -22,6 +22,7 @@ import {
 import * as graphics from "./graphics.ts";
 import * as listen from "./listen.ts";
 import * as look from "./look.ts";
+import * as movie from "./movie.ts";
 import * as picture from "./picture.ts";
 import * as sound from "./sound.ts";
 import * as video from "./video.ts";
@@ -34,6 +35,7 @@ const areas: Record<string, Record<string, Command>> = {
   look: look.commands,
   listen: listen.commands,
   graphics: graphics.commands,
+  movie: movie.commands,
 };
 
 // ---------- doctor: is this computer ready? ----------
