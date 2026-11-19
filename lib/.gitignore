@@ -1,5 +1,6 @@
 node_modules/
 .packs/
 .assets/
+.models/
 .joedit-cache/
 __pycache__/

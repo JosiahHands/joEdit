@@ -16,10 +16,10 @@ import {
   requireFile,
   round,
   runCli,
+  videoEncoder,
   withTempDir,
   type Command,
 } from "./shared.ts";
-import { encoderArgs } from "./graphics.ts";
 
 // Blender: on the PATH, or in the usual app folder on macOS / Windows.
 export function findBlender(): string {
@@ -93,7 +93,7 @@ export function render(script: string, output: string, options: RenderOptions = 
     } else {
       const count = readdirSync(frameFolder).filter((name) => name.endsWith(".png")).length;
       if (count === 0) throw new Error("Blender rendered no frames.");
-      ffmpeg(["-framerate", String(fps), "-start_number", "1", "-i", join(frameFolder, "%04d.png"), ...encoderArgs(output, options.transparent ?? false), output]);
+      ffmpeg(["-framerate", String(fps), "-start_number", "1", "-i", join(frameFolder, "%04d.png"), ...videoEncoder(output, { transparent: options.transparent }), output]);
     }
     return { width, height, frames: still ? 1 : frames, engine, samples, draft, seconds: round((Date.now() - started) / 1000, 1) };
   });

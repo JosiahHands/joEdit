@@ -7,6 +7,7 @@ import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   DEFAULT_FONT,
+  FFMPEG,
   analyze,
   ffmpeg,
   formatTime,
@@ -123,7 +124,7 @@ const WINDOW = 256; // samples in each loudness measurement
 function samples(input: string): Float32Array {
   requireFile(input);
   const bytes = execFileSync(
-    "ffmpeg",
+    FFMPEG,
     ["-hide_banner", "-loglevel", "error", "-i", input, "-ac", "1", "-ar", String(RATE), "-f", "f32le", "-"],
     { maxBuffer: 1024 * 1024 * 1024 },
   );

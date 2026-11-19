@@ -10,6 +10,7 @@ import { basename, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import {
   ASSETS,
+  FFMPEG,
   FONT_FAMILIES,
   hasProgram,
   inOut,
@@ -21,6 +22,7 @@ import {
   run,
   runCli,
   stringFlag,
+  videoEncoder,
   type Args,
   type Brand,
   type Command,
@@ -220,15 +222,6 @@ export async function withPage<T>(file: string, options: PageOptions, work: (pag
 
 // ---------- Rendering ----------
 
-// ffmpeg settings for the output type. Transparent video needs .mov or .webm.
-export function encoderArgs(output: string, transparent: boolean): string[] {
-  const type = output.toLowerCase().split(".").pop();
-  if (type === "mov") return transparent ? ["-c:v", "prores_ks", "-profile:v", "4444", "-pix_fmt", "yuva444p10le"] : ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18"];
-  if (type === "webm") return ["-c:v", "libvpx-vp9", "-b:v", "0", "-crf", "30", "-pix_fmt", transparent ? "yuva420p" : "yuv420p"];
-  if (type === "gif") return ["-filter_complex", "split[a][b];[a]palettegen[p];[b][p]paletteuse"];
-  return ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18", "-preset", "medium"];
-}
-
 export type RenderOptions = {
   width?: number;
   height?: number;
@@ -257,14 +250,14 @@ export async function render(file: string, output: string, options: RenderOption
   const format = transparent ? "png" : "jpeg";
   const soundArgs = options.audio ? ["-i", options.audio, "-map", "0:v", "-map", "1:a", "-c:a", "aac", "-shortest"] : [];
   const encoder = spawn(
-    "ffmpeg",
+    FFMPEG,
     [
       "-hide_banner", "-loglevel", "error", "-y",
       "-f", "image2pipe", "-framerate", String(fps), "-c:v", format === "png" ? "png" : "mjpeg", "-i", "-",
       ...soundArgs,
       // Most video formats need an even width and height.
       ...(output.endsWith(".gif") ? [] : ["-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2"]),
-      ...encoderArgs(output, transparent),
+      ...videoEncoder(output, { transparent }),
       output,
     ],
     { stdio: ["pipe", "ignore", "pipe"] },

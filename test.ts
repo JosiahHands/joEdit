@@ -12,6 +12,7 @@ import * as video from "./lib/video.ts";
 import * as sound from "./lib/sound.ts";
 import * as graphics from "./lib/graphics.ts";
 import * as threeD from "./lib/3d.ts";
+import { FFMPEG, probe, readFrames, writeVideo } from "./lib/shared.ts";
 
 type Tool = "picture" | "video" | "sound" | "look" | "listen" | "graphics" | "movie" | "voice" | "music" | "3d" | "joedit";
 
@@ -75,7 +76,7 @@ function near(actual: number, expected: number, tolerance = 0.15): void {
 
 // Save the video frame at `time` seconds as a picture.
 function frameAt(path: string, time: number, output: string): void {
-  execFileSync("ffmpeg", ["-loglevel", "error", "-y", "-ss", String(time), "-i", path, "-frames:v", "1", output]);
+  execFileSync(FFMPEG, ["-loglevel", "error", "-y", "-ss", String(time), "-i", path, "-frames:v", "1", output]);
 }
 
 // How different the same region (e.g. "320x100+0+0") is in two pictures: 0 = same, 1 = opposite.
@@ -87,7 +88,7 @@ function regionDiff(a: string, b: string, region: string): number {
 // Average loudness in dB (closer to 0 = louder). `seconds` limits it to the start of the file.
 function loudness(path: string, seconds = 0): number {
   const limit = seconds ? ["-t", String(seconds)] : [];
-  const result = spawnSync("ffmpeg", ["-hide_banner", ...limit, "-i", path, "-af", "volumedetect", "-f", "null", "-"], { encoding: "utf8" });
+  const result = spawnSync(FFMPEG, ["-hide_banner", ...limit, "-i", path, "-af", "volumedetect", "-f", "null", "-"], { encoding: "utf8" });
   const match = result.stderr.match(/mean_volume: (-?[\d.]+) dB/);
   assert.ok(match, `no loudness found for ${path}`);
   return Number(match[1]);
@@ -98,28 +99,28 @@ before(() => {
   // 400x300 red picture with a blue top-right corner (so flips can be checked).
   execFileSync("magick", ["-size", "400x300", "xc:red", "-fill", "blue", "-draw", "rectangle 200,0 399,149", file("in.png")]);
   // 3 second 320x240 video with sound.
-  execFileSync("ffmpeg", [
+  execFileSync(FFMPEG, [
     "-loglevel", "error", "-y",
     "-f", "lavfi", "-i", "testsrc=size=320x240:rate=30",
     "-f", "lavfi", "-i", "sine=frequency=440",
     "-t", "3", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", file("in.mp4"),
   ]);
   // 2 second 160x120 video with no sound.
-  execFileSync("ffmpeg", [
+  execFileSync(FFMPEG, [
     "-loglevel", "error", "-y",
     "-f", "lavfi", "-i", "testsrc2=size=160x120:rate=30",
     "-t", "2", "-c:v", "libx264", "-pix_fmt", "yuv420p", file("silent.mp4"),
   ]);
   // 5 second audio file.
-  execFileSync("ffmpeg", ["-loglevel", "error", "-y", "-f", "lavfi", "-i", "sine=frequency=220", "-t", "5", file("sound.mp3")]);
+  execFileSync(FFMPEG, ["-loglevel", "error", "-y", "-f", "lavfi", "-i", "sine=frequency=220", "-t", "5", file("sound.mp3")]);
   // 8 second click track at exactly 120 BPM (a click every 0.5s).
-  execFileSync("ffmpeg", [
+  execFileSync(FFMPEG, [
     "-loglevel", "error", "-y",
     "-f", "lavfi", "-i", "aevalsrc='0.8*sin(2*PI*1000*t)*lt(mod(t,0.5),0.03)':s=44100:d=8",
     file("click120.wav"),
   ]);
   // 2s tone, 3s silence, 2s tone.
-  execFileSync("ffmpeg", [
+  execFileSync(FFMPEG, [
     "-loglevel", "error", "-y",
     "-f", "lavfi", "-i", "sine=frequency=440:duration=2",
     "-f", "lavfi", "-i", "anullsrc=r=44100:cl=mono",
@@ -128,7 +129,7 @@ before(() => {
     file("gap.wav"),
   ]);
   // 1.5s of black, then 3s of test picture, with sound.
-  execFileSync("ffmpeg", [
+  execFileSync(FFMPEG, [
     "-loglevel", "error", "-y",
     "-f", "lavfi", "-i", "color=black:s=320x240:d=1.5",
     "-f", "lavfi", "-i", "testsrc=size=320x240:d=3",
@@ -441,7 +442,7 @@ describe("video", () => {
 
   test("remove-silence cuts out the pause", () => {
     // 7s video whose sound is: 2s tone, 3s silence, 2s tone.
-    execFileSync("ffmpeg", ["-loglevel", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=320x240:rate=30", "-i", file("gap.wav"), "-t", "7", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", file("gap.mp4")]);
+    execFileSync(FFMPEG, ["-loglevel", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=320x240:rate=30", "-i", file("gap.wav"), "-t", "7", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", file("gap.mp4")]);
     const result = JSON.parse(ok("video", ["remove-silence", file("gap.mp4"), file("tight.mp4"), "--min", "1"]));
     assert.equal(result.cuts, 1);
     // 2s + 2s of tone, plus 0.1s of pause kept on each side.
@@ -460,7 +461,7 @@ describe("video", () => {
     if (!hasPack("cutout")) return t.skip("cutout pack not installed");
     // A red ball moving from the left to the right of a wide video.
     execFileSync("magick", ["-size", "100x100", "xc:none", "-fill", "red", "-draw", "circle 50,50 50,5", file("ball-small.png")]);
-    execFileSync("ffmpeg", [
+    execFileSync(FFMPEG, [
       "-loglevel", "error", "-y", "-f", "lavfi", "-i", "color=c=0xDDDDDD:s=640x360:r=30:d=3", "-i", file("ball-small.png"),
       "-filter_complex", "[0][1]overlay=x='20+t*170':y=130,format=yuv420p", file("moving.mp4"),
     ]);
@@ -653,7 +654,7 @@ describe("voice", () => {
     if (!hasPack("stems")) return t.skip("stems pack not installed");
     // 6s of drums, with speech only from 2s to about 4.5s.
     execFileSync("say", ["-o", file("words.aiff"), "Separate my voice from these drums please."]);
-    execFileSync("ffmpeg", [
+    execFileSync(FFMPEG, [
       "-loglevel", "error", "-y",
       "-f", "lavfi", "-i", "aevalsrc='0.7*sin(2*PI*(50+80*exp(-mod(t,0.5)*30))*t)*exp(-mod(t,0.5)*10)':s=44100:d=6",
       "-i", file("words.aiff"),
@@ -813,7 +814,7 @@ describe("graphics", () => {
     ok("graphics", ["title", file("title.png"), "--text", "Hello joEdit", "--subtitle", "test", ...size]);
     assert.deepEqual(picture.info(file("title.png")), { width: 640, height: 360, format: "PNG" });
     ok("graphics", ["lower-third", file("lt.mov"), "--text", "Ada Lovelace", "--subtitle", "Engineer", "--duration", "1", ...size]);
-    const stream = JSON.parse(execFileSync("ffprobe", ["-v", "error", "-show_streams", "-of", "json", file("lt.mov")], { encoding: "utf8" })).streams[0];
+    const stream = probe(file("lt.mov")).streams[0];
     assert.match(stream.pix_fmt, /a/, `no alpha: ${stream.pix_fmt}`);
     ok("graphics", ["counter", file("counter.mp4"), "--to", "100", "--duration", "1", ...size]);
     near(video.info(file("counter.mp4")).duration, 1, 0.15);
@@ -960,7 +961,7 @@ describe("sound", () => {
       const result = JSON.parse(ok("sound", ["sfx", file(`sfx-${type}.wav`), "--type", type]));
       near(sound.info(file(`sfx-${type}.wav`)).duration, result.duration, 0.05);
       // Every effect is leveled so its loudest moment is -3 dB.
-      const log = spawnSync("ffmpeg", ["-hide_banner", "-i", file(`sfx-${type}.wav`), "-af", "volumedetect", "-f", "null", "-"], { encoding: "utf8" }).stderr;
+      const log = spawnSync(FFMPEG, ["-hide_banner", "-i", file(`sfx-${type}.wav`), "-af", "volumedetect", "-f", "null", "-"], { encoding: "utf8" }).stderr;
       const peak = Number(log.match(/max_volume: (-?[\d.]+) dB/)?.[1]);
       assert.ok(Math.abs(peak + 3) < 0.6, `${type} peaks at ${peak} dB`);
     }
@@ -972,18 +973,18 @@ describe("sound", () => {
   test("duck turns the music down while the voice speaks", () => {
     // Music: a 6s tone. Voice: a 2s tone from 2s to 4s.
     ok("sound", ["tone", file("duck-music.wav"), "--frequency", "220", "--duration", "6"]);
-    execFileSync("ffmpeg", ["-loglevel", "error", "-y", "-f", "lavfi", "-i", "sine=frequency=1000:duration=2", "-af", "adelay=2000|2000,apad=whole_dur=6", file("duck-voice.wav")]);
+    execFileSync(FFMPEG, ["-loglevel", "error", "-y", "-f", "lavfi", "-i", "sine=frequency=1000:duration=2", "-af", "adelay=2000|2000,apad=whole_dur=6", file("duck-voice.wav")]);
     ok("sound", ["duck", file("duck-music.wav"), file("duck-voice.wav"), file("ducked.wav"), "--amount", "12"]);
     // Measure just the music (low tone) before and during the voice.
     const music = (from: number) => {
-      const log = spawnSync("ffmpeg", ["-hide_banner", "-ss", String(from), "-t", "1", "-i", file("ducked.wav"), "-af", "lowpass=f=400,volumedetect", "-f", "null", "-"], { encoding: "utf8" }).stderr;
+      const log = spawnSync(FFMPEG, ["-hide_banner", "-ss", String(from), "-t", "1", "-i", file("ducked.wav"), "-af", "lowpass=f=400,volumedetect", "-f", "null", "-"], { encoding: "utf8" }).stderr;
       return Number(log.match(/mean_volume: (-?[\d.]+) dB/)?.[1]);
     };
     assert.ok(music(0.5) - music(2.7) > 6, `music before ${music(0.5)} dB, under voice ${music(2.7)} dB`);
   });
 
   test("denoise removes hiss and keeps the tone", () => {
-    execFileSync("ffmpeg", [
+    execFileSync(FFMPEG, [
       "-loglevel", "error", "-y",
       "-f", "lavfi", "-i", "anoisesrc=d=3:c=white:a=0.05",
       "-f", "lavfi", "-i", "sine=frequency=440:duration=3",
@@ -991,7 +992,7 @@ describe("sound", () => {
     ]);
     ok("sound", ["denoise", file("hiss.wav"), file("no-hiss.wav")]);
     const band = (path: string, filter: string) => {
-      const log = spawnSync("ffmpeg", ["-hide_banner", "-i", path, "-af", `${filter},volumedetect`, "-f", "null", "-"], { encoding: "utf8" }).stderr;
+      const log = spawnSync(FFMPEG, ["-hide_banner", "-i", path, "-af", `${filter},volumedetect`, "-f", "null", "-"], { encoding: "utf8" }).stderr;
       return Number(log.match(/mean_volume: (-?[\d.]+) dB/)?.[1]);
     };
     assert.ok(band(file("hiss.wav"), "highpass=f=2000") - band(file("no-hiss.wav"), "highpass=f=2000") > 6, "hiss not reduced");
@@ -1070,7 +1071,7 @@ describe("look", () => {
     if (!hasPack("vision")) return t.skip("vision pack not installed");
     // 2s of blue sky color, 2s of a red ball on white, 2s of green: the ball is at 2-4s.
     execFileSync("magick", ["-size", "320x240", "xc:white", "-fill", "red", "-draw", "circle 160,120 160,40", file("ball.png")]);
-    execFileSync("ffmpeg", [
+    execFileSync(FFMPEG, [
       "-loglevel", "error", "-y",
       "-f", "lavfi", "-i", "color=c=0x3B82F6:s=320x240:r=30:d=2",
       "-loop", "1", "-t", "2", "-r", "30", "-i", file("ball.png"),
@@ -1135,6 +1136,37 @@ describe("listen", () => {
     const result = JSON.parse(ok("listen", ["transcribe", file("speech.aiff"), file("speech.json"), "--model", "tiny"]));
     assert.match(result.text.toLowerCase(), /hello/);
     assert.ok(result.words >= 5);
+  });
+});
+
+describe("engine", () => {
+  test("joEdit uses its own full ffmpeg (no system install needed)", () => {
+    assert.match(FFMPEG, /node-av-ffmpeg/);
+    const filters = execFileSync(FFMPEG, ["-hide_banner", "-filters"], { encoding: "utf8" });
+    for (const name of ["drawtext", "subtitles", "lut3d", "xfade", "ebur128"]) assert.match(filters, new RegExp(` ${name} `));
+  });
+
+  test("probe reads streams and shows rotated phone video upright", () => {
+    execFileSync(FFMPEG, ["-loglevel", "error", "-y", "-display_rotation", "90", "-i", file("in.mp4"), "-c", "copy", file("rotated.mp4")]);
+    const streams = probe(file("rotated.mp4")).streams;
+    const picture = streams.find((s) => s.codec_type === "video");
+    assert.deepEqual([picture.width, picture.height, picture.rotation, picture.codec_name], [240, 320, 90, "h264"]);
+    assert.equal(streams.find((s) => s.codec_type === "audio").codec_name, "aac");
+    near(Number(probe(file("in.mp4")).format.duration), 3);
+  });
+
+  test("frames go out of and back into a video", async () => {
+    const out = writeVideo(file("frames.mp4"), { width: 64, height: 32, fps: 10 });
+    for (let i = 0; i < 10; i++) await out.write(Buffer.alloc(64 * 32 * 4, i < 5 ? 0 : 255));
+    await out.finish();
+    near(video.info(file("frames.mp4")).duration, 1);
+    const frames: number[] = [];
+    for await (const frame of readFrames(file("frames.mp4"), { width: 32 })) {
+      assert.equal(frame.pixels.length, 32 * 16 * 4);
+      frames.push(frame.pixels[0]);
+    }
+    assert.equal(frames.length, 10);
+    assert.ok(frames[0] < 30 && frames[9] > 225, `first ${frames[0]}, last ${frames[9]}`);
   });
 });
 

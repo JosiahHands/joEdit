@@ -4,9 +4,11 @@
 //        node joedit.ts            (lists every command)
 // This file also holds the top-level commands: doctor and check.
 import { cpus, totalmem } from "node:os";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import {
   DEFAULT_FONT,
+  LIB,
   analyze,
   closest,
   formatTime,
@@ -74,7 +76,30 @@ function chrome(): Tool {
   }
 }
 
+// joEdit's engine: npm libraries that `npm install` puts in node_modules.
+const LIBRARIES = [
+  { name: "node-av", does: "reads media files; its FFmpeg 8 (@seydx/node-av-ffmpeg) encodes and decodes everything" },
+  { name: "@seydx/node-av-ffmpeg", does: "the full FFmpeg 8 program (x264, x265, hardware encoders, libass, whisper)" },
+  { name: "sharp", does: "fast picture editing (libvips)" },
+  { name: "@napi-rs/canvas", does: "Skia drawing: text, titles, captions, motion graphics" },
+  { name: "node-web-audio-api", does: "sound mixing, effects and synthesis (Web Audio)" },
+  { name: "@huggingface/transformers", does: "local AI models: speech to text, depth, search by meaning" },
+  { name: "onnxruntime-node", does: "runs AI models (cutout and more)" },
+  { name: "kokoro-js", does: "natural voices" },
+  { name: "koffi", does: "loads raylib for GPU effects, transitions and shaders" },
+];
+
+// Is an npm library installed, and which version?
+function library(name: string): { name: string; found: boolean; version?: string; does: string } {
+  const does = LIBRARIES.find((l) => l.name === name)!.does;
+  const file = join(LIB, "node_modules", name, "package.json");
+  if (!existsSync(file)) return { name, found: false, does };
+  return { name, found: true, version: JSON.parse(readFileSync(file, "utf8")).version, does };
+}
+
 // Check everything joEdit needs and say exactly how to install what is missing.
+// Three groups: what joEdit needs (tools + libraries), downloads it makes on first use (assets, packs),
+// and optional outside programs that unlock extra areas. Agents install optional ones only when a task needs them.
 export function doctor() {
   const mac = process.platform === "darwin";
   const tool = (name: string, args: string[], neededFor: string, fix: string): Tool => {
@@ -83,6 +108,7 @@ export function doctor() {
   };
 
   const nodeMajor = Number(process.versions.node.split(".")[0]);
+  const libraries = LIBRARIES.map((l) => library(l.name));
   const tools: Tool[] = [
     {
       name: "node",
@@ -91,8 +117,7 @@ export function doctor() {
       neededFor: "everything",
       fix: nodeMajor >= 24 ? undefined : "install Node.js 24 or newer: https://nodejs.org",
     },
-    tool("ffmpeg", ["-version"], "video, sound, look, listen, check", mac ? "brew install ffmpeg" : "sudo apt install ffmpeg"),
-    tool("ffprobe", ["-version"], "video, sound, look, listen, check", mac ? "brew install ffmpeg" : "sudo apt install ffmpeg"),
+    tool("ffmpeg", ["-version"], "video, sound, look, listen, check", `cd ${LIB} && npm install`),
     tool("magick", ["-version"], "picture, look, text", mac ? "brew install imagemagick" : "install ImageMagick 7: https://imagemagick.org/script/download.php"),
     {
       name: "font",
@@ -102,15 +127,23 @@ export function doctor() {
       fix: existsSync(DEFAULT_FONT) ? undefined : "node joedit.ts install fonts",
     },
     chrome(),
-    { ...tool("uv", ["--version"], "AI packs", mac ? "brew install uv" : "curl -LsSf https://astral.sh/uv/install.sh | sh"), optional: true },
-    { ...tool("fluidsynth", ["--version"], "music compose", mac ? "brew install fluid-synth" : "sudo apt install fluidsynth"), optional: true },
-    { ...tool("blender", ["--version"], "3d", mac ? "brew install --cask blender" : "install Blender: https://www.blender.org/download/"), optional: true },
+  ];
+  // Outside programs that unlock extra areas. Install one only when a task needs it.
+  const optional: Tool[] = [
+    tool("blender", ["--version"], "3d (Blender scenes, 3D titles, turntables)", mac ? "brew install --cask blender" : "install Blender: https://www.blender.org/download/"),
+    tool("uv", ["--version"], "Python AI packs: song, image, clone, stems, videogen", mac ? "brew install uv" : "curl -LsSf https://astral.sh/uv/install.sh | sh"),
+    tool("fluidsynth", ["--version"], "music compose", mac ? "brew install fluid-synth" : "sudo apt install fluidsynth"),
   ];
 
-  const ready = tools.filter((t) => !t.optional).every((t) => t.found);
+  const missingLibraries = libraries.filter((l) => !l.found);
+  const ready = tools.every((t) => t.found) && missingLibraries.length === 0;
   return {
     ready,
     tools,
+    libraries: missingLibraries.length
+      ? { found: false, missing: missingLibraries.map((l) => l.name), fix: `cd ${LIB} && npm install` }
+      : { found: true, list: libraries.map((l) => `${l.name} ${l.version}: ${l.does}`) },
+    optional,
     machine: {
       system: `${process.platform} ${process.arch}`,
       cpu: cpus()[0]?.model ?? "unknown",
@@ -121,9 +154,8 @@ export function doctor() {
     packs: listPacks(),
     assets: listAssets(),
     next: [
-      ready ? "Everything needed is installed. Read AGENTS.md to start." : "Install the missing tools (see 'fix'), then run doctor again.",
-      "Optional tools (marked optional) unlock more areas, e.g. Blender for 3d.",
-      "AI packs and assets that are not installed yet: node joedit.ts install <name> (each lists what it is for).",
+      ready ? "Everything needed is installed. Read AGENTS.md to start." : "Install what is missing (see each 'fix'), then run doctor again.",
+      "Optional programs, packs and assets unlock extra features: install one only when a task needs it (node joedit.ts install <name> for packs and assets).",
     ].join(" "),
   };
 }

@@ -1,14 +1,53 @@
 // Shared helpers used by every joEdit module: running programs, reading arguments, the CLI,
-// packs (local AI tools), assets (downloaded fonts and tools) and the brand kit.
+// the native libraries (in node_modules), packs (local AI tools), assets (downloaded fonts and tools) and the brand kit.
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-// The folder joEdit lives in, and where downloaded assets go.
+// The folder joEdit lives in, where downloaded assets go, and where AI models are kept.
 export const LIB = dirname(fileURLToPath(import.meta.url));
 export const ASSETS = join(LIB, ".assets");
+export const MODELS = join(LIB, ".models");
+
+// ---------- Native libraries ----------
+// joEdit's engine is a set of npm libraries installed into node_modules by `npm install`:
+// node-av (FFmpeg), sharp (pictures), @napi-rs/canvas (Skia drawing), node-web-audio-api (sound),
+// @huggingface/transformers + onnxruntime-node (AI models), kokoro-js (voices) and koffi (loads raylib for GPU effects).
+// They are loaded only when a command needs them, so a missing one only breaks its own commands.
+const require = createRequire(import.meta.url);
+
+// Load a library by name, with a clear message if it is missing.
+export async function need<T = any>(name: string): Promise<T> {
+  try {
+    return await import(name);
+  } catch (error: any) {
+    if (error.code === "ERR_MODULE_NOT_FOUND") throw new Error(`The "${name}" library is missing. Run: cd ${LIB} && npm install`);
+    throw error;
+  }
+}
+
+// The same for code that cannot wait (Node 24 can require ES modules).
+export function needNow<T = any>(name: string): T {
+  try {
+    return require(name);
+  } catch (error: any) {
+    if (error.code === "MODULE_NOT_FOUND") throw new Error(`The "${name}" library is missing. Run: cd ${LIB} && npm install`);
+    throw error;
+  }
+}
+
+// The ffmpeg program: the full build that comes with joEdit (FFmpeg 8 with x264/x265, VideoToolbox/NVENC,
+// libass, drawtext and whisper), or else one installed on this computer.
+export const FFMPEG: string = (() => {
+  try {
+    return require("node-av/ffmpeg").ffmpegPath();
+  } catch {
+    return "ffmpeg";
+  }
+})();
 
 // Font file used when ImageMagick draws text: a system font if there is one, else a downloaded one.
 export const DEFAULT_FONT =
@@ -34,11 +73,11 @@ export type Command = {
   run: (args: Args) => Result | void | Promise<Result | void>;
 };
 
-// Run a program (ffmpeg, ffprobe, magick, uv) and return its stdout.
+// Run a program (ffmpeg, uv, blender ...) and return its stdout. "ffmpeg" means joEdit's own ffmpeg.
 // Throws an Error containing stderr if the program fails.
 export function run(program: string, args: string[], env?: Record<string, string>): string {
   try {
-    return execFileSync(program, args, {
+    return execFileSync(program === "ffmpeg" ? FFMPEG : program, args, {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
       maxBuffer: 256 * 1024 * 1024, // transcripts and analysis output can be large
@@ -64,7 +103,7 @@ export function ffmpeg(args: string[]): void {
 // The same, without waiting: other work (more scenes, Chrome renders) keeps going while ffmpeg runs.
 export function ffmpegAsync(args: string[]): Promise<void> {
   return new Promise((done, fail) => {
-    const child = spawn("ffmpeg", ["-hide_banner", "-loglevel", "error", "-y", ...args], { stdio: ["ignore", "ignore", "pipe"] });
+    const child = spawn(FFMPEG, ["-hide_banner", "-loglevel", "error", "-y", ...args], { stdio: ["ignore", "ignore", "pipe"] });
     let errors = "";
     child.stderr.on("data", (chunk) => (errors += chunk));
     child.on("error", (error: any) => fail(error.code === "ENOENT" ? new Error('"ffmpeg" is not installed. Run: node joedit.ts doctor') : error));
@@ -78,7 +117,7 @@ export function ffmpegAsync(args: string[]): Promise<void> {
 export function analyze(input: string, kind: "video" | "audio", filter: string): string {
   requireFile(input);
   const option = kind === "video" ? "-vf" : "-af";
-  const result = spawnSync("ffmpeg", ["-hide_banner", "-nostats", "-i", input, option, filter, "-f", "null", "-"], {
+  const result = spawnSync(FFMPEG, ["-hide_banner", "-nostats", "-i", input, option, filter, "-f", "null", "-"], {
     encoding: "utf8",
     maxBuffer: 256 * 1024 * 1024,
   });
@@ -116,10 +155,126 @@ export function round(value: number, decimals = 2): number {
   return Math.round(value * factor) / factor;
 }
 
-// Read a media file's streams and format with ffprobe.
+// Read a media file's streams and format, in the same shape ffprobe prints (read in-process by node-av).
+// Width and height are as shown: a phone video recorded upright (rotated 90°) reports a tall size.
 export function probe(input: string): { streams: any[]; format: any } {
   requireFile(input);
-  return JSON.parse(run("ffprobe", ["-v", "error", "-print_format", "json", "-show_format", "-show_streams", input]));
+  const av = needNow("node-av");
+  let demuxer: any;
+  try {
+    demuxer = av.Demuxer.openSync(input);
+  } catch (error: any) {
+    throw new Error(`Cannot read "${input}" as a picture, video or sound (${error.message}).`);
+  }
+  try {
+    const streams = demuxer.streams.map((stream: any) => {
+      const p = stream.codecpar;
+      const rate = stream.rFrameRate ?? { num: 0, den: 1 };
+      // Rotation is stored as a 3x3 matrix; the first two numbers give the angle.
+      const matrix = p.getCodedSideData?.(av.AV_PKT_DATA_DISPLAYMATRIX);
+      const rotation = matrix ? Math.round((-Math.atan2(matrix.readInt32LE(4), matrix.readInt32LE(0)) * 180) / Math.PI) : 0;
+      const sideways = Math.abs(rotation) % 180 === 90;
+      return {
+        index: stream.index,
+        codec_type: av.avGetMediaTypeString(p.codecType),
+        codec_name: av.avGetCodecName(p.codecId),
+        pix_fmt: p.codecType === av.AVMEDIA_TYPE_VIDEO ? av.avGetPixFmtName(p.format) : undefined,
+        width: sideways ? p.height : p.width,
+        height: sideways ? p.width : p.height,
+        rotation,
+        r_frame_rate: `${rate.num}/${rate.den}`,
+        sample_rate: p.sampleRate ? String(p.sampleRate) : undefined,
+        channels: p.channels ?? p.channelLayout?.nbChannels,
+        disposition: { attached_pic: stream.disposition & av.AV_DISPOSITION_ATTACHED_PIC ? 1 : 0 },
+      };
+    });
+    const duration = Number(demuxer.duration);
+    return { streams, format: { duration: duration > 0 ? duration : undefined, format_name: demuxer.formatName } };
+  } finally {
+    demuxer.closeSync();
+  }
+}
+
+// ---------- Frames: raw pixels in and out ----------
+// Native drawing (Skia), GPU effects (raylib) and AI models work on raw RGBA pixels:
+// 4 bytes per pixel (red, green, blue, alpha), row after row. ffmpeg turns video into those and back.
+
+export type Frame = { time: number; pixels: Buffer; width: number; height: number };
+
+// Read a video's frames as RGBA pixels, one at a time (memory stays small for long videos).
+// fps: take this many frames per second (default: every frame). width: scale down to this width.
+export async function* readFrames(input: string, options: { fps?: number; width?: number; start?: number; duration?: number } = {}): AsyncGenerator<Frame> {
+  const video = probe(input).streams.find((s) => s.codec_type === "video");
+  if (!video) throw new Error(`"${input}" has no picture.`);
+  const width = options.width ? Math.round(options.width / 2) * 2 : video.width;
+  const height = options.width ? Math.round((video.height * width) / video.width / 2) * 2 : video.height;
+  const [num, den] = video.r_frame_rate.split("/").map(Number);
+  const fps = options.fps ?? (den ? num / den : 30);
+  const filters = [...(options.fps ? [`fps=${options.fps}`] : []), `scale=${width}:${height}`, "format=rgba"];
+  const child = spawn(FFMPEG, [
+    "-hide_banner", "-loglevel", "error",
+    ...(options.start ? ["-ss", String(options.start)] : []), "-i", input,
+    ...(options.duration ? ["-t", String(options.duration)] : []),
+    "-vf", filters.join(","), "-f", "rawvideo", "-",
+  ], { stdio: ["ignore", "pipe", "pipe"] });
+  let errors = "";
+  child.stderr.on("data", (chunk) => (errors += chunk));
+  const closed = new Promise<number>((done) => child.on("close", (code) => done(code ?? 1)));
+  const size = width * height * 4;
+  let waiting: Buffer[] = [];
+  let buffered = 0;
+  let index = 0;
+  for await (const chunk of child.stdout) {
+    waiting.push(chunk);
+    buffered += chunk.length;
+    while (buffered >= size) {
+      const all = Buffer.concat(waiting);
+      yield { time: (options.start ?? 0) + index / fps, pixels: all.subarray(0, size), width, height };
+      index++;
+      waiting = [all.subarray(size)];
+      buffered -= size;
+    }
+  }
+  if ((await closed) !== 0) throw new Error(`ffmpeg failed: ${errors.trim()}`);
+}
+
+// Write RGBA frames into a video. Returns a writer: await write(pixels) for every frame, then await finish().
+// audio: a sound file to mux in. The encoder settings come from the output's extension (see videoEncoder).
+export function writeVideo(output: string, options: { width: number; height: number; fps: number; audio?: string; transparent?: boolean; draft?: boolean }) {
+  const { width, height, fps } = options;
+  const child = spawn(FFMPEG, [
+    "-hide_banner", "-loglevel", "error", "-y",
+    "-f", "rawvideo", "-pix_fmt", "rgba", "-s", `${width}x${height}`, "-r", String(fps), "-i", "-",
+    ...(options.audio ? ["-i", options.audio, "-map", "0:v", "-map", "1:a", "-c:a", "aac", "-b:a", "192k", "-shortest"] : []),
+    ...videoEncoder(output, { transparent: options.transparent, draft: options.draft }),
+    output,
+  ], { stdio: ["pipe", "ignore", "pipe"] });
+  let errors = "";
+  child.stderr.on("data", (chunk) => (errors += chunk));
+  const closed = new Promise<number>((done) => child.on("close", (code) => done(code ?? 1)));
+  child.stdin.on("error", () => {}); // a failed encoder is reported by finish()
+  return {
+    async write(pixels: Buffer | Uint8Array | Uint8ClampedArray): Promise<void> {
+      if (!child.stdin.write(pixels)) await new Promise((done) => child.stdin.once("drain", done));
+    },
+    async finish(): Promise<void> {
+      child.stdin.end();
+      if ((await closed) !== 0) throw new Error(`ffmpeg failed: ${errors.trim()}`);
+    },
+  };
+}
+
+// Encoder settings for an output file. Transparent .mov is ProRes 4444, transparent .webm is VP9 with alpha;
+// .gif makes its own palette; everything else is H.264 (draft: fast and small; else high quality).
+export function videoEncoder(output: string, options: { transparent?: boolean; draft?: boolean } = {}): string[] {
+  const type = output.split(".").pop()?.toLowerCase();
+  if (type === "gif") return ["-vf", "split[a][b];[a]palettegen[p];[b][p]paletteuse", "-loop", "0"];
+  if (type === "mov" && options.transparent) return ["-c:v", "prores_ks", "-profile:v", "4444", "-pix_fmt", "yuva444p10le"];
+  if (type === "webm") return ["-c:v", "libvpx-vp9", "-b:v", "0", "-crf", "30", "-pix_fmt", options.transparent ? "yuva420p" : "yuv420p"];
+  if (type === "png") return ["-frames:v", "1"];
+  const h264 = ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", options.draft ? "ultrafast" : "medium", "-crf", options.draft ? "28" : "18"];
+  // faststart lets a video start playing on the web before it has fully downloaded.
+  return type === "mp4" || type === "m4v" || type === "mov" ? [...h264, "-movflags", "+faststart"] : h264;
 }
 
 // Turn ["a.png", "--width", "100"] into { positional: ["a.png"], flags: { width: "100" } }.
