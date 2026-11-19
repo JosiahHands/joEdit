@@ -4,6 +4,7 @@
 import argparse
 import json
 import os
+import sys
 import warnings
 
 warnings.filterwarnings("ignore")
@@ -12,6 +13,12 @@ os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")  # run any missing App
 import soundfile as sf
 import torch
 from demucs.api import Separator
+
+# `node joedit.ts install stems` runs this once to add the model; after that every run is offline.
+if "--download" in sys.argv:
+    Separator(model="htdemucs", device="cpu")  # loading the model fetches it into joEdit's pack folder
+    print(json.dumps({"downloaded": "htdemucs"}))
+    sys.exit(0)
 
 parser = argparse.ArgumentParser()
 parser.add_argument("input")

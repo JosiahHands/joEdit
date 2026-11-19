@@ -11,6 +11,16 @@ import warnings
 
 warnings.filterwarnings("ignore")
 
+MODEL = "Wan-AI/Wan2.2-TI2V-5B-Diffusers"
+
+# `node joedit.ts install videogen` runs this once to add the model; after that every run is offline.
+if "--download" in sys.argv:
+    from huggingface_hub import snapshot_download
+
+    snapshot_download(MODEL)
+    print(json.dumps({"downloaded": MODEL}))
+    sys.exit(0)
+
 parser = argparse.ArgumentParser()
 parser.add_argument("folder")
 parser.add_argument("--prompt", required=True)
@@ -30,7 +40,6 @@ import torch
 from diffusers import AutoencoderKLWan, WanImageToVideoPipeline, WanPipeline
 from PIL import Image
 
-MODEL = "Wan-AI/Wan2.2-TI2V-5B-Diffusers"
 FPS = 24
 seed = args.seed if args.seed >= 0 else random.randint(0, 2**31 - 1)
 # The model works in blocks of 32 pixels, and with 4n + 1 frames.

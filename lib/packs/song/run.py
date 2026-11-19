@@ -11,8 +11,10 @@ import warnings
 warnings.filterwarnings("ignore")
 
 parser = argparse.ArgumentParser()
-parser.add_argument("folder")
-parser.add_argument("--prompt", required=True)
+parser.add_argument("folder", nargs="?")
+parser.add_argument("--prompt", default="")
+# `node joedit.ts install song` runs this once with --download: loading the models adds them; after that every run is offline.
+parser.add_argument("--download", action="store_true")
 parser.add_argument("--lyrics", default="")
 parser.add_argument("--duration", type=float, default=30)
 parser.add_argument("--bpm", type=int, default=None)
@@ -52,6 +54,12 @@ status, ok = llm.initialize(
 )
 if not ok:
     raise SystemExit(f"ACE-Step language model failed to load: {status}")
+if args.download:
+    sys.stdout = real_stdout
+    print(json.dumps({"downloaded": "ACE-Step 1.5"}))
+    sys.exit(0)
+if not args.folder or not args.prompt:
+    raise SystemExit("Give a work folder and --prompt.")
 
 lyrics = args.lyrics.strip()
 params = GenerationParams(

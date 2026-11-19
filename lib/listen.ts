@@ -3,7 +3,7 @@
 // CLI:     node joedit.ts listen <command> ...
 // Library: import { beats } from "./joEdit/listen.ts"
 import { execFileSync } from "node:child_process";
-import { writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   FFMPEG,
@@ -14,6 +14,7 @@ import {
   ffmpeg,
   formatTime,
   inOut,
+  numberFlag,
   optionalNumberFlag,
   requireFile,
   round,
@@ -265,6 +266,81 @@ async function detectLanguage(transcriber: any, audio: Float32Array): Promise<st
   return best;
 }
 
+// Whisper's word times can be off by a tenth of a second or more, so they are lined up with the sound itself (16 kHz).
+// The real pauses are found (quiet for 40 ms or more); every gap between words is matched, in order, to the nearest
+// pause within 0.3 s, and the words around it are moved to the pause's edges. Gaps with no pause near (words that
+// run together) stay as Whisper heard them.
+// Pauses in speech (16 kHz numbers): [start, end] of every stretch quieter than -30 dB of the loudest moment for 40 ms or more.
+export function speechPauses(audio: Float32Array): [number, number][] {
+  const steps = Math.ceil(audio.length / 160); // 10 ms each
+  const level = new Float32Array(steps);
+  for (let f = 0; f < steps; f++) {
+    let sum = 0;
+    for (let i = f * 160; i < Math.min(audio.length, (f + 1) * 160); i++) sum += audio[i] * audio[i];
+    level[f] = Math.sqrt(sum / 160);
+  }
+  const quiet = level.reduce((a, b) => Math.max(a, b), 0) * 0.03;
+  const pauses: [number, number][] = [];
+  let from = -1;
+  for (let f = 0; f <= steps; f++) {
+    const silent = f < steps && level[f] <= quiet;
+    if (silent && from < 0) from = f;
+    if (!silent && from >= 0) {
+      if (f - from >= 4) pauses.push([from / 100, f / 100]);
+      from = -1;
+    }
+  }
+  return pauses;
+}
+
+function alignWords(words: Word[], audio: Float32Array): Word[] {
+  if (!words.length) return words;
+  // 1. The real pauses.
+  const pauses = speechPauses(audio);
+  const steps = Math.ceil(audio.length / 160);
+  const n = words.length;
+  const aligned = words.map((w) => ({ ...w }));
+  // 2. Speech starts where the silence at the start ends, and stops where the silence at the end starts.
+  const first = pauses.find(([start]) => start === 0);
+  if (first && Math.abs(first[1] - aligned[0].start) <= 0.3) aligned[0].start = first[1];
+  const last = pauses.findLast(([, end]) => end >= steps / 100 - 0.01);
+  if (last && Math.abs(last[0] - aligned[n - 1].end) <= 0.3) aligned[n - 1].end = last[0];
+  const inner = pauses.filter((p) => p !== first && p !== last);
+  // 3. Gap k is between word k-1 and word k. Distance: from the middle of Whisper's gap to the pause (0 if inside it).
+  const distance = (k: number, [start, end]: [number, number]) => {
+    const at = (words[k - 1].end + words[k].start) / 2;
+    return at < start ? start - at : at > end ? at - end : 0;
+  };
+  // Best matching in order (each pause used once): cost = how far each match is, plus 0.12 for a gap left unmatched.
+  // States: the last pause used -> [cost, matches so far]. Old states that can no longer differ are merged.
+  let states = new Map<number, { cost: number; matches: [number, number][] }>([[-1, { cost: 0, matches: [] }]]);
+  for (let k = 1; k < n; k++) {
+    const candidates = inner.map((p, j) => ({ j, d: distance(k, p) })).filter((c) => c.d <= 0.3);
+    const next = new Map<number, { cost: number; matches: [number, number][] }>();
+    const keep = (last: number, cost: number, matches: [number, number][]) => {
+      const old = next.get(last);
+      if (!old || cost < old.cost) next.set(last, { cost, matches });
+    };
+    for (const [last, state] of states) {
+      keep(last, state.cost + 0.12, state.matches);
+      for (const { j, d } of candidates) if (j > last) keep(j, state.cost + d, [...state.matches, [k, j]]);
+    }
+    // States whose last pause is before every candidate of the next gaps behave the same: keep only the cheapest.
+    const lowest = Math.min(...candidates.map((c) => c.j), Infinity);
+    let early: [number, { cost: number; matches: [number, number][] }] | undefined;
+    for (const entry of next) if (entry[0] < lowest && (!early || entry[1].cost < early[1].cost)) early = entry;
+    states = new Map([...next].filter(([last]) => last >= lowest));
+    if (early) states.set(early[0], early[1]);
+  }
+  const best = [...states.values()].sort((a, b) => a.cost - b.cost)[0];
+  // 4. Move the words on both sides of each matched pause onto its edges.
+  for (const [k, j] of best.matches) {
+    aligned[k - 1].end = inner[j][0];
+    aligned[k].start = inner[j][1];
+  }
+  return aligned.map((w) => ({ word: w.word, start: round(w.start), end: round(Math.max(w.start + 0.03, w.end)) }));
+}
+
 // Group words into sentences: a new one after . ? ! or a pause longer than 0.8 s.
 function sentences(words: Word[]): Transcript["segments"] {
   const segments: Transcript["segments"] = [];
@@ -287,7 +363,7 @@ export async function transcribe(input: string, output: string, model = "base", 
   const transcriber = await whisper(model);
   const spoken = language || (await detectLanguage(transcriber, audio));
   const result = await transcriber(audio, { return_timestamps: "word", chunk_length_s: 30, language: spoken, task: "transcribe" });
-  const words: Word[] = [];
+  let words: Word[] = [];
   for (const chunk of result.chunks ?? []) {
     const text: string = chunk.text;
     const start = round(chunk.timestamp[0] ?? 0);
@@ -300,10 +376,202 @@ export async function transcribe(input: string, output: string, model = "base", 
       last.end = end;
     } else words.push({ word: text.trim(), start, end });
   }
+  words = alignWords(words, audio);
   const transcript: Transcript = { language: spoken, text: words.map((w) => w.word).join(" "), words, segments: sentences(words) };
   writeFileSync(output, JSON.stringify(transcript, null, 2));
   const preview = transcript.text.length > 200 ? `${transcript.text.slice(0, 200)}...` : transcript.text;
   return { language: transcript.language, words: transcript.words.length, text: preview };
+}
+
+// ---------- Search sounds by meaning (CLAP) ----------
+// Sounds and descriptions become vectors; a sound and a description that mean the same thing point the same way.
+
+function soundModel(): Promise<any> {
+  requireModel("sounds");
+  const library = transformers();
+  const repo = AI_MODELS.sounds.repo;
+  return loadModel("sounds", async () => ({
+    features: await library.ClapFeatureExtractor.from_pretrained(repo),
+    tokenizer: await library.AutoTokenizer.from_pretrained(repo),
+    sounds: await library.ClapAudioModelWithProjection.from_pretrained(repo, { dtype: "fp32" }),
+    words: await library.ClapTextModelWithProjection.from_pretrained(repo, { dtype: "q8" }),
+  }));
+}
+
+function unit(vector: Float32Array): Float32Array {
+  const length = Math.sqrt(vector.reduce((sum, v) => sum + v * v, 0)) || 1;
+  return vector.map((v) => v / length);
+}
+
+// A vector for every `window` seconds of sound (48 kHz numbers), stepping by half a window.
+// Near-silent windows get no vector: silence looks like anything to CLAP.
+export async function soundVectors(audio: Float32Array, window = 4): Promise<{ start: number; end: number; vector: Float32Array }[]> {
+  const model = await soundModel();
+  const size = Math.min(window * 48000, audio.length);
+  const starts: number[] = [];
+  for (let from = 0; from + size < audio.length; from += size / 2) starts.push(Math.round(from));
+  starts.push(audio.length - size); // the last window ends exactly at the end
+  const loudness = (from: number) => {
+    let sum = 0;
+    for (let i = from; i < from + size; i++) sum += audio[i] * audio[i];
+    return Math.sqrt(sum / size);
+  };
+  const loudest = Math.max(...starts.map(loudness));
+  const result: { start: number; end: number; vector: Float32Array }[] = [];
+  for (const from of starts) {
+    if (loudness(from) < loudest * 0.03) continue; // 30 dB quieter than the loudest part
+    const { audio_embeds } = await model.sounds(await model.features(audio.subarray(from, from + size)));
+    result.push({ start: round(from / 48000), end: round((from + size) / 48000), vector: unit(audio_embeds.data) });
+  }
+  return result;
+}
+
+// The vector of a description of a sound.
+export async function soundWordsVector(text: string): Promise<Float32Array> {
+  const model = await soundModel();
+  const { text_embeds } = await model.words(model.tokenizer([text], { padding: true, truncation: true }));
+  return unit(text_embeds.data);
+}
+
+// Find the moments that sound like a description. Short sound labels work best: "speech", "dog barking",
+// "applause", "explosion", "laughter", "music", "bell". Scores: about 0.3 or more is a clear match, under 0.1 is not there.
+export async function find(input: string, query: string, options: { top?: number; window?: number } = {}) {
+  if (!query.trim()) throw new Error('Describe the sound with --query, e.g. --query "dog barking".');
+  const { top = 5, window = 4 } = options;
+  const pieces = await soundVectors(monoSamples(input, 48000), window);
+  const words = await soundWordsVector(query);
+  const scored = pieces.map((p, n) => ({ ...p, n, score: p.vector.reduce((sum, v, i) => sum + v * words[i], 0) }));
+  // Best first; a match grows over the neighbouring windows that also match well. Overlapping matches are skipped.
+  const matches: { start: number; end: number; score: number }[] = [];
+  const taken = (w: { start: number; end: number }) => matches.some((m) => w.start < m.end && w.end > m.start);
+  for (const piece of [...scored].sort((a, b) => b.score - a.score)) {
+    if (matches.length === top) break;
+    if (taken(piece)) continue;
+    let first = piece.n;
+    let last = piece.n;
+    // (a neighbour only counts when it touches in time, since silent windows were skipped, and is not in another match)
+    const grows = (from: number, to: number) =>
+      scored[to] && scored[to].start < scored[from].end && scored[to].end > scored[from].start &&
+      scored[to].score >= piece.score * 0.85 && !taken(scored[to]);
+    while (grows(first, first - 1)) first--;
+    while (grows(last, last + 1)) last++;
+    matches.push({ start: scored[first].start, end: scored[last].end, score: round(piece.score, 3) });
+  }
+  return { query, searched: pieces.length, matches };
+}
+
+// Everyday sounds that soundTags names.
+export const SOUND_LABELS = [
+  "speech", "music", "singing", "laughter", "applause", "crowd", "dog barking", "birds", "car engine", "siren",
+  "wind", "rain", "water", "explosion", "gunshot", "footsteps", "door knock", "bell", "phone ringing", "typing",
+];
+
+// What can be heard when: the best-fitting SOUND_LABELS name for every few seconds, joined into moments.
+export async function soundTags(input: string, window = 4): Promise<{ label: string; moments: [number, number][] }[]> {
+  const pieces = await soundVectors(monoSamples(input, 48000), window);
+  const labels = await Promise.all(SOUND_LABELS.map((l) => soundWordsVector(l)));
+  const tags: Record<string, [number, number][]> = {};
+  for (const piece of pieces) {
+    const scores = labels.map((l) => l.reduce((sum, v, i) => sum + v * piece.vector[i], 0));
+    const best = scores.indexOf(Math.max(...scores));
+    if (scores[best] < 0.2) continue; // nothing on the list fits
+    const moments = (tags[SOUND_LABELS[best]] ??= []);
+    const last = moments.at(-1);
+    if (last && piece.start <= last[1]) last[1] = piece.end;
+    else moments.push([piece.start, piece.end]);
+  }
+  return Object.entries(tags).map(([label, moments]) => ({ label, moments }));
+}
+
+// ---------- Who speaks when ----------
+
+// One voice fingerprint (WavLM x-vector, length 1) for a stretch of 16 kHz speech.
+async function voicePrint(audio: Float32Array): Promise<Float32Array> {
+  requireModel("speakers");
+  const library = transformers();
+  const repo = AI_MODELS.speakers.repo;
+  const model = await loadModel<any>("speakers", async () => ({
+    features: await library.AutoProcessor.from_pretrained(repo),
+    net: await library.WavLMForXVector.from_pretrained(repo, { dtype: "fp32" }),
+  }));
+  const { embeddings } = await model.net(await model.features(audio));
+  const vector = embeddings.data as Float32Array;
+  const length = Math.sqrt(vector.reduce((sum, v) => sum + v * v, 0)) || 1;
+  return vector.map((v) => v / length);
+}
+
+// Label who speaks each sentence (S1, S2 ... in order of first appearance), from voice fingerprints.
+// Sentences whose voices are alike (similarity above 0.6, or until `count` speakers are left) are joined.
+// The transcript (from transcribe; made here if not given) is saved with a speaker on every segment and word.
+export async function speakers(input: string, output: string, options: { transcript?: string; count?: number; model?: string } = {}) {
+  const audio = monoSamples(input, 16000);
+  let transcript: Transcript;
+  if (options.transcript) transcript = JSON.parse(readFileSync(requireFile(options.transcript), "utf8"));
+  else {
+    await transcribe(input, output, options.model ?? "base");
+    transcript = JSON.parse(readFileSync(output, "utf8"));
+  }
+  // Long sentences are split into pieces of up to 8 s (a speaker can change inside a long run of words).
+  const pieces: { start: number; end: number; words: Word[] }[] = [];
+  for (const segment of transcript.segments) {
+    const words = transcript.words.filter((w) => w.start >= segment.start - 0.01 && w.end <= segment.end + 0.01);
+    let current: Word[] = [];
+    for (const word of words) {
+      if (current.length && word.end - current[0].start > 8) {
+        pieces.push({ start: current[0].start, end: current.at(-1)!.end, words: current });
+        current = [];
+      }
+      current.push(word);
+    }
+    if (current.length) pieces.push({ start: current[0].start, end: current.at(-1)!.end, words: current });
+  }
+  if (!pieces.length) throw new Error("No speech was found.");
+  // A fingerprint for each piece long enough to tell voices apart (0.6 s or more).
+  const prints: (Float32Array | null)[] = [];
+  for (const piece of pieces) {
+    prints.push(piece.end - piece.start >= 0.6 ? await voicePrint(audio.subarray(Math.floor(piece.start * 16000), Math.ceil(piece.end * 16000))) : null);
+  }
+  // Join groups of pieces, the most alike first (average similarity between their fingerprints).
+  const similar = (a: Float32Array, b: Float32Array) => a.reduce((sum, v, i) => sum + v * b[i], 0);
+  let groups = prints.flatMap((p, n) => (p ? [[n]] : []));
+  const likeness = (a: number[], b: number[]) => {
+    let sum = 0;
+    for (const i of a) for (const j of b) sum += similar(prints[i]!, prints[j]!);
+    return sum / (a.length * b.length);
+  };
+  while (groups.length > 1) {
+    let best = { a: 0, b: 1, value: -Infinity };
+    for (let a = 0; a < groups.length; a++) for (let b = a + 1; b < groups.length; b++) {
+      const value = likeness(groups[a], groups[b]);
+      if (value > best.value) best = { a, b, value };
+    }
+    // The same voice scores about 0.7-0.95 and different voices about 0.25-0.5, so 0.6 sits in the gap.
+    if (options.count ? groups.length <= options.count : best.value < 0.6) break;
+    groups[best.a] = [...groups[best.a], ...groups[best.b]];
+    groups.splice(best.b, 1);
+  }
+  // Name speakers in the order they first speak. Short pieces get the speaker of the nearest piece in time.
+  groups.sort((a, b) => Math.min(...a) - Math.min(...b));
+  const who: string[] = [];
+  groups.forEach((group, g) => group.forEach((n) => (who[n] = `S${g + 1}`)));
+  pieces.forEach((piece, n) => {
+    if (who[n]) return;
+    const nearest = pieces.map((p, m) => ({ m, gap: Math.abs(p.start - piece.start) })).filter(({ m }) => who[m]).sort((a, b) => a.gap - b.gap)[0];
+    who[n] = nearest ? who[nearest.m] : "S1";
+  });
+  // Save: every piece becomes a segment with its speaker, and every word knows its speaker.
+  const segments = pieces.map((p, n) => ({ start: p.start, end: p.end, speaker: who[n], text: p.words.map((w) => w.word).join(" ") }));
+  const words = pieces.flatMap((p, n) => p.words.map((w) => ({ ...w, speaker: who[n] })));
+  writeFileSync(output, JSON.stringify({ ...transcript, words, segments }, null, 2));
+  const names = [...new Set(who)];
+  return {
+    speakers: names.map((name) => ({
+      name,
+      seconds: round(segments.filter((s) => s.speaker === name).reduce((sum, s) => sum + s.end - s.start, 0), 1),
+      turns: segments.filter((s, n) => s.speaker === name && segments[n - 1]?.speaker !== name).length,
+    })),
+    segments: segments.length,
+  };
 }
 
 export const commands: Record<string, Command> = {
@@ -338,6 +606,22 @@ export const commands: Record<string, Command> = {
     run: (a) => {
       const { input, output } = inOut(a);
       return transcribe(input, output, a.flags.model ?? "base", a.flags.language ?? "");
+    },
+  },
+  find: {
+    usage: 'find <sound|video> --query "dog barking" (short labels work best) [--top 5] [--window 4]  (search sounds by meaning; needs: install sounds)',
+    run: (a) =>
+      find(requireFile(a.positional[0]), a.flags.query ?? "", { top: optionalNumberFlag(a, "top", 5), window: optionalNumberFlag(a, "window", 4) }),
+  },
+  speakers: {
+    usage: "speakers <sound> <output.json> [--transcript words.json] [--speakers N] [--model base]  (who speaks when; needs: install speakers)",
+    run: (a) => {
+      const { input, output } = inOut(a);
+      return speakers(input, output, {
+        transcript: a.flags.transcript,
+        count: a.flags.speakers === undefined ? undefined : numberFlag(a, "speakers"),
+        model: a.flags.model,
+      });
     },
   },
 };

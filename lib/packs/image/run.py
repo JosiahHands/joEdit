@@ -9,6 +9,17 @@ import random
 import subprocess
 import sys
 
+APPLE = sys.platform == "darwin" and platform.machine() == "arm64"
+MODEL = "filipstrand/Z-Image-Turbo-mflux-4bit" if APPLE else "Tongyi-MAI/Z-Image-Turbo"
+
+# `node joedit.ts install image` runs this once to add the model; after that every run is offline.
+if "--download" in sys.argv:
+    from huggingface_hub import snapshot_download
+
+    snapshot_download(MODEL)
+    print(json.dumps({"downloaded": MODEL}))
+    sys.exit(0)
+
 parser = argparse.ArgumentParser()
 parser.add_argument("output")
 parser.add_argument("--prompt", required=True)
@@ -23,12 +34,12 @@ seed = args.seed if args.seed >= 0 else random.randint(0, 2**31 - 1)
 width = max(256, round(args.width / 16) * 16)
 height = max(256, round(args.height / 16) * 16)
 
-if sys.platform == "darwin" and platform.machine() == "arm64":
-    # Apple Silicon: MLX through mflux, with the ready-made 4-bit model (small download, fast).
+if APPLE:
+    # Apple Silicon: MLX through mflux, with the ready-made 4-bit model (small, fast).
     engine = "mflux"
     command = os.path.join(os.path.dirname(sys.executable), "mflux-generate-z-image-turbo")
     subprocess.run(
-        [command, "--model", "filipstrand/Z-Image-Turbo-mflux-4bit", "--prompt", args.prompt,
+        [command, "--model", MODEL, "--prompt", args.prompt,
          "--width", str(width), "--height", str(height), "--steps", str(args.steps), "--seed", str(seed),
          "--output", args.output],
         check=True,
@@ -40,7 +51,7 @@ else:
 
     engine = "diffusers"
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    pipe = ZImagePipeline.from_pretrained("Tongyi-MAI/Z-Image-Turbo", torch_dtype=torch.bfloat16).to(device)
+    pipe = ZImagePipeline.from_pretrained(MODEL, torch_dtype=torch.bfloat16).to(device)
     image = pipe(
         prompt=args.prompt, width=width, height=height, num_inference_steps=args.steps,
         guidance_scale=0.0, generator=torch.Generator(device).manual_seed(seed),

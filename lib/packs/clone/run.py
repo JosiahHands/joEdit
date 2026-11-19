@@ -4,12 +4,21 @@
 # Chatterbox adds an inaudible watermark (Perth) to everything it makes, so it can be identified as AI speech.
 import argparse
 import json
+import sys
 import warnings
 
 warnings.filterwarnings("ignore")
 
 import torch
 import torchaudio
+
+# `node joedit.ts install clone` runs this once to add the model; after that every run is offline.
+if "--download" in sys.argv:
+    from huggingface_hub import snapshot_download
+
+    snapshot_download("ResembleAI/chatterbox")
+    print(json.dumps({"downloaded": "ResembleAI/chatterbox"}))
+    sys.exit(0)
 
 parser = argparse.ArgumentParser()
 parser.add_argument("output")

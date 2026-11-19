@@ -1,8 +1,10 @@
 // Shared helpers used by every joEdit module: running programs, reading arguments, the CLI,
 // the native libraries (in node_modules), packs (local AI tools), assets (downloaded fonts and tools) and the brand kit.
 import { execFileSync, spawn, spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, createWriteStream, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
+import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -303,8 +305,15 @@ export async function savePicture(image: any, output: string, quality?: number):
 }
 
 // Open a picture with sharp, turned upright (phone photos store their rotation separately).
+// iPhone photos (.heic, .heif) are decoded by ffmpeg first: sharp's ready-made build cannot read them.
 export async function openPicture(input: string): Promise<any> {
   requireFile(input);
+  if (/\.(heic|heif)$/i.test(input)) {
+    const png = execFileSync(FFMPEG, ["-hide_banner", "-loglevel", "error", "-i", input, "-frames:v", "1", "-f", "image2pipe", "-c:v", "png", "-"], {
+      maxBuffer: 1024 * 1024 * 1024,
+    });
+    return need("sharp")(png);
+  }
   return need("sharp")(input).autoOrient();
 }
 
@@ -636,8 +645,9 @@ export function listPacks(): PackInfo[] {
     });
 }
 
+// Installed = its Python environment is set up and its models were added (marked by models-ready).
 function isPackInstalled(name: string): boolean {
-  return existsSync(join(PACK_ENVIRONMENTS, name, "pyvenv.cfg"));
+  return existsSync(join(PACK_ENVIRONMENTS, name, "pyvenv.cfg")) && existsSync(join(PACK_ENVIRONMENTS, name, "models-ready"));
 }
 
 // The pack's recipe folder. Throws a helpful error for unknown names.
@@ -650,34 +660,37 @@ function packRecipe(name: string): string {
   return folder;
 }
 
-// Tells uv to put this pack's environment in .packs/<name>.
+// The pack's environment lives in .packs/<name>, and its models in .packs/<name>/models (not in a cache elsewhere).
 function packEnvironment(name: string): Record<string, string> {
-  return { UV_PROJECT_ENVIRONMENT: join(PACK_ENVIRONMENTS, name) };
+  const home = join(PACK_ENVIRONMENTS, name);
+  return { UV_PROJECT_ENVIRONMENT: home, HF_HOME: join(home, "models"), TORCH_HOME: join(home, "models") };
 }
 
-// Install a pack. The first install can take a few minutes (it downloads Python libraries).
+// Install a pack: its Python libraries, then its models (`run.py --download`). This is the only time it goes online.
+// The first install can take a while (libraries and models are big).
 export function installPack(name: string): { pack: string; installed: boolean } {
   const folder = packRecipe(name);
   if (!hasProgram("uv")) {
     throw new Error("Packs need uv (a Python installer). Install it with: brew install uv   (or: curl -LsSf https://astral.sh/uv/install.sh | sh)");
   }
+  const env = { ...process.env, ...packEnvironment(name) };
   try {
     // Progress is shown on stderr so the person waiting can see something is happening.
-    execFileSync("uv", ["sync", "--project", folder], {
-      stdio: ["ignore", "ignore", "inherit"],
-      env: { ...process.env, ...packEnvironment(name) },
-    });
+    execFileSync("uv", ["sync", "--project", folder], { stdio: ["ignore", "ignore", "inherit"], env });
+    execFileSync("uv", ["run", "--project", folder, "--no-sync", "python", join(folder, "run.py"), "--download"], { stdio: ["ignore", "ignore", "inherit"], env });
   } catch {
     throw new Error(`Installing the "${name}" pack failed. See the messages above.`);
   }
+  writeFileSync(join(PACK_ENVIRONMENTS, name, "models-ready"), new Date().toISOString());
   return { pack: name, installed: true };
 }
 
-// Run a pack's run.py with arguments and return the JSON it prints.
+// Run a pack's run.py with arguments and return the JSON it prints. Packs run offline: their models are already in .packs/.
 export function runPack(name: string, args: string[]): any {
   const folder = packRecipe(name);
-  if (!isPackInstalled(name)) throw new Error(`The "${name}" pack is not installed. Run: node joedit.ts install ${name}`);
-  const output = run("uv", ["run", "--project", folder, "--no-sync", "python", join(folder, "run.py"), ...args], packEnvironment(name));
+  if (!isPackInstalled(name)) throw new Error(`The "${name}" pack is not installed (or its models are missing). Run: node joedit.ts install ${name}`);
+  const offline = { HF_HUB_OFFLINE: "1", TRANSFORMERS_OFFLINE: "1", HF_DATASETS_OFFLINE: "1" };
+  const output = run("uv", ["run", "--project", folder, "--no-sync", "python", join(folder, "run.py"), ...args], { ...packEnvironment(name), ...offline });
   // The JSON result is always the last line printed.
   const lastLine = output.trim().split("\n").pop() ?? "";
   return JSON.parse(lastLine);
@@ -733,6 +746,43 @@ export const AI_MODELS: Record<string, AiModel> = {
     does: "look find, look index: search pictures and video by meaning (SigLIP 2). 660 MB",
     license: "Apache-2.0",
   },
+  objects: {
+    repo: "onnx-community/dfine_s_coco-ONNX",
+    files: ["config.json", "preprocessor_config.json", "onnx/model.onnx"],
+    does: "look objects, look track: find and follow 80 kinds of things (people, cars, dogs, cups ...) (D-FINE). 42 MB",
+    license: "Apache-2.0",
+  },
+  sounds: {
+    repo: "Xenova/clap-htsat-unfused",
+    files: [
+      "config.json", "preprocessor_config.json", "tokenizer.json", "tokenizer_config.json", "special_tokens_map.json",
+      "onnx/audio_model.onnx", "onnx/text_model_quantized.onnx",
+    ],
+    does: "listen find, look index: search sounds by description (\"dog barking\", \"applause\") (CLAP). 245 MB",
+    license: "Apache-2.0",
+  },
+  read: {
+    repo: "onnx-community/Florence-2-base-ft",
+    files: [
+      "config.json", "generation_config.json", "preprocessor_config.json", "tokenizer.json", "tokenizer_config.json",
+      "special_tokens_map.json", "added_tokens.json", "vocab.json", "merges.txt",
+      "onnx/vision_encoder.onnx", "onnx/embed_tokens.onnx", "onnx/encoder_model_q4.onnx", "onnx/decoder_model_merged_q4.onnx",
+    ],
+    does: "look read, look index: read the text in pictures and video, with where it is (Florence-2). 620 MB",
+    license: "MIT",
+  },
+  speakers: {
+    repo: "Xenova/wavlm-base-plus-sv",
+    files: ["config.json", "preprocessor_config.json", "onnx/model.onnx"],
+    does: "listen speakers: who speaks when, from voice fingerprints (WavLM). 400 MB",
+    license: "MIT",
+  },
+  faces: {
+    repo: "opencv/face_detection_yunet",
+    files: ["face_detection_yunet_2023mar.onnx"],
+    does: "look faces, look track --what face, video blur-faces: find faces (YuNet). 0.2 MB",
+    license: "MIT",
+  },
 };
 
 // The folder a model lives in.
@@ -756,19 +806,36 @@ export function listModels() {
   return Object.entries(AI_MODELS).map(([name, m]) => ({ name, does: m.does, license: m.license, installed: isModelInstalled(name) }));
 }
 
-// Add a model to .models/ (the only step that goes online). Files arrive under a temporary name first,
-// so a stopped download never looks installed.
+// Download a file for an install (models and assets; commands never do this).
+// It streams to <target>.part and only gets its real name when complete. A dropped connection
+// is tried again up to 3 times, carrying on from where it stopped.
+export async function download(url: string, target: string): Promise<void> {
+  mkdirSync(dirname(target), { recursive: true });
+  const part = `${target}.part`;
+  for (let attempt = 1; ; attempt++) {
+    try {
+      const have = existsSync(part) ? statSync(part).size : 0;
+      const response = await fetch(url, { headers: have ? { Range: `bytes=${have}-` } : {} });
+      if (!response.ok || !response.body) throw new Error(`the server answered ${response.status}`);
+      const carryOn = have > 0 && response.status === 206; // 206 = the rest of the file
+      await pipeline(Readable.fromWeb(response.body as any), createWriteStream(part, { flags: carryOn ? "a" : "w" }));
+      renameSync(part, target);
+      return;
+    } catch (error: any) {
+      if (attempt === 3) throw new Error(`Downloading ${basename(target)} failed: ${error.message}. Run the same install again to carry on.`);
+      process.stderr.write(`  connection dropped (${error.message}), trying again...\n`);
+    }
+  }
+}
+
+// Add a model to .models/ (the only step that goes online).
 export async function installModel(name: string): Promise<{ model: string; installed: boolean }> {
   const folder = modelFolder(name);
   for (const file of AI_MODELS[name].files) {
     const target = join(folder, file);
     if (existsSync(target)) continue;
     process.stderr.write(`Adding ${name}: ${file}\n`);
-    const response = await fetch(`https://huggingface.co/${AI_MODELS[name].repo}/resolve/main/${file}`);
-    if (!response.ok) throw new Error(`Getting ${file} for ${name} failed (${response.status}).`);
-    mkdirSync(dirname(target), { recursive: true });
-    writeFileSync(`${target}.part`, Buffer.from(await response.arrayBuffer()));
-    renameSync(`${target}.part`, target);
+    await download(`https://huggingface.co/${AI_MODELS[name].repo}/resolve/main/${file}`, target);
   }
   return { model: name, installed: true };
 }
@@ -889,11 +956,8 @@ export async function installAsset(name: string): Promise<{ asset: string; insta
     execFileSync(program, [...args, folder], { stdio: ["ignore", "ignore", "inherit"] });
   }
   for (const file of asset.files ?? []) {
-    const response = await fetch(file.url);
-    if (!response.ok) throw new Error(`Download failed (${response.status}): ${file.url}`);
-    const target = join(folder, file.path);
-    mkdirSync(dirname(target), { recursive: true }); // paths may include sub-folders
-    writeFileSync(target, Buffer.from(await response.arrayBuffer()));
+    const target = join(folder, file.path); // paths may include sub-folders
+    await download(file.url, target);
     if (file.unzip) {
       run("unzip", ["-o", "-q", target, "-d", folder]);
       rmSync(target);
@@ -911,6 +975,12 @@ export async function installAsset(name: string): Promise<{ asset: string; insta
 export async function install(name: string): Promise<Result> {
   if (AI_MODELS[name]) return installModel(name);
   if (ASSET_LIST.some((a) => a.name === name)) return installAsset(name);
+  if (!existsSync(join(PACK_RECIPES, name, "pyproject.toml"))) {
+    throw new Error(
+      `Nothing to install called "${name}". AI models: ${Object.keys(AI_MODELS).join(", ")}. ` +
+        `Assets: ${ASSET_LIST.map((a) => a.name).join(", ")}. Packs: ${listPacks().map((p) => p.name).join(", ")}`,
+    );
+  }
   return installPack(name);
 }
 

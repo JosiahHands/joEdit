@@ -16,12 +16,14 @@ import {
   numberFlag,
   optionalNumberFlag,
   probe,
+  readFrames,
   requireFile,
   round,
   runCli,
   runPack,
   stringFlag,
   withTempDir,
+  writeVideo,
   loadBrand,
   type Args,
   type Command,
@@ -308,15 +310,112 @@ export function removeSilence(input: string, output: string, min = 0.6, db = -35
   }
   if (start < details.duration) keep.push([start, details.duration]);
   if (!keep.length) throw new Error("The whole file is silent. Try a lower --db (e.g. -50).");
+  const kept = keepOnly(input, output, keep);
+  return { cuts: silences.length, before: round(details.duration), after: round(kept), removed: round(details.duration - kept) };
+}
 
+// Keep only these [start, end] parts of a video (or sound) and join them. Returns the new length.
+export function keepOnly(input: string, output: string, keep: [number, number][]): number {
   // select keeps the frames inside the ranges; setpts closes the gaps.
   const ranges = keep.map(([a, b]) => `between(t,${a.toFixed(3)},${b.toFixed(3)})`).join("+");
-  const filters = details.width
+  const filters = info(input).width
     ? ["-vf", `select='${ranges}',setpts=N/FRAME_RATE/TB`, "-af", `aselect='${ranges}',asetpts=N/SR/TB`]
     : ["-af", `aselect='${ranges}',asetpts=N/SR/TB`];
   ffmpeg(["-i", input, ...filters, output]);
-  const kept = keep.reduce((sum, [a, b]) => sum + b - a, 0);
-  return { cuts: silences.length, before: round(details.duration), after: round(kept), removed: round(details.duration - kept) };
+  return keep.reduce((sum, [a, b]) => sum + b - a, 0);
+}
+
+// Filler sounds people say while thinking. Whisper writes some of them down; those get cut.
+export const FILLERS = ["um", "umm", "uh", "uhh", "uhm", "erm", "er", "ah", "hmm", "mm", "mhm"];
+
+// Cut filler words ("um", "uh") and stutters ("I I think" → "I think") out of speech, using the word times.
+// transcript: from listen transcribe (made here if not given). words: your own list of words to cut instead of FILLERS.
+export async function removeFillers(input: string, output: string, options: { transcript?: string; words?: string[]; repeats?: boolean; model?: string } = {}) {
+  const details = info(input);
+  if (!details.hasAudio) throw new Error("This file has no sound to find words in.");
+  const cut = (options.words ?? FILLERS).map((w) => w.toLowerCase());
+  const words: listen.Word[] = await withTempDir(async (folder) => {
+    let transcript = options.transcript;
+    if (!transcript) {
+      transcript = join(folder, "words.json");
+      await listen.transcribe(input, transcript, options.model ?? "base");
+    }
+    return JSON.parse(readFileSync(requireFile(transcript), "utf8")).words ?? [];
+  });
+  const plain = (word: string) => word.toLowerCase().replace(/[^\p{L}\p{N}']/gu, "");
+  const pauses = listen.speechPauses(listen.monoSamples(input, 16000));
+  // A word goes when it is a filler, or (repeats) when the next word is the same word right after it.
+  // The cut runs from the word to the end of the first real pause after it (word times can be a little off;
+  // pauses are exact), or to the next word when the speaker runs straight on.
+  const removed: { word: string; at: number }[] = [];
+  const gaps: [number, number][] = [];
+  words.forEach((word, n) => {
+    const next = words[n + 1];
+    const filler = cut.includes(plain(word.word));
+    const stutter = (options.repeats ?? true) && next && plain(word.word) && plain(word.word) === plain(next.word) && next.start - word.end < 0.6;
+    if (!filler && !stutter) return;
+    removed.push({ word: word.word, at: word.start });
+    const pause = pauses.find(([start]) => start >= word.start + 0.05 && start <= word.end + 0.3);
+    gaps.push([word.start, pause ? Math.max(pause[0], pause[1] - 0.03) : next ? next.start : word.end]);
+  });
+  if (!removed.length) {
+    ffmpeg(["-i", input, "-c", "copy", output]);
+    return { removed, count: 0, before: round(details.duration), after: round(details.duration) };
+  }
+  const keep: [number, number][] = [];
+  let start = 0;
+  for (const [from, to] of gaps) {
+    if (from > start) keep.push([start, from]);
+    start = Math.max(start, to);
+  }
+  if (start < details.duration) keep.push([start, details.duration]);
+  const kept = keepOnly(input, output, keep);
+  return { removed, count: removed.length, before: round(details.duration), after: round(kept) };
+}
+
+// Blur every face in a video (privacy). Faces are found every `every` seconds (faces model);
+// each frame blurs the faces seen just before and just after it, so moving faces stay covered.
+// strength: 1 = strong blur, 2 = stronger. pad: how much bigger than the face the blur is (0.3 = 30%).
+export async function blurFaces(input: string, output: string, options: { every?: number; strength?: number; pad?: number; min?: number } = {}) {
+  const { every = 0.2, strength = 1, pad = 0.3 } = options;
+  const details = info(input);
+  if (!details.width) throw new Error("This file has no picture.");
+  const look = await import("./look.ts");
+  const checks = await look.thingsOverTime(input, ["face"], every, options.min);
+  const sharp = need("sharp");
+  const { width, height } = details;
+  const writer = writeVideo(output, { width, height, fps: details.fps || 30, audio: details.hasAudio ? input : undefined });
+  let blurred = 0;
+  for await (const frame of readFrames(input)) {
+    // The checks just before and just after this frame.
+    const after = checks.findIndex((c) => c.time >= frame.time);
+    const near = after < 0 ? [checks.at(-1)] : [checks[after], checks[after - 1]];
+    const faces = near.flatMap((c) => c?.things ?? []);
+    for (const face of faces) {
+      // The blurred area: the face plus padding, kept inside the picture.
+      const x = Math.max(0, Math.floor(face.x - face.width * pad));
+      const y = Math.max(0, Math.floor(face.y - face.height * pad));
+      const w = Math.min(width - x, Math.ceil(face.width * (1 + 2 * pad)));
+      const h = Math.min(height - y, Math.ceil(face.height * (1 + 2 * pad)));
+      if (w < 2 || h < 2) continue;
+      const region = Buffer.alloc(w * h * 4);
+      for (let row = 0; row < h; row++) frame.pixels.copy(region, row * w * 4, ((y + row) * width + x) * 4, ((y + row) * width + x + w) * 4);
+      const soft: Buffer = await sharp(region, { raw: { width: w, height: h, channels: 4 } }).blur(Math.max(4, (w / 6) * strength)).raw().toBuffer();
+      // Only inside an oval (faces are round), so the blur does not look like a box.
+      for (let row = 0; row < h; row++) {
+        for (let col = 0; col < w; col++) {
+          const dx = (col + 0.5) / w - 0.5;
+          const dy = (row + 0.5) / h - 0.5;
+          if (dx * dx + dy * dy > 0.25) continue;
+          soft.copy(frame.pixels, ((y + row) * width + x + col) * 4, (row * w + col) * 4, (row * w + col) * 4 + 4);
+        }
+      }
+    }
+    if (faces.length) blurred++;
+    await writer.write(frame.pixels);
+  }
+  await writer.finish();
+  return { checks: checks.length, mostFaces: Math.max(0, ...checks.map((c) => c.things.length)), framesBlurred: blurred };
 }
 
 // Parse "9:16" or "1.78" into a number (width / height).
@@ -584,6 +683,30 @@ export const commands: Record<string, Command> = {
         position: a.flags.position,
         model: a.flags.model,
         brand: a.flags.brand,
+      });
+    },
+  },
+  "remove-fillers": {
+    usage: `remove-fillers <input> <output> [--transcript words.json] [--words ${FILLERS.slice(0, 3).join(",")},...] [--repeats true|false] [--model base]  (cuts um, uh and stutters)`,
+    run: async (a) => {
+      const { input, output } = inOut(a);
+      return removeFillers(input, output, {
+        transcript: a.flags.transcript,
+        words: a.flags.words ? a.flags.words.split(",").map((w) => w.trim()) : undefined,
+        repeats: a.flags.repeats !== "false",
+        model: a.flags.model,
+      });
+    },
+  },
+  "blur-faces": {
+    usage: "blur-faces <input> <output> [--every 0.2] [--strength 1] [--pad 0.3] [--min 0.6]  (needs: install faces)",
+    run: async (a) => {
+      const { input, output } = inOut(a);
+      return blurFaces(input, output, {
+        every: optionalNumberFlag(a, "every", 0.2),
+        strength: optionalNumberFlag(a, "strength", 1),
+        pad: optionalNumberFlag(a, "pad", 0.3),
+        min: a.flags.min === undefined ? undefined : numberFlag(a, "min"),
       });
     },
   },

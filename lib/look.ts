@@ -7,7 +7,11 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSy
 import { basename, dirname, join, resolve } from "node:path";
 import {
   AI_MODELS,
+  isModelInstalled,
   loadModel,
+  onnxModel,
+  pictureCanvas,
+  readFrames,
   requireModel,
   transformers,
   analyze,
@@ -29,6 +33,7 @@ import {
   type Command,
   type Frame,
 } from "./shared.ts";
+import * as listen from "./listen.ts";
 import * as video from "./video.ts";
 
 // A picture to put on a board: RGBA pixels and a label.
@@ -375,7 +380,513 @@ export async function colors(input: string, count = 6, swatch?: string) {
   return { colors: palette, ...(swatch ? { swatch } : {}) };
 }
 
+// ---------- Things and faces ----------
+
+// Something found in a picture or a frame: what it is, how sure (0..1), and its box in pixels of the
+// original picture or video (x, y = top-left corner).
+export type Thing = { label: string; score: number; x: number; y: number; width: number; height: number };
+
+// RGB pixels (what the models want) from RGBA pixels.
+function rgbFrom(rgba: Buffer | Uint8Array, width: number, height: number): Buffer {
+  const rgb = Buffer.alloc(width * height * 3);
+  for (let i = 0, j = 0; i < width * height * 4; i += 4, j += 3) {
+    rgb[j] = rgba[i];
+    rgb[j + 1] = rgba[i + 1];
+    rgb[j + 2] = rgba[i + 2];
+  }
+  return rgb;
+}
+
+function objectModel(): Promise<any> {
+  requireModel("objects");
+  const library = transformers();
+  return loadModel("objects", () => library.pipeline("object-detection", AI_MODELS.objects.repo));
+}
+
+// The 80 kinds of things the objects model knows ("person", "car", "dog", "cup" ...).
+export async function objectLabels(): Promise<string[]> {
+  return Object.values((await objectModel()).model.config.id2label as Record<string, string>);
+}
+
+// Things in a picture (RGB pixels), at least `min` sure. what: only these kinds.
+async function detectObjects(rgb: Buffer, width: number, height: number, min: number, what?: string[]): Promise<Thing[]> {
+  const detect = await objectModel();
+  const found = await detect(new (transformers().RawImage)(rgb, width, height, 3), { threshold: min });
+  return found
+    .filter((f: any) => !what || what.includes(f.label))
+    .map((f: any) => ({
+      label: f.label,
+      score: round(f.score, 3),
+      x: round(f.box.xmin, 1),
+      y: round(f.box.ymin, 1),
+      width: round(f.box.xmax - f.box.xmin, 1),
+      height: round(f.box.ymax - f.box.ymin, 1),
+    }));
+}
+
+// How much two boxes overlap: 0 = not at all, 1 = the same box.
+function overlap(a: Thing, b: Thing): number {
+  const w = Math.max(0, Math.min(a.x + a.width, b.x + b.width) - Math.max(a.x, b.x));
+  const h = Math.max(0, Math.min(a.y + a.height, b.y + b.height) - Math.max(a.y, b.y));
+  const shared = w * h;
+  return shared / (a.width * a.height + b.width * b.height - shared || 1);
+}
+
+// Faces in a picture (RGB pixels), with YuNet (OpenCV's face finder). min: how sure, 0..1.
+async function detectFaces(rgb: Buffer, width: number, height: number, min = 0.6): Promise<Thing[]> {
+  const SIZE = 640;
+  const session = await onnxModel("faces", "face_detection_yunet_2023mar.onnx");
+  // YuNet looks at a 640x640 picture: scale ours to fit in the top-left corner. It wants B, G, R planes, 0..255.
+  const scale = Math.min(SIZE / width, SIZE / height);
+  const w = Math.max(1, Math.round(width * scale));
+  const h = Math.max(1, Math.round(height * scale));
+  const small: Buffer = await need("sharp")(rgb, { raw: { width, height, channels: 3 } }).resize(w, h, { fit: "fill" }).raw().toBuffer();
+  const planes = new Float32Array(3 * SIZE * SIZE);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const from = (y * w + x) * 3;
+      const to = y * SIZE + x;
+      planes[to] = small[from + 2];
+      planes[SIZE * SIZE + to] = small[from + 1];
+      planes[2 * SIZE * SIZE + to] = small[from];
+    }
+  }
+  const ort = need("onnxruntime-node");
+  const out = await session.run({ input: new ort.Tensor("float32", planes, [1, 3, SIZE, SIZE]) });
+  // Every cell of three grids (8, 16 and 32 pixels apart) guesses one face: how sure, and its box.
+  const faces: Thing[] = [];
+  for (const step of [8, 16, 32]) {
+    const columns = SIZE / step;
+    const sure = out[`cls_${step}`].data;
+    const there = out[`obj_${step}`].data;
+    const box = out[`bbox_${step}`].data;
+    for (let cell = 0; cell < sure.length; cell++) {
+      const score = Math.sqrt(Math.min(1, Math.max(0, sure[cell])) * Math.min(1, Math.max(0, there[cell])));
+      if (score < min) continue;
+      const cx = ((cell % columns) + box[cell * 4]) * step;
+      const cy = (Math.floor(cell / columns) + box[cell * 4 + 1]) * step;
+      const bw = Math.exp(box[cell * 4 + 2]) * step;
+      const bh = Math.exp(box[cell * 4 + 3]) * step;
+      faces.push({ label: "face", score: round(score, 3), x: round((cx - bw / 2) / scale, 1), y: round((cy - bh / 2) / scale, 1), width: round(bw / scale, 1), height: round(bh / scale, 1) });
+    }
+  }
+  // Many cells see the same face: keep the surest box and drop the ones that overlap it.
+  const kept: Thing[] = [];
+  for (const face of faces.sort((a, b) => b.score - a.score)) if (kept.every((k) => overlap(k, face) < 0.3)) kept.push(face);
+  return kept;
+}
+
+// Things or faces in RGB pixels. what: "face", or kinds of things (empty = all).
+async function detect(rgb: Buffer, width: number, height: number, what: string[], min?: number): Promise<Thing[]> {
+  if (what.includes("face")) return detectFaces(rgb, width, height, min ?? 0.6);
+  return detectObjects(rgb, width, height, min ?? 0.5, what.length ? what : undefined);
+}
+
+// Check that every name in --what is something the models know.
+async function checkWhat(what: string[]): Promise<void> {
+  if (what.includes("face")) {
+    if (what.length > 1) throw new Error('Look for faces on their own: --what face');
+    return;
+  }
+  const known = await objectLabels();
+  for (const name of what) {
+    if (!known.includes(name)) throw new Error(`"${name}" is not something the objects model knows. It knows: face, ${known.join(", ")}`);
+  }
+}
+
+// Draw labelled boxes on a canvas. scale: canvas pixels per original pixel. showScore: add "87%" to the label.
+function drawThings(ctx: any, things: Thing[], scale: number, showScore = true): void {
+  const colors = ["#FFD400", "#00E5FF", "#FF4FD8", "#7CFF4F", "#FF8A00"];
+  const kinds = [...new Set(things.map((t) => t.label))];
+  for (const thing of things) {
+    const color = colors[kinds.indexOf(thing.label) % colors.length];
+    ctx.strokeStyle = color;
+    ctx.lineWidth = Math.max(2, ctx.canvas.width / 300);
+    ctx.strokeRect(thing.x * scale, thing.y * scale, thing.width * scale, thing.height * scale);
+    const size = Math.max(11, Math.round(ctx.canvas.width / 45));
+    drawText(ctx, showScore ? `${thing.label} ${Math.round(thing.score * 100)}%` : thing.label, thing.x * scale, Math.max(0, thing.y * scale - size - 6), { size, weight: 700, color: "#000", box: color, padding: 3 });
+  }
+}
+
+// Frames of a video every `every` seconds, scaled to at most 640 wide (enough for the models).
+async function* sampleFrames(input: string, every: number): AsyncGenerator<Frame & { scale: number }> {
+  const { width } = requireVideo(input);
+  const size = Math.min(width, 640);
+  for await (const frame of readFrames(input, { fps: 1 / every, width: size })) yield { ...frame, time: round(frame.time, 3), scale: width / frame.width };
+}
+
+// The same box measured in the original video's pixels.
+function scaleThing(thing: Thing, scale: number): Thing {
+  return { ...thing, x: round(thing.x * scale, 1), y: round(thing.y * scale, 1), width: round(thing.width * scale, 1), height: round(thing.height * scale, 1) };
+}
+
+// Find things (or faces) in a picture or a video.
+// Picture: every thing with its box. Video: when each kind is seen (moments), how many at most, checked every `every` seconds.
+// draw: a picture with the boxes drawn on (for a video, a sheet of the frames that have the most).
+export async function objects(input: string, options: { what?: string[]; min?: number; every?: number; draw?: string } = {}) {
+  requireFile(input);
+  const what = options.what ?? [];
+  await checkWhat(what);
+  if (PICTURE_FILE.test(input)) {
+    const { canvas, ctx, width, height } = await pictureCanvas(input);
+    const rgb = rgbFrom(ctx.getImageData(0, 0, width, height).data, width, height);
+    const things = await detect(rgb, width, height, what, options.min);
+    if (options.draw) {
+      drawThings(ctx, things, 1);
+      await saveCanvas(canvas, options.draw);
+    }
+    return { count: things.length, things, ...(options.draw ? { draw: options.draw } : {}) };
+  }
+  const every = options.every ?? 1;
+  const frames: { time: number; things: Thing[] }[] = [];
+  const drawn: Tile[] = []; // frames with their boxes drawn on (only with draw)
+  const { createCanvas, ImageData } = await skia();
+  for await (const frame of sampleFrames(input, every)) {
+    const found = await detect(rgbFrom(frame.pixels, frame.width, frame.height), frame.width, frame.height, what, options.min);
+    frames.push({ time: frame.time, things: found.map((t) => scaleThing(t, frame.scale)) });
+    if (options.draw && found.length) {
+      const canvas = createCanvas(frame.width, frame.height);
+      const ctx = canvas.getContext("2d");
+      ctx.putImageData(new ImageData(new Uint8ClampedArray(frame.pixels), frame.width, frame.height), 0, 0);
+      drawThings(ctx, found, 1);
+      const small = await need("sharp")(Buffer.from(ctx.getImageData(0, 0, frame.width, frame.height).data), { raw: { width: frame.width, height: frame.height, channels: 4 } })
+        .resize(320)
+        .raw()
+        .toBuffer({ resolveWithObject: true });
+      drawn.push({ pixels: small.data, width: small.info.width, height: small.info.height, label: `${formatTime(frame.time)}  ${found.length} found` });
+    }
+  }
+  // Moments: when each kind is in view (gaps shorter than 1.5 checks are joined).
+  const seen: { label: string; most: number; moments: [number, number][] }[] = [];
+  for (const label of [...new Set(frames.flatMap((f) => f.things.map((t) => t.label)))].sort()) {
+    const moments: [number, number][] = [];
+    let most = 0;
+    for (const frame of frames) {
+      const count = frame.things.filter((t) => t.label === label).length;
+      most = Math.max(most, count);
+      if (!count) continue;
+      const last = moments.at(-1);
+      if (last && frame.time - last[1] <= every * 1.5) last[1] = round(frame.time + every);
+      else moments.push([frame.time, round(frame.time + every)]);
+    }
+    seen.push({ label, most, moments });
+  }
+  if (options.draw && drawn.length) {
+    // Up to 12 of the frames where something was found, spread over the video.
+    const tiles = drawn.length <= 12 ? drawn : Array.from({ length: 12 }, (_, k) => drawn[Math.round((k * (drawn.length - 1)) / 11)]);
+    await board(tiles, Math.min(4, tiles.length), options.draw, what.length ? what.join(", ") : "everything found");
+  }
+  return { every, checked: frames.length, seen, ...(options.draw ? { draw: options.draw } : {}) };
+}
+
+// A box at one moment of a track.
+export type TrackPoint = { time: number; x: number; y: number; width: number; height: number };
+
+// Follow one thing through a video (the main person, the dog, a face) and save where it is every `every` seconds.
+// The box path is joined across short gaps and smoothed, so it can steer crops, follow-text and blur.
+// The main thing is the one seen the longest (then the biggest). Saved as JSON: { label, width, height, every, points }.
+export async function track(input: string, output: string, what = "person", options: { every?: number; min?: number; draw?: string } = {}) {
+  const every = options.every ?? 0.2;
+  const { width, height, duration } = requireVideo(input);
+  await checkWhat([what]);
+  // 1. Things in every checked frame, joined into paths: each box continues the path it overlaps most.
+  type Path = { points: TrackPoint[] };
+  const paths: Path[] = [];
+  for await (const frame of sampleFrames(input, every)) {
+    const found = (await detect(rgbFrom(frame.pixels, frame.width, frame.height), frame.width, frame.height, [what], options.min)).map((t) => scaleThing(t, frame.scale));
+    const used = new Set<Path>();
+    for (const thing of found.sort((a, b) => b.score - a.score)) {
+      let best: Path | undefined;
+      let bestOverlap = 0.1;
+      for (const path of paths) {
+        const last = path.points.at(-1)!;
+        if (used.has(path) || frame.time - last.time > 1.5) continue; // a path ends after 1.5 s unseen
+        const shared = overlap({ ...last, label: what, score: 1 }, thing);
+        if (shared > bestOverlap) [best, bestOverlap] = [path, shared];
+      }
+      const point = { time: frame.time, x: thing.x, y: thing.y, width: thing.width, height: thing.height };
+      if (best) best.points.push(point);
+      else paths.push((best = { points: [point] }));
+      used.add(best);
+    }
+  }
+  if (!paths.length) throw new Error(`No ${what} was found in this video. Try --min 0.3, or look first: node joedit.ts look objects ${JSON.stringify(input)}`);
+  const size = (p: Path) => p.points.reduce((sum, q) => sum + q.width * q.height, 0) / p.points.length;
+  const main = paths.sort((a, b) => b.points.length - a.points.length || size(b) - size(a))[0];
+
+  // 2. A point at every check from the first sighting to the last (gaps filled in a straight line), then smoothed.
+  const filled: TrackPoint[] = [];
+  for (let n = 0; n < main.points.length; n++) {
+    const a = main.points[n];
+    filled.push(a);
+    const b = main.points[n + 1];
+    if (!b) break;
+    const steps = Math.round((b.time - a.time) / every);
+    for (let k = 1; k < steps; k++) {
+      const f = k / steps;
+      const mix = (key: keyof TrackPoint) => a[key] + (b[key] - a[key]) * f;
+      filled.push({ time: round(a.time + k * every, 3), x: mix("x"), y: mix("y"), width: mix("width"), height: mix("height") });
+    }
+  }
+  const points = filled.map((point, n) => {
+    const near = filled.slice(Math.max(0, n - 2), n + 3); // an average of 5 checks: steady, like a camera operator
+    const average = (key: keyof TrackPoint) => round(near.reduce((sum, q) => sum + q[key], 0) / near.length, 1);
+    return { time: point.time, x: average("x"), y: average("y"), width: average("width"), height: average("height") };
+  });
+  writeFileSync(output, JSON.stringify({ label: what, width, height, every, points }, null, 1));
+
+  // 3. Optional sheet: 8 frames along the track with its box drawn on.
+  if (options.draw) {
+    const chosen = Array.from({ length: Math.min(8, points.length) }, (_, k) => points[Math.round((k * (points.length - 1)) / Math.max(1, Math.min(8, points.length) - 1))]);
+    const tiles = await frameTiles(input, chosen.map((p) => p.time), 320);
+    const { createCanvas, ImageData } = await skia();
+    const drawn = tiles.map((tile, k) => {
+      const canvas = createCanvas(tile.width, tile.height);
+      const ctx = canvas.getContext("2d");
+      ctx.putImageData(new ImageData(new Uint8ClampedArray(tile.pixels), tile.width, tile.height), 0, 0);
+      drawThings(ctx, [{ ...chosen[k], label: what, score: 1 }], tile.width / width);
+      return { ...tile, pixels: Buffer.from(ctx.getImageData(0, 0, tile.width, tile.height).data) };
+    });
+    await board(drawn, 4, options.draw, `track: ${what}`);
+  }
+  const start = points[0].time;
+  const end = points.at(-1)!.time;
+  return { label: what, points: points.length, start, end, coverage: round((end - start + every) / Math.max(duration, every), 2), others: paths.length - 1 };
+}
+
+// Things (or faces) found every `every` seconds through a video, with boxes in the video's own pixels.
+export async function thingsOverTime(input: string, what: string[], every: number, min?: number): Promise<{ time: number; things: Thing[] }[]> {
+  await checkWhat(what);
+  const checks: { time: number; things: Thing[] }[] = [];
+  for await (const frame of sampleFrames(input, every)) {
+    const found = await detect(rgbFrom(frame.pixels, frame.width, frame.height), frame.width, frame.height, what, min);
+    checks.push({ time: frame.time, things: found.map((t) => scaleThing(t, frame.scale)) });
+  }
+  return checks;
+}
+
+// ---------- Read text (OCR) ----------
+
+// A line of text and its box in pixels of the original picture or video.
+export type TextLine = { text: string; x: number; y: number; width: number; height: number };
+
+function readModel(): Promise<any> {
+  requireModel("read");
+  const library = transformers();
+  const repo = AI_MODELS.read.repo;
+  return loadModel("read", async () => ({
+    processor: await library.AutoProcessor.from_pretrained(repo),
+    model: await library.Florence2ForConditionalGeneration.from_pretrained(repo, {
+      dtype: { embed_tokens: "fp32", vision_encoder: "fp32", encoder_model: "q4", decoder_model_merged: "q4" },
+    }),
+  }));
+}
+
+// The lines of text in RGB pixels, top to bottom, with Florence-2.
+async function readLines(rgb: Buffer, width: number, height: number): Promise<TextLine[]> {
+  const { processor, model } = await readModel();
+  const task = "<OCR_WITH_REGION>";
+  const image = new (transformers().RawImage)(rgb, width, height, 3);
+  const inputs = await processor(image, processor.construct_prompts(task));
+  const ids = await model.generate({ ...inputs, max_new_tokens: 512 });
+  const answer = processor.post_process_generation(processor.batch_decode(ids, { skip_special_tokens: false })[0], task, image.size)[task];
+  // Each line comes with 4 corners (x1, y1, ... x4, y4): keep the box around them.
+  return answer.labels
+    .map((label: string, n: number) => {
+      const corners: number[] = answer.quad_boxes[n];
+      const xs = corners.filter((_, k) => k % 2 === 0);
+      const ys = corners.filter((_, k) => k % 2 === 1);
+      const x = Math.min(...xs);
+      const y = Math.min(...ys);
+      return { text: label.replace(/<\/?s>|<pad>/g, "").trim(), x: round(x, 1), y: round(y, 1), width: round(Math.max(...xs) - x, 1), height: round(Math.max(...ys) - y, 1) };
+    })
+    .filter((line: TextLine) => line.text && line.width >= 4 && line.height >= 4) // a box too thin to hold text is a misread
+    .sort((a: TextLine, b: TextLine) => a.y - b.y || a.x - b.x);
+}
+
+// Read the text in a picture or video: signs, titles, slides, screens, labels.
+// Picture: every line with its box (draw: the boxes drawn on). Video: each text and when it is on screen, checked every `every` seconds.
+export async function read(input: string, options: { every?: number; draw?: string } = {}) {
+  requireFile(input);
+  if (PICTURE_FILE.test(input)) {
+    const { canvas, ctx, width, height } = await pictureCanvas(input);
+    const lines = await readLines(rgbFrom(ctx.getImageData(0, 0, width, height).data, width, height), width, height);
+    if (options.draw) {
+      drawThings(ctx, lines.map((l) => ({ ...l, label: l.text, score: 1 })), 1, false);
+      await saveCanvas(canvas, options.draw);
+    }
+    return { text: lines.map((l) => l.text).join("\n"), lines, ...(options.draw ? { draw: options.draw } : {}) };
+  }
+  if (options.draw) throw new Error("--draw works on pictures. For a video, take a frame first: node joedit.ts video frame <video> frame.png --time S");
+  const every = options.every ?? 1;
+  const { width, duration } = requireVideo(input);
+  const until = (time: number) => round(Math.min(duration, time + every)); // a check covers until the next one
+  // Text that stays on screen is one entry; it ends when a check no longer sees it.
+  const texts: (TextLine & { start: number; end: number })[] = [];
+  let showing = new Map<string, TextLine & { start: number; end: number }>();
+  let checked = 0;
+  for await (const frame of readFrames(input, { fps: 1 / every, width: Math.min(width, 1280) })) {
+    checked++;
+    const scale = width / frame.width;
+    const time = round(frame.time, 3);
+    const next = new Map<string, TextLine & { start: number; end: number }>();
+    for (const line of await readLines(rgbFrom(frame.pixels, frame.width, frame.height), frame.width, frame.height)) {
+      const key = line.text.toLowerCase();
+      const entry = showing.get(key) ?? next.get(key);
+      if (entry) entry.end = until(time);
+      else {
+        const box = { x: round(line.x * scale, 1), y: round(line.y * scale, 1), width: round(line.width * scale, 1), height: round(line.height * scale, 1) };
+        const created = { text: line.text, ...box, start: time, end: until(time) };
+        texts.push(created);
+        next.set(key, created);
+        continue;
+      }
+      next.set(key, entry);
+    }
+    showing = next;
+  }
+  return { every, checked, texts };
+}
+
+// ---------- Index: one log of all the footage ----------
+
+const SOUND_FILE = /\.(wav|mp3|m4a|aac|flac|ogg|opus|aiff?)$/i;
+
+// Everything joEdit can tell about one file, using the AI models that are installed.
+async function indexFile(file: string, every: number, cache: string): Promise<Record<string, any>> {
+  const has = (model: string) => isModelInstalled(model);
+  const kind = PICTURE_FILE.test(file) ? "picture" : VIDEO_FILE.test(file) ? "video" : "sound";
+  const entry: Record<string, any> = { kind };
+  const details = kind === "picture" ? null : video.info(file);
+  if (kind === "picture") {
+    const { width, height } = await (await openPicture(file)).metadata();
+    Object.assign(entry, { width, height });
+  } else {
+    entry.duration = round(details!.duration, 2);
+    if (kind === "video") Object.assign(entry, { width: details!.width, height: details!.height, fps: details!.fps, cuts: scenes(file).cuts });
+  }
+  // What it looks like.
+  if (kind !== "sound") {
+    entry.colors = (await colors(file, 5)).colors.map((c) => c.hex);
+    if (has("objects")) {
+      const found: any = await objects(file, { every });
+      entry.things = kind === "picture" ? count(found.things.map((t: Thing) => t.label)) : found.seen.map((s: any) => ({ label: s.label, most: s.most, moments: s.moments }));
+    }
+    if (has("faces")) {
+      const found: any = await faces(file, { every });
+      entry.faces = kind === "picture" ? found.count : { most: found.seen[0]?.most ?? 0, moments: found.seen[0]?.moments ?? [] };
+    }
+    if (has("read")) {
+      const found: any = await read(file, { every });
+      entry.text = kind === "picture" ? found.text : found.texts.map((t: any) => ({ text: t.text, start: t.start, end: t.end }));
+    }
+  }
+  // What it sounds like.
+  if (kind === "sound" || details?.hasAudio) {
+    entry.lufs = listen.loudness(file).lufs;
+    if (has("whisper")) {
+      const words = join(cache, `${basename(file)}.words.json`);
+      const said = await listen.transcribe(file, words);
+      entry.speech = { language: said.language, words: said.words, text: said.text, transcript: words };
+    }
+    if (has("sounds")) entry.sounds = await listen.soundTags(file);
+  }
+  return entry;
+}
+
+// How many of each: ["person", "person", "dog"] -> { person: 2, dog: 1 }
+function count(labels: string[]): Record<string, number> {
+  const counts: Record<string, number> = {};
+  for (const label of labels) counts[label] = (counts[label] ?? 0) + 1;
+  return counts;
+}
+
+// One JSON log of every picture, video and sound in a folder: size, length, cuts, colors, things, faces,
+// text on screen, loudness, what is said and what can be heard. Read it to know the footage without opening each file.
+// Files that did not change since the last index are not looked at again. Each AI part runs only when its model is installed.
+export async function index(folder: string, output?: string, options: { every?: number } = {}) {
+  requireFile(folder);
+  if (!statSync(folder).isDirectory()) throw new Error("index looks at a folder. For one file, use look objects, look read or listen transcribe.");
+  const every = options.every ?? 2;
+  const target = output ?? join(folder, "index.json");
+  const cache = join(folder, ".joedit-cache", "index");
+  mkdirSync(cache, { recursive: true });
+  const before: Record<string, any> = existsSync(target) ? JSON.parse(readFileSync(target, "utf8")).files ?? {} : {};
+  const names = readdirSync(folder).filter((n) => PICTURE_FILE.test(n) || VIDEO_FILE.test(n) || SOUND_FILE.test(n)).sort();
+  if (!names.length) throw new Error("No pictures, videos or sounds in this folder.");
+  const files: Record<string, any> = {};
+  let looked = 0;
+  for (const name of names) {
+    const path = join(folder, name);
+    const { size, mtimeMs } = statSync(path);
+    const old = before[name];
+    if (old && old.bytes === size && old.modified === Math.round(mtimeMs) && old.every === every) {
+      files[name] = old;
+      continue;
+    }
+    looked++;
+    try {
+      files[name] = { bytes: size, modified: Math.round(mtimeMs), every, ...(await indexFile(path, every, cache)) };
+    } catch (error) {
+      files[name] = { bytes: size, modified: Math.round(mtimeMs), every, error: (error as Error).message };
+    }
+    writeFileSync(target, JSON.stringify({ folder: resolve(folder), files }, null, 1)); // saved after each file, so a stop loses little
+  }
+  writeFileSync(target, JSON.stringify({ folder: resolve(folder), files }, null, 1));
+  const missing = ["objects", "faces", "read", "whisper", "sounds"].filter((m) => !isModelInstalled(m));
+  return {
+    output: target,
+    files: names.length,
+    looked,
+    reused: names.length - looked,
+    ...(missing.length ? { notUsed: `Models not installed (their parts are left out): ${missing.join(", ")}. Add with: node joedit.ts install <name>` } : {}),
+  };
+}
+
+// Faces in a picture or video (the same as objects --what face).
+export function faces(input: string, options: { min?: number; every?: number; draw?: string } = {}) {
+  return objects(input, { ...options, what: ["face"] });
+}
+
 export const commands: Record<string, Command> = {
+  objects: {
+    usage: "objects <picture|video> [--what person,car] [--min 0.5] [--every 1] [--draw boxes.png]  (needs: install objects)",
+    run: (a) =>
+      objects(requireFile(a.positional[0]), {
+        what: a.flags.what ? a.flags.what.split(",").map((w) => w.trim()) : undefined,
+        min: a.flags.min === undefined ? undefined : numberFlag(a, "min"),
+        every: optionalNumberFlag(a, "every", 1),
+        draw: a.flags.draw,
+      }),
+  },
+  faces: {
+    usage: "faces <picture|video> [--min 0.6] [--every 1] [--draw boxes.png]  (needs: install faces)",
+    run: (a) =>
+      faces(requireFile(a.positional[0]), {
+        min: a.flags.min === undefined ? undefined : numberFlag(a, "min"),
+        every: optionalNumberFlag(a, "every", 1),
+        draw: a.flags.draw,
+      }),
+  },
+  index: {
+    usage: "index <folder> [--output index.json] [--every 2]  (one JSON log of all the footage; uses the AI models that are installed)",
+    run: (a) => index(requireFile(a.positional[0]), a.flags.output, { every: optionalNumberFlag(a, "every", 2) }),
+  },
+  read: {
+    usage: "read <picture|video> [--every 1] [--draw boxes.png]  (the text in it, with boxes; video: when each text shows; needs: install read)",
+    run: (a) => read(requireFile(a.positional[0]), { every: optionalNumberFlag(a, "every", 1), draw: a.flags.draw }),
+  },
+  track: {
+    usage: "track <video> <track.json> [--what person|face|car|dog|...] [--every 0.2] [--min 0.5] [--draw track.png]  (needs: install objects or faces)",
+    run: (a) => {
+      const { input, output } = inOut(a);
+      return track(input, output, a.flags.what ?? "person", {
+        every: optionalNumberFlag(a, "every", 0.2),
+        min: a.flags.min === undefined ? undefined : numberFlag(a, "min"),
+        draw: a.flags.draw,
+      });
+    },
+  },
   find: {
     usage: 'find <video|picture|folder> --query "what to find" [--top 5] [--every 1] [--sheet matches.png]  (needs: install vision)',
     run: (a) =>

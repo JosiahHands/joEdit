@@ -1,6 +1,0 @@
-[project]
-name = "joedit-vision"
-version = "0.1.0"
-description = "Search pictures and video by meaning (\"a dog on a beach\") with SigLIP 2 (Apache-2.0)."
-requires-python = ">=3.11,<3.14"
-dependencies = ["transformers>=4.50", "torch>=2.4", "pillow", "numpy", "sentencepiece", "protobuf"]

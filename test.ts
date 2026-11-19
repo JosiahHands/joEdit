@@ -518,6 +518,18 @@ describe("video", () => {
     near(video.info(file("tight.mp4")).duration, 4.2, 0.2);
   });
 
+  test("remove-fillers cuts um and stutters, with the pause after them", () => {
+    // Tones stand in for words: "so" 0-1, "um" 1.3-1.6, "I" 1.9-2.2, "I" 2.4-2.7, "agree" 3-4.
+    const on = "lt(t,1)+between(t,1.3,1.6)+between(t,1.9,2.2)+between(t,2.4,2.7)+between(t,3,4)";
+    execFileSync(FFMPEG, ["-loglevel", "error", "-y", "-f", "lavfi", "-i", `aevalsrc='0.5*sin(2*PI*300*t)*(${on})':d=4.3`, file("filler.wav")]);
+    const words = [["so", 0, 1], ["um,", 1.3, 1.6], ["I", 1.9, 2.2], ["I", 2.4, 2.7], ["agree.", 3, 4]].map(([word, start, end]) => ({ word, start, end }));
+    writeFileSync(file("filler.json"), JSON.stringify({ language: "en", text: "", words, segments: [] }));
+    const result = JSON.parse(ok("video", ["remove-fillers", file("filler.wav"), file("no-filler.wav"), "--transcript", file("filler.json")]));
+    assert.deepEqual(result.removed.map((r: any) => r.word), ["um,", "I"]);
+    // Each cut runs to the end of the pause after the word: 0.3 + 0.3 and 0.3 + 0.2 seconds (minus a tiny margin).
+    near(sound.info(file("no-filler.wav")).duration, 4.3 - 1.04, 0.1);
+  });
+
   test("reframe crops to a phone shape", () => {
     ok("video", ["reframe", file("in.mp4"), file("tall.mp4"), "--aspect", "9:16"]);
     const details = video.info(file("tall.mp4"));
@@ -1232,6 +1244,93 @@ describe("look", () => {
     near(best.end, 4, 0.01);
     assert.ok(existsSync(file("found.png")));
   });
+
+  // A real photo that comes with macOS (an iPhone-style .heic), so no download is needed.
+  const ZEBRA = "/Library/User Pictures/Animals/Zebra.heic";
+
+  test("objects finds and boxes things in a photo (needs the objects model)", (t) => {
+    if (!hasModel("objects") || !existsSync(ZEBRA)) return t.skip("objects model or macOS sample photo missing");
+    const result = JSON.parse(ok("look", ["objects", ZEBRA, "--draw", file("zebra-boxes.png")]));
+    const zebra = result.things.find((thing: any) => thing.label === "zebra");
+    assert.ok(zebra && zebra.score > 0.8, JSON.stringify(result.things));
+    assert.ok(zebra.width > 300 && zebra.height > 300);
+    assert.equal(picture.info(file("zebra-boxes.png")).width, 512);
+    assert.match(cli("look", ["objects", ZEBRA, "--what", "kazoo"]).stderr, /knows: face, person/);
+  });
+
+  test("read finds the text in a picture, and when text shows in a video (needs the read model)", (t) => {
+    if (!hasModel("read")) return t.skip("read model not installed");
+    execFileSync(FFMPEG, ["-loglevel", "error", "-y", "-f", "lavfi", "-i", "color=c=0x334455:s=1280x720", "-frames:v", "1", file("sign.png")]);
+    ok("picture", ["text", file("sign.png"), file("sign.png"), "--text", "GRAND OPENING", "--x", "100", "--y", "150", "--size", "90"]);
+    const result = JSON.parse(ok("look", ["read", file("sign.png"), "--draw", file("sign-boxes.png")]));
+    assert.equal(result.text, "GRAND OPENING");
+    assert.ok(Math.abs(result.lines[0].x - 100) < 15 && Math.abs(result.lines[0].y - 160) < 30, JSON.stringify(result.lines));
+    assert.ok(existsSync(file("sign-boxes.png")));
+    // A video: the sign for 2 s, then a second line joins it for 2 s.
+    ok("picture", ["text", file("sign.png"), file("sign2.png"), "--text", "THANKS FOR COMING", "--x", "100", "--y", "450", "--size", "70"]);
+    execFileSync(FFMPEG, ["-loglevel", "error", "-y", "-loop", "1", "-t", "2", "-i", file("sign.png"), "-loop", "1", "-t", "2", "-i", file("sign2.png"),
+      "-filter_complex", "[0][1]concat=n=2:v=1:a=0,format=yuv420p", file("signs.mp4")]);
+    const texts = JSON.parse(ok("look", ["read", file("signs.mp4")])).texts;
+    assert.deepEqual(texts.map((x: any) => [x.text, x.start, x.end]), [["GRAND OPENING", 0, 4], ["THANKS FOR COMING", 2, 4]]);
+  });
+
+  test("index logs a folder of footage, and only looks again at files that changed", () => {
+    const folder = file("footage");
+    mkdirSync(folder, { recursive: true });
+    execFileSync(FFMPEG, ["-loglevel", "error", "-y", "-f", "lavfi", "-i", "color=c=0x334455:s=640x360", "-frames:v", "1", join(folder, "card.png")]);
+    execFileSync(FFMPEG, ["-loglevel", "error", "-y", "-f", "lavfi", "-i", "testsrc=s=320x240:d=2", "-f", "lavfi", "-i", "sine=f=440:d=2", "-shortest", "-pix_fmt", "yuv420p", join(folder, "clip.mp4")]);
+    const first = JSON.parse(ok("look", ["index", folder]));
+    assert.deepEqual([first.files, first.looked, first.reused], [2, 2, 0]);
+    const log = JSON.parse(readFileSync(join(folder, "index.json"), "utf8")).files;
+    assert.equal(log["card.png"].kind, "picture");
+    assert.equal(log["card.png"].colors[0], "#334455");
+    assert.equal(log["clip.mp4"].kind, "video");
+    assert.ok(Math.abs(log["clip.mp4"].duration - 2) < 0.1 && log["clip.mp4"].lufs < 0);
+    const again = JSON.parse(ok("look", ["index", folder]));
+    assert.deepEqual([again.looked, again.reused], [0, 2]);
+  });
+
+  test("objects and track follow a thing moving through a video", (t) => {
+    if (!hasModel("objects") || !existsSync(ZEBRA)) return t.skip("objects model or macOS sample photo missing");
+    // A zebra photo sliding from left to right over a gray background for 3 seconds.
+    execFileSync(FFMPEG, [
+      "-loglevel", "error", "-y", "-f", "lavfi", "-i", "color=c=gray:s=640x360:r=25:d=3", "-i", ZEBRA,
+      "-filter_complex", "[1]scale=220:220[z];[0][z]overlay=x='20+t*120':y=70", "-pix_fmt", "yuv420p", file("zebra.mp4"),
+    ]);
+    const seen = JSON.parse(ok("look", ["objects", file("zebra.mp4"), "--every", "0.5", "--draw", file("zebra-sheet.png")]));
+    const zebra = seen.seen.find((s: any) => s.label === "zebra");
+    assert.ok(zebra, JSON.stringify(seen));
+    assert.equal(zebra.most, 1);
+    assert.ok(zebra.moments[0][0] <= 0.5 && zebra.moments.at(-1)[1] >= 2.5);
+    const result = JSON.parse(ok("look", ["track", file("zebra.mp4"), file("zebra-track.json"), "--what", "zebra", "--every", "0.25"]));
+    assert.ok(result.coverage > 0.8, JSON.stringify(result));
+    const { points, width } = JSON.parse(readFileSync(file("zebra-track.json"), "utf8"));
+    assert.equal(width, 640);
+    // The box moves right by about 120 pixels a second.
+    const speed = (points.at(-1).x - points[0].x) / (points.at(-1).time - points[0].time);
+    assert.ok(speed > 90 && speed < 150, `moves ${speed} px/s`);
+  });
+
+  test("faces finds faces, and blur-faces hides them in a moving video (needs the faces model and image pack)", (t) => {
+    if (!hasModel("faces") || !hasPack("image")) return t.skip("faces model or image pack missing");
+    // A made-up photo of two people (made on this computer), then a 2 s pan across it.
+    ok("picture", ["generate", file("people.jpg"), "--prompt", "candid photo of two friends laughing at a cafe table, faces visible", "--width", "768", "--height", "512", "--seed", "7"]);
+    const found = JSON.parse(ok("look", ["faces", file("people.jpg")]));
+    assert.equal(found.count, 2, JSON.stringify(found));
+    execFileSync(FFMPEG, [
+      "-loglevel", "error", "-y", "-loop", "1", "-i", file("people.jpg"), "-f", "lavfi", "-i", "sine=frequency=300:duration=2",
+      "-filter_complex", "[0]scale=960:-2,crop=640:480:x='80*t':y=40,format=yuv420p[v]", "-map", "[v]", "-map", "1:a", "-t", "2", "-r", "25", file("people.mp4"),
+    ]);
+    const result = JSON.parse(ok("video", ["blur-faces", file("people.mp4"), file("blurred.mp4")]));
+    assert.equal(result.mostFaces, 2);
+    assert.ok(video.info(file("blurred.mp4")).hasAudio);
+    // The face is now smooth: its detail (difference from a blurred copy) drops a lot; the table below does not change.
+    const detail = (path: string, region: string) => {
+      const log = spawnSync(FFMPEG, ["-hide_banner", "-ss", "1", "-i", path, "-frames:v", "1", "-vf", `crop=${region},edgedetect,signalstats,metadata=print`, "-f", "null", "-"], { encoding: "utf8" }).stderr;
+      return Number(log.match(/YAVG=([\d.]+)/)?.[1] ?? 0);
+    };
+    assert.ok(detail(file("blurred.mp4"), "60:80:150:90") < detail(file("people.mp4"), "60:80:150:90") * 0.5, "face not blurred");
+  });
 });
 
 describe("listen", () => {
@@ -1275,6 +1374,37 @@ describe("listen", () => {
   test("beats needs at least 3 seconds", () => {
     ok("sound", ["trim", file("click120.wav"), file("short.wav"), "--start", "0", "--end", "2"]);
     assert.equal(cli("listen", ["beats", file("short.wav")]).code, 1);
+  });
+
+  test("speakers tells two voices apart, sentence by sentence (needs the whisper and speakers models)", (t) => {
+    if (!hasWhisper() || !hasModel("speakers") || process.platform !== "darwin") return t.skip("whisper/speakers model missing (or not macOS)");
+    const lines: [string, string][] = [
+      ["Daniel", "Welcome back to the show. Today we are talking about editing video."],
+      ["Samantha", "Thanks for having me. I have been looking forward to this."],
+      ["Daniel", "Let's start with the basics. What does your workflow look like?"],
+    ];
+    lines.forEach(([voice, text], n) => execFileSync("say", ["-v", voice, "-o", file(`talk${n}.aiff`), text]));
+    execFileSync(FFMPEG, ["-loglevel", "error", "-y", ...lines.flatMap((_, n) => ["-i", file(`talk${n}.aiff`)]), "-filter_complex", "concat=n=3:v=0:a=1", file("talk.wav")]);
+    const result = JSON.parse(ok("listen", ["speakers", file("talk.wav"), file("talk.json")]));
+    assert.deepEqual(result.speakers.map((s: any) => s.name), ["S1", "S2"]);
+    const segments = JSON.parse(readFileSync(file("talk.json"), "utf8")).segments;
+    const order = segments.map((s: any) => s.speaker).filter((s: string, n: number, all: string[]) => s !== all[n - 1]);
+    assert.deepEqual(order, ["S1", "S2", "S1"]);
+    assert.ok(JSON.parse(readFileSync(file("talk.json"), "utf8")).words.every((w: any) => w.speaker));
+  });
+
+  test("find hears where a sound is, and skips silence (needs the sounds model)", (t) => {
+    if (!hasModel("sounds")) return t.skip("sounds model not installed");
+    ok("sound", ["sfx", file("boom.wav"), "--type", "boom"]);
+    ok("sound", ["sfx", file("ding.wav"), "--type", "ding"]);
+    // boom 0-4 s, silence 4-8 s, ding 8-12 s
+    execFileSync(FFMPEG, ["-loglevel", "error", "-y", "-i", file("boom.wav"), "-i", file("ding.wav"), "-filter_complex",
+      "[0]aresample=48000,apad=whole_dur=8[a];[1]aresample=48000,apad=whole_dur=4[b];[a][b]concat=n=2:v=0:a=1", "-ac", "1", file("scene.wav")]);
+    const bell = JSON.parse(ok("listen", ["find", file("scene.wav"), "--query", "bell", "--top", "1"]));
+    assert.ok(bell.matches[0].start >= 6 && bell.matches[0].score > 0.3, JSON.stringify(bell));
+    const boom = JSON.parse(ok("listen", ["find", file("scene.wav"), "--query", "explosion", "--top", "1"]));
+    assert.ok(boom.matches[0].end <= 6, JSON.stringify(boom));
+    assert.ok(boom.searched < 6, "the silent windows are skipped");
   });
 
   test("transcribe gives words with times (needs the whisper model)", (t) => {
@@ -1398,10 +1528,10 @@ describe("joedit", () => {
     assert.equal(result.passed, true, JSON.stringify(result.problems));
   });
 
-  test("install rejects unknown packs", () => {
+  test("install rejects unknown names and lists what there is", () => {
     const result = cli("joedit", ["install", "nope"]);
     assert.equal(result.code, 1);
-    assert.match(result.stderr, /Available packs: .*whisper/);
+    assert.match(result.stderr, /AI models: .*whisper.*Assets: .*Packs: .*song/);
   });
 
   test("every command of every area is reachable through joedit.ts", async () => {
