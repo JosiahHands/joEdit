@@ -5,9 +5,10 @@
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
-import { ffmpeg, listPacks, loadBrand, requireFile, round, runCli, withTempDir, type Brand, type Command } from "./shared.ts";
+import { ffmpeg, listAssets, listPacks, loadBrand, requireFile, round, runCli, withTempDir, type Brand, type Command } from "./shared.ts";
 import * as graphics from "./graphics.ts";
 import * as listen from "./listen.ts";
+import * as music from "./music.ts";
 import * as picture from "./picture.ts";
 import * as sound from "./sound.ts";
 import * as video from "./video.ts";
@@ -68,8 +69,20 @@ export type Movie = {
   sfx?: { type: string; at: number; volume?: number; duration?: number }[];
   captions?: boolean | { style?: graphics.CaptionStyle; position?: string; transcript?: string; model?: string };
   voiceover?: { text: string; voice?: string; speed?: number; at?: number; volume?: number }; // spoken by the tts pack
-  beatSync?: string; // a sound file: cuts move to its nearest beats
+  music?: MusicSpec; // background music: a composed score, an AI song, or a file
+  beatSync?: string | boolean; // a sound file (or true = the movie's music): cuts move to its nearest beats
   notes?: string; // free text, ignored when rendering
+};
+
+export type MusicSpec = {
+  score?: string; // a score file for music compose
+  song?: { prompt: string; lyrics?: string; duration?: number; seed?: number; bpm?: number }; // song pack
+  file?: string; // any sound file
+  volume?: number;
+  duck?: boolean; // default true: quieter while people speak
+  loop?: boolean;
+  fadeIn?: number;
+  fadeOut?: number; // default 2
 };
 
 // ffmpeg's xfade transitions that work well. Any of these can be a scene's transition type.
@@ -82,7 +95,7 @@ export const TRANSITIONS = [
 
 const SCENE_KINDS = ["video", "image", "title", "html", "color"];
 const SCENE_KEYS = [...SCENE_KINDS, "duration", "from", "to", "volume", "fit", "motion", "subtitle", "data", "look", "transition", "text"];
-const MOVIE_KEYS = ["size", "fps", "brand", "look", "lookStrength", "effects", "scenes", "audio", "sfx", "captions", "voiceover", "beatSync", "notes"];
+const MOVIE_KEYS = ["size", "fps", "brand", "look", "lookStrength", "effects", "scenes", "audio", "sfx", "captions", "voiceover", "music", "beatSync", "notes"];
 const TRACK_KEYS = ["file", "at", "volume", "from", "to", "fadeIn", "fadeOut", "loop", "duck"];
 const DEFAULT_DURATION = 3;
 const CACHE_VERSION = 1; // bump to throw away old cached scenes after changing how scenes render
@@ -147,7 +160,17 @@ export function validate(movie: Movie, base: string): { valid: boolean; errors: 
   if (movie.fps !== undefined && !(movie.fps > 0 && movie.fps <= 120)) errors.push("fps: use a number like 24, 30 or 60.");
   if (movie.brand) file("brand", movie.brand);
   if (movie.look && !video.LOOKS[movie.look]) errors.push(`look: unknown look "${movie.look}". Looks: ${Object.keys(video.LOOKS).join(", ")}.`);
-  if (movie.beatSync) file("beatSync", movie.beatSync);
+  if (typeof movie.beatSync === "string") file("beatSync", movie.beatSync);
+  if (movie.beatSync === true && !movie.music) errors.push('beatSync: true means "cut on the beat of the movie\'s music", so add "music" (or give a sound file instead).');
+  if (movie.music) {
+    const sources = (["score", "song", "file"] as const).filter((k) => movie.music![k]);
+    if (sources.length !== 1) errors.push('music: give exactly one of "score" (a score file), "song" ({"prompt": ...}) or "file".');
+    if (movie.music.score) file("music", movie.music.score);
+    if (movie.music.file) file("music", movie.music.file);
+    if (movie.music.score && !listAssets().find((a) => a.name === "instruments")?.installed) errors.push("music: a score needs instrument sounds. Run: node joedit.ts install instruments");
+    if (movie.music.song && !movie.music.song.prompt) errors.push('music: a song needs a "prompt" describing the style.');
+    if (movie.music.song && !listPacks().find((p) => p.name === "song")?.installed) errors.push("music: a song needs the song pack. Run: node joedit.ts install song");
+  }
   if (movie.effects) {
     try {
       video.effectsGraph(movie.effects, "in", "out");
@@ -221,11 +244,10 @@ export function validate(movie: Movie, base: string): { valid: boolean; errors: 
 
 // ---------- Timing ----------
 
-// Scene lengths, rounded to whole frames, with cuts moved onto the beat if beatSync is set.
-function planTimes(movie: Movie, base: string, fps: number): number[] {
+// Scene lengths, rounded to whole frames, with cuts moved onto the beats if any are given.
+function planTimes(movie: Movie, base: string, fps: number, beats: number[]): number[] {
   const lengths = movie.scenes.map((scene) => sceneLength(scene, base));
-  if (movie.beatSync) {
-    const { beats } = listen.beats(pathFrom(base, movie.beatSync));
+  if (beats.length) {
     let start = 0;
     for (let n = 1; n < lengths.length; n++) {
       const overlap = transitionOf(movie.scenes[n])?.duration ?? 0;
@@ -426,6 +448,24 @@ function mixSound(movie: Movie, tracks: Track[], joined: string, length: number,
   else ffmpeg(["-i", raw, "-ar", "48000", output]);
 }
 
+// Make the movie's music (cached). Composed scores also give their exact beat times.
+function makeMusic(spec: MusicSpec, ctx: Context): { file: string; beats?: number[] } {
+  if (spec.file) return { file: pathFrom(ctx.base, spec.file) };
+  if (spec.score) {
+    const scoreFile = pathFrom(ctx.base, spec.score);
+    const key = createHash("sha256").update(readFileSync(scoreFile)).digest("hex").slice(0, 16);
+    const file = join(ctx.cache, `score-${key}.wav`);
+    const score = JSON.parse(readFileSync(scoreFile, "utf8"));
+    const made = existsSync(file) ? { beats: music.scoreToMidi(score).beats } : music.compose(scoreFile, file);
+    const secondsPerBeat = 60 / (score.tempo ?? 120);
+    return { file, beats: Array.from({ length: Math.ceil(made.beats) }, (_, k) => k * secondsPerBeat) };
+  }
+  const key = createHash("sha256").update(JSON.stringify(spec.song)).digest("hex").slice(0, 16);
+  const file = join(ctx.cache, `song-${key}.wav`);
+  if (!existsSync(file)) music.song(file, spec.song!.prompt, spec.song!);
+  return { file };
+}
+
 // Speak the voice-over (cached like scenes). Returns the sound file and the time of every word.
 function makeVoiceover(spec: NonNullable<Movie["voiceover"]>, ctx: Context): { file: string; words: graphics.CaptionWord[] } {
   const key = createHash("sha256").update(JSON.stringify({ text: spec.text, voice: spec.voice, speed: spec.speed })).digest("hex").slice(0, 16);
@@ -456,7 +496,12 @@ export async function renderMovie(file: string, output: string, draft = false) {
   return withTempDir(async (temp) => {
     const brand = loadBrand(movie.brand ? pathFrom(base, movie.brand) : undefined);
     const ctx: Context = { base, width, height, fps, draft, brand, cache, temp };
-    const lengths = planTimes(movie, base, fps);
+    // Music first, because beatSync can cut to its beats.
+    const backing = movie.music ? makeMusic(movie.music, ctx) : undefined;
+    let beats: number[] = [];
+    if (movie.beatSync === true && backing) beats = backing.beats ?? listen.beats(backing.file).beats;
+    if (typeof movie.beatSync === "string") beats = listen.beats(pathFrom(base, movie.beatSync)).beats;
+    const lengths = planTimes(movie, base, fps, beats);
 
     // 1. Every scene (reusing cached ones).
     const segments: string[] = [];
@@ -471,6 +516,10 @@ export async function renderMovie(file: string, output: string, draft = false) {
     const joined = join(temp, "joined.mp4");
     const length = joinScenes(movie, segments, lengths, joined, ctx);
     const tracks = [...(movie.audio ?? [])];
+    if (backing) {
+      const m = movie.music!;
+      tracks.push({ file: backing.file, volume: m.volume ?? 0.8, duck: m.duck ?? true, loop: m.loop, fadeIn: m.fadeIn, fadeOut: m.fadeOut ?? 2 });
+    }
     const spoken = movie.voiceover ? makeVoiceover(movie.voiceover, ctx) : undefined;
     if (spoken) tracks.push({ file: spoken.file, at: movie.voiceover!.at ?? 0, volume: movie.voiceover!.volume ?? 1 });
     const mixed = join(temp, "mix-final.wav");

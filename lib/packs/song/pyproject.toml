@@ -1,0 +1,21 @@
+[project]
+name = "joedit-song"
+version = "0.1.0"
+description = "Full songs with vocals or instrumentals from a description and lyrics (ACE-Step 1.5, MIT). Large: needs ~10 GB disk; best on Apple Silicon or an NVIDIA GPU."
+requires-python = ">=3.11,<3.13"
+dependencies = [
+  "ace-step @ git+https://github.com/ace-step/ACE-Step-1.5.git",
+  # ACE-Step's fast language-model engine for NVIDIA GPUs (not used on Macs).
+  "nano-vllm; sys_platform != 'darwin'",
+]
+
+[tool.uv]
+# ACE-Step pins special CUDA builds of torch from its own index; the normal builds work everywhere.
+override-dependencies = ["torch>=2.7", "torchvision", "torchaudio>=2.7", "setuptools<72"]
+environments = [
+  "sys_platform == 'darwin' and platform_machine == 'arm64'",
+  "sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
+
+[tool.uv.sources]
+nano-vllm = { git = "https://github.com/ace-step/ACE-Step-1.5.git", subdirectory = "acestep/third_parts/nano-vllm" }

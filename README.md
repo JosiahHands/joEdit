@@ -6,6 +6,7 @@ A studio for AI agents: edit pictures, video and sound, make motion graphics and
 - **Edit:** trim, join, jump cuts, reframe for phones, picture-in-picture, color grades, film effects, sound mixing, denoising.
 - **Create:** HTML → video motion graphics, titles, lower-thirds, karaoke captions, sound effects.
 - **Voice:** natural text-to-speech, consent-based voice cloning, and splitting songs into vocals/drums/bass (open models, run locally).
+- **Music:** write scores (chords, melodies, drum grooves) played with real instrument sounds, or generate full songs with vocals.
 - **See & hear:** contact sheets, waveforms, loudness, beats, transcripts, and a one-command quality `check`.
 
 ## Install

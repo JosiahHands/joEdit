@@ -12,7 +12,7 @@ import * as video from "./lib/video.ts";
 import * as sound from "./lib/sound.ts";
 import * as graphics from "./lib/graphics.ts";
 
-type Tool = "picture" | "video" | "sound" | "look" | "listen" | "graphics" | "movie" | "voice" | "joedit";
+type Tool = "picture" | "video" | "sound" | "look" | "listen" | "graphics" | "movie" | "voice" | "music" | "joedit";
 
 // Graphics tests need Chrome; they are skipped on machines without it.
 const hasChrome = (() => {
@@ -596,6 +596,76 @@ describe("voice", () => {
     frameAt(file("vo.mp4"), 0.05, file("vo-start.png"));
     assert.ok(regionDiff(file("vo-start.png"), file("vo.png"), "320x60+0+110") > 0.03, "no captions at 1.5s");
     assert.ok(loudness(file("vo.mp4")) > -40);
+  });
+});
+
+describe("music", () => {
+  const hasInstruments = () => JSON.parse(ok("joedit", ["packs"])).assets.find((a: any) => a.name === "instruments")?.installed;
+  const score = {
+    tempo: 120,
+    bars: 4,
+    tracks: [
+      { instrument: "piano", chords: "C Am F G", rhythm: "block" },
+      { instrument: "synth bass", chords: "C Am F G", rhythm: "bass" },
+      { instrument: "flute", melody: "E5 D5 C5:2 - G4 C5:2" },
+    ],
+    drums: { style: "four-on-floor" },
+  };
+
+  test("compose writes a MIDI file without needing any sounds", () => {
+    writeFileSync(file("score.json"), JSON.stringify(score));
+    const result = JSON.parse(ok("music", ["compose", file("score.json"), file("score.mid")]));
+    assert.equal(result.seconds, 8); // 4 bars of 4 beats at 120 BPM
+    assert.equal(execFileSync("head", ["-c", "4", file("score.mid")], { encoding: "utf8" }), "MThd");
+  });
+
+  test("compose plays the score in time (needs the instruments asset and fluidsynth)", (t) => {
+    const hasFluidsynth = spawnSync("which", ["fluidsynth"]).status === 0;
+    if (!hasInstruments() || !hasFluidsynth) return t.skip("instruments asset or fluidsynth missing");
+    writeFileSync(file("score.json"), JSON.stringify(score));
+    ok("music", ["compose", file("score.json"), file("score.wav")]);
+    near(sound.info(file("score.wav")).duration, 9.5, 0.2); // 8 seconds plus the last notes ringing out
+    const beats = JSON.parse(ok("listen", ["beats", file("score.wav")]));
+    assert.ok(Math.abs(beats.bpm - 120) <= 3, `bpm ${beats.bpm}`);
+    const level = JSON.parse(ok("listen", ["loudness", file("score.wav")]));
+    assert.equal(level.verdict, "good");
+  });
+
+  test("compose explains bad chords, notes and instruments", () => {
+    const bad = (part: object) => {
+      writeFileSync(file("bad-score.json"), JSON.stringify({ tracks: [part] }));
+      return cli("music", ["compose", file("bad-score.json"), file("x.mid")]);
+    };
+    assert.match(bad({ chords: "C Hm" }).stderr, /not a chord/);
+    assert.match(bad({ melody: "C4 Q9" }).stderr, /not a note/);
+    assert.match(bad({ instrument: "kazoo", melody: "C4" }).stderr, /Unknown instrument/);
+    const list = JSON.parse(ok("music", ["instruments"]));
+    assert.equal(list.instruments.length, 128);
+    assert.ok(list.drumStyles.includes("hiphop"));
+  });
+
+  test("a movie can use composed music and cut on its beat", (t) => {
+    if (!hasInstruments()) return t.skip("instruments asset missing");
+    writeFileSync(file("score.json"), JSON.stringify(score));
+    writeFileSync(file("music-movie.json"), JSON.stringify({
+      size: "160x90",
+      music: { score: "score.json" },
+      beatSync: true,
+      scenes: [{ color: "red", duration: 1.3 }, { color: "blue", duration: 1.8 }, { color: "lime", duration: 2 }],
+    }));
+    ok("movie", ["render", file("music-movie.json"), file("music-movie.mp4")]);
+    assert.ok(video.info(file("music-movie.mp4")).hasAudio);
+    const cuts = JSON.parse(ok("look", ["scenes", file("music-movie.mp4")])).cuts;
+    assert.equal(cuts.length, 2);
+    for (const cut of cuts) assert.ok(Math.abs(cut - Math.round(cut * 2) / 2) < 0.05, `cut at ${cut} is not on a beat`);
+  });
+
+  test("song makes music from a description (needs the song pack)", (t) => {
+    if (!hasPack("song")) return t.skip("song pack not installed");
+    const result = JSON.parse(ok("music", ["song", file("song.wav"), "--prompt", "calm acoustic guitar instrumental", "--duration", "10", "--seed", "1"]));
+    near(sound.info(file("song.wav")).duration, 10, 1);
+    assert.equal(JSON.parse(ok("listen", ["loudness", file("song.wav")])).verdict, "good");
+    assert.ok(result.seed !== undefined);
   });
 });
 

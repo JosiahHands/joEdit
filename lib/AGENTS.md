@@ -3,7 +3,7 @@
 joEdit is a toolkit for editing pictures, video and sound, making motion graphics, and **seeing and hearing the results**. It runs entirely on this computer: no API keys, no cost per edit. Use it however suits the job: one command at a time, chained in a script, or imported as TypeScript functions. When joEdit doesn't do something, `ffmpeg`, `ffprobe` and `magick` are installed too, so call them directly or extend joEdit.
 
 ```
-node joedit.ts <area> <command> ...      areas: picture, video, sound, look, listen, graphics, movie, voice
+node joedit.ts <area> <command> ...      areas: picture, video, sound, look, listen, graphics, movie, voice, music
 node joedit.ts                           prints every command
 node joedit.ts doctor                    shows what this computer has installed
 ```
@@ -134,6 +134,33 @@ stems <music> <folder> [--only vocals|drums|bass|other]   → vocals.wav drums.w
 - `clone` (`install clone`, Chatterbox) speaks new words in the voice of a 5–20 second sample. It needs `--consent` with a sentence about whose voice it is and that they agreed; that statement is saved in `<out>.consent.txt` (with a fingerprint of the sample) and in the file's metadata, and the speech carries Chatterbox's inaudible watermark. `--emotion` 0.25 (calm) … 1 (very expressive).
 - `stems` (`install stems`, Demucs) splits any song or video sound. `--only vocals` gives `vocals.wav` and `without-vocals.wav`: voice isolation from noisy footage, karaoke backing tracks, remixes, or ducking a song's music under new speech.
 
+**music**: write music as a score, or generate whole songs
+```
+compose <score.json> <out.wav|.mp3|.mid>    play a score with real instruments (install instruments; needs fluidsynth)
+instruments                                 → the 128 instrument names, short names, drum sounds, drum styles, rhythms, chords
+song <out.wav> --prompt "style, mood, instruments, voice" [--lyrics lyrics.txt] [--duration 30] [--bpm N] [--seed N]
+```
+A score is JSON. You decide every note, so the music fits the film exactly (length, tempo, mood, where it builds):
+```json
+{
+  "tempo": 96, "beatsPerBar": 4, "bars": 16,
+  "tracks": [
+    {"instrument": "piano", "chords": "Am F C G", "rhythm": "arp", "repeat": 4},
+    {"instrument": "strings", "chords": "Am F C G", "rhythm": "pad", "repeat": 4, "volume": 0.5, "octave": 3},
+    {"instrument": "synth bass", "chords": "Am F C G", "rhythm": "bass", "repeat": 4, "start": 16},
+    {"instrument": "flute", "melody": "E5 D5 C5:2 - A4 C5:2 E5:4", "start": 32, "pan": 0.3},
+    {"instrument": "violin", "notes": [["A5", 48, 4, 100], ["G5", 52, 4, 90]]}
+  ],
+  "drums": {"style": "hiphop", "start": 16}
+}
+```
+- Times are in beats from the start. `melody` notes last 1 beat unless written `C5:2` (2 beats) or `G4:0.5`; `-` is a rest.
+- `chords` are names like `C Am F G7 Dm7 Fmaj7 Esus4 Cadd9 C/E`, one per bar unless `beatsPerChord`. `rhythm`: `pad` (held), `block` (each beat), `arp` (broken chord in eighths), `strum` (guitar pattern), `pulse` (eighth-note synth), `bass` (bass line from the chord roots).
+- `instrument`: any General MIDI name (`acoustic grand piano`, `cello`, `warm pad`, `steel drums` …) or short names: piano, electric piano, organ, guitar, electric guitar, bass, synth bass, strings, violin, cello, harp, choir, trumpet, brass, sax, flute, lead, pad, bells, music box, marimba.
+- `drums`: a `style` (`four-on-floor`, `hiphop`, `rock`, `halftime`, `trap`, `bossa`, `waltz`) or your own `pattern`: `{"kick": "x...x...x...x...", "snare": "....x.......x...", "hat": "x.x.x.x.x.x.x.x."}`. Each character is a 16th note: `x` hit, `X` accent, `o` soft, `.` rest. Drums: kick, snare, rim, clap, hat, openhat, pedalhat, crash, ride, hightom, midtom, lowtom, tambourine, cowbell, shaker, conga, bongo.
+- Ideas: start sparse and add parts every 8 bars to build energy; set `tempo` so that 1 bar = a scene length; make the score exactly as long as the film (`bars` = seconds × tempo / 60 / 4). `.mid` output opens in any music app.
+- `song` (`install song`, ACE-Step 1.5, ~10 GB of models) makes a full produced song: describe genre, mood, instruments and voice in `--prompt`; lyrics use section tags like `[verse]`, `[chorus]`, `[bridge]`. Without lyrics it is instrumental. Same `--seed` = same song. Takes a minute or two on Apple Silicon or an NVIDIA GPU. To check the singing (or time lyric captions), split it first: `voice stems song.wav stems --only vocals`, then `listen transcribe stems/vocals.wav words.json`; speech-to-text hears sung words much better without the band.
+
 **movie**: a whole film from one JSON file
 ```
 render <movie.json> <out.mp4> [--draft]     → duration, scenes rendered/cached, time taken, and a quality check
@@ -165,8 +192,9 @@ A movie file describes the film; joEdit does the cutting, transitions, text, sou
   ],
   "sfx": [{"type": "whoosh", "at": 2.9}, {"type": "boom", "at": 0, "volume": 1}],
   "voiceover": {"text": "Every great film starts with a voice.", "voice": "am_michael", "at": 0.5},   // tts pack
+  "music": {"score": "score.json", "volume": 0.7},    // or {"song": {"prompt": "...", "duration": 60}} or {"file": "track.mp3"}
   "captions": {"style": "karaoke", "position": "bottom"},   // or {"transcript": "words.json"}; true = defaults
-  "beatSync": "music.mp3",                 // move every cut to the nearest beat
+  "beatSync": true,                        // move every cut to the nearest beat of "music" (or give a sound file)
   "notes": "free text for yourself"
 }
 ```
@@ -174,6 +202,7 @@ A movie file describes the film; joEdit does the cutting, transitions, text, sou
 - **Scenes** are one of `title`, `video`, `image`, `html` (any page you write, rendered like `graphics render`) or `color`. Non-video scenes last 3 seconds unless `duration` is given. Video scenes use `from`/`to` (or `duration`) and `fit`: `cover` fills the frame and crops the edges, `contain` shows the whole clip on a blurred copy of itself (good for wide clips in a phone video).
 - **Transitions** belong to the scene they lead into: `fade`, `fadeblack`, `fadewhite`, `dissolve`, `wipeleft/right/up/down`, `slideleft/right/up/down`, `smoothleft/right/up/down`, `circleopen`, `circleclose`, `radial`, `pixelize`, `zoomin`, `hblur`, `squeezeh`, `coverleft`, `revealright` and more (`validate` lists them all). Each transition overlaps the two scenes, so the film gets shorter by its duration.
 - **Sound:** scene sound, `audio` tracks and `sfx` are mixed together and set to -14 LUFS. Tracks with `"duck": true` go quiet whenever the other sound (speech) is loud. `at` is seconds from the start of the film.
+- **Music** is made once and cached: a `score` is composed (with exact beat times for `beatSync`), a `song` is generated by the song pack, a `file` is used as it is. It ducks under speech unless `"duck": false`, and fades out over 2 seconds unless `fadeOut` says otherwise.
 - **Voice-over** is spoken with Kokoro, mixed in like an audio track (music with `duck` goes quiet under it), and cached.
 - **Captions** use the transcript if given, else the voice-over's own word times, else they transcribe the final mix (whisper pack).
 - After rendering, the result includes `check` (black frames, silence, loudness) and `warnings`, e.g. a voice-over longer than the film. An intended black ending shows up in `check`, which is fine.
@@ -185,7 +214,7 @@ check <file>                                quality report with fix commands
 packs                                       available AI packs and assets, and whether they are installed
 install <name>                              a pack (needs uv) or an asset (fonts, browser)
 ```
-Packs: `whisper` (speech to text), `tts` (speak), `clone` (voice cloning), `stems` (music separation). Each installs once (a few minutes, mostly downloading) and then runs offline; the first use of each also downloads its model.
+Packs: `whisper` (speech to text), `tts` (speak), `clone` (voice cloning), `stems` (music separation), `song` (AI songs). Assets: `fonts`, `instruments` (sounds for music compose), `browser`. Each installs once (a few minutes, mostly downloading) and then runs offline; the first use of each also downloads its model.
 
 ## Examples
 Ideas for combining commands, not fixed recipes.

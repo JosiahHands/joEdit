@@ -1,7 +1,7 @@
 // Shared helpers used by every joEdit module: running programs, reading arguments, the CLI,
 // packs (local AI tools), assets (downloaded fonts and tools) and the brand kit.
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -272,7 +272,7 @@ export type Asset = {
   name: string;
   description: string;
   license: string;
-  files?: { url: string; path: string }[]; // downloaded into .assets/<name>/<path>
+  files?: { url: string; path: string; unzip?: boolean }[]; // downloaded into .assets/<name>/<path> (zips are unpacked)
   command?: string[]; // or: a command that installs it into .assets/<name>
 };
 
@@ -289,6 +289,24 @@ export const ASSET_LIST: Asset[] = [
       { url: `${GOOGLE_FONTS}/bebasneue/BebasNeue-Regular.ttf`, path: "BebasNeue.ttf" },
       { url: `${GOOGLE_FONTS}/playfairdisplay/PlayfairDisplay%5Bwght%5D.ttf`, path: "PlayfairDisplay.ttf" },
       { url: `${GOOGLE_FONTS}/jetbrainsmono/JetBrainsMono%5Bwght%5D.ttf`, path: "JetBrainsMono.ttf" },
+    ],
+  },
+  {
+    name: "instruments",
+    description: "GeneralUser GS: 259 instrument sounds (piano, strings, drums, synths …) for music compose. 32 MB.",
+    license: "GeneralUser GS License v2.0 (free for any use)",
+    files: [{ url: "https://raw.githubusercontent.com/mrbumpy409/GeneralUser-GS/main/GeneralUser-GS.sf2", path: "GeneralUser-GS.sf2" }],
+  },
+  {
+    name: "upscaler",
+    description: "Real-ESRGAN: makes pictures and video frames 2-4x bigger with AI-sharpened detail (runs on the GPU via Vulkan/Metal). 50 MB.",
+    license: "BSD-3-Clause",
+    files: [
+      {
+        url: `https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesrgan-ncnn-vulkan-20220424-${process.platform === "darwin" ? "macos" : process.platform === "win32" ? "windows" : "ubuntu"}.zip`,
+        path: "upscaler.zip",
+        unzip: true,
+      },
     ],
   },
   {
@@ -330,7 +348,17 @@ export async function installAsset(name: string): Promise<{ asset: string; insta
   for (const file of asset.files ?? []) {
     const response = await fetch(file.url);
     if (!response.ok) throw new Error(`Download failed (${response.status}): ${file.url}`);
-    writeFileSync(join(folder, file.path), Buffer.from(await response.arrayBuffer()));
+    const target = join(folder, file.path);
+    writeFileSync(target, Buffer.from(await response.arrayBuffer()));
+    if (file.unzip) {
+      run("unzip", ["-o", "-q", target, "-d", folder]);
+      rmSync(target);
+      // Zips do not always keep the "can run" flag, so set it on the programs inside.
+      for (const name of readdirSync(folder)) {
+        const path = join(folder, name);
+        if (!name.includes(".") && statSync(path).isFile()) chmodSync(path, 0o755);
+      }
+    }
   }
   return { asset: name, installed: true };
 }
