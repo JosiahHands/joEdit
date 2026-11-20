@@ -1,0 +1,32 @@
+# Auto release: when lib/package.json on main has a version that has no release yet,
+# tag it (v1.2.3) and publish "joEdit 1.2.3". The release notes are the commit message body.
+name: Release
+
+on:
+  push:
+    branches: [main]
+    paths: [lib/package.json]
+  workflow_dispatch: # also runnable by hand from the Actions tab
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Release the new version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(node -p "require('./lib/package.json').version")
+          tag="v$version"
+          if gh release view "$tag" > /dev/null 2>&1; then
+            echo "$tag is already released."
+            exit 0
+          fi
+          # The commit message body, without the co-author line, becomes the release notes.
+          git log -1 --format=%b | grep -v '^Co-Authored-By:' > notes.md
+          gh release create "$tag" --target "$GITHUB_SHA" --title "joEdit $version" --notes-file notes.md --latest
