@@ -1,12 +1,10 @@
-# Auto release: when lib/package.json on main has a version that has no release yet,
-# tag it (v1.2.3) and publish "joEdit 1.2.3". The release notes are the commit message body.
+# Auto release: a commit on main whose title starts with a version, like "v2.1.1: color fixes",
+# is tagged v2.1.1 and published as "joEdit 2.1.1". The release notes are the commit message body.
 name: Release
 
 on:
   push:
     branches: [main]
-    paths: [lib/package.json]
-  workflow_dispatch: # also runnable by hand from the Actions tab
 
 permissions:
   contents: write
@@ -17,16 +15,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Release the new version
+      - name: Release the version in the commit title
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          version=$(node -p "require('./lib/package.json').version")
-          tag="v$version"
+          title=$(git log -1 --format=%s)
+          tag=$(echo "$title" | grep -oE '^v[0-9]+\.[0-9]+\.[0-9]+' || true)
+          if [ -z "$tag" ]; then
+            echo "No vX.Y.Z at the start of \"$title\": nothing to release."
+            exit 0
+          fi
           if gh release view "$tag" > /dev/null 2>&1; then
             echo "$tag is already released."
             exit 0
           fi
           # The commit message body, without the co-author line, becomes the release notes.
           git log -1 --format=%b | grep -v '^Co-Authored-By:' > notes.md
-          gh release create "$tag" --target "$GITHUB_SHA" --title "joEdit $version" --notes-file notes.md --latest
+          gh release create "$tag" --target "$GITHUB_SHA" --title "joEdit ${tag#v}" --notes-file notes.md --latest

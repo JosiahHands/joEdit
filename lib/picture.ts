@@ -28,6 +28,7 @@ import {
   runPack,
   saveCanvas,
   savePicture,
+  videoEncoder,
   skia,
   stringFlag,
   TEXT_FLAGS,
@@ -393,7 +394,10 @@ export function animateArgs(
   // Work at 4x size so the slow movement is smooth (no 1-pixel jumps).
   const big = `scale=${width * 4}:${height * 4}:force_original_aspect_ratio=increase,crop=${width * 4}:${height * 4},setsar=1`;
   const zoompan = `zoompan=z='${move.z}':x='${move.x}':y='${move.y}':d=${frames}:s=${width}x${height}:fps=${fps}`;
-  return { args: ["-i", input, "-vf", `${big},${zoompan},format=yuv420p`, "-frames:v", String(frames), "-c:v", "libx264", "-crf", "18", output], frames };
+  // A .gif's encoder brings its own filter (the palette): it joins the camera move's filter, as one -vf.
+  const encoder = videoEncoder(output);
+  const own = encoder[0] === "-vf" ? encoder.splice(0, 2)[1] : "format=yuv420p";
+  return { args: ["-i", input, "-vf", `${big},${zoompan},${own}`, "-frames:v", String(frames), ...encoder, output], frames };
 }
 
 // ---------- AI: make, enlarge, cut out, measure depth ----------

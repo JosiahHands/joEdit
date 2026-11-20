@@ -95,7 +95,24 @@ export const npx = process.platform === "win32" ? "npx.cmd" : "npx";
 // Run ffmpeg quietly, always overwriting the output. Used by video.ts and sound.ts.
 // cwd: see run().
 export function ffmpeg(args: string[], cwd?: string): void {
-  run("ffmpeg", ["-hide_banner", "-loglevel", "error", "-y", ...args], undefined, cwd);
+  run("ffmpeg", ["-hide_banner", "-loglevel", "error", "-y", ...bt709(args)], undefined, cwd);
+}
+
+// Every video joEdit writes is BT.709, the colors players assume for video, and says so in the file.
+// Given these tags, ffmpeg converts whatever comes in (BT.601, full-range phone video, RGB pictures and frames)
+// with the right math; without them, RGB became BT.601 and colors shifted by up to 35/255 when played.
+// Copies (-c:v copy) and files that already choose their colors are left alone.
+const VIDEO_FILE = /\.(mp4|m4v|mov|mkv|webm|avi)$/i;
+export function bt709(args: string[]): string[] {
+  const output = args[args.length - 1] ?? "";
+  const codecAt = Math.max(args.lastIndexOf("-c:v"), args.lastIndexOf("-c"));
+  const codec = codecAt >= 0 ? args[codecAt + 1] : undefined;
+  if (!VIDEO_FILE.test(output) || codec === "copy" || args.includes("-vn") || args.includes("-colorspace")) return args;
+  // H.264 (chosen, or ffmpeg's default for these files) also needs the tags inside the stream.
+  const h264 = codec ? codec === "libx264" : !/\.webm$/i.test(output);
+  const tags = ["-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709", "-color_range", "tv"];
+  if (h264 && !args.includes("-x264-params")) tags.push("-x264-params", "colorprim=bt709:transfer=bt709");
+  return [...args.slice(0, -1), ...tags, output];
 }
 
 // Read a JSON file. A byte-order mark (Windows PowerShell adds one) is ignored, and a mistake names the file.
@@ -116,7 +133,7 @@ export function concatLine(path: string): string {
 // The same, without waiting: other work (more scenes, Chrome renders) keeps going while ffmpeg runs. cwd: see run().
 export function ffmpegAsync(args: string[], cwd?: string): Promise<void> {
   return new Promise((done, fail) => {
-    const child = spawn(FFMPEG, ["-hide_banner", "-loglevel", "error", "-y", ...args], { stdio: ["ignore", "ignore", "pipe"], cwd });
+    const child = spawn(FFMPEG, ["-hide_banner", "-loglevel", "error", "-y", ...bt709(args)], { stdio: ["ignore", "ignore", "pipe"], cwd });
     let errors = "";
     child.stderr.on("data", (chunk) => (errors += chunk));
     child.on("error", (error: any) => fail(error.code === "ENOENT" ? new Error('"ffmpeg" is not installed. Run: node joedit.ts doctor') : error));
@@ -294,9 +311,12 @@ export function writeVideo(output: string, options: { width: number; height: num
     "-hide_banner", "-loglevel", "error", "-y",
     "-f", "rawvideo", "-pix_fmt", "rgba", "-s", `${width}x${height}`, "-r", String(fps), "-i", "-",
     // Only the first sound track (iPhones add a second, spatial one that other tools can't play).
-    ...(options.audio ? ["-i", options.audio, "-map", "0:v", "-map", "1:a:0?", "-c:a", "aac", "-b:a", "192k", "-shortest"] : []),
-    ...videoEncoder(output, { transparent: options.transparent, draft: options.draft }),
-    output,
+    ...bt709([
+      // Working copies (.mkv) keep the sound uncompressed, so it is only compressed once, in the finished file.
+      ...(options.audio ? ["-i", options.audio, "-map", "0:v", "-map", "1:a:0?", ...(output.endsWith(".mkv") ? ["-c:a", "pcm_s16le"] : ["-c:a", "aac", "-b:a", "192k"]), "-shortest"] : []),
+      ...videoEncoder(output, { transparent: options.transparent, draft: options.draft }),
+      output,
+    ]),
   ], { stdio: ["pipe", "ignore", "pipe"] });
   let errors = "";
   child.stderr.on("data", (chunk) => (errors += chunk));
@@ -315,13 +335,15 @@ export function writeVideo(output: string, options: { width: number; height: num
 
 // Encoder settings for an output file. Transparent .mov is ProRes 4444, transparent .webm is VP9 with alpha;
 // .gif makes its own palette; everything else is H.264 (draft: fast and small; else high quality).
+// .mkv is a working copy for more editing (movie render's scenes): near-lossless and about 6x faster to write.
 export function videoEncoder(output: string, options: { transparent?: boolean; draft?: boolean } = {}): string[] {
   const type = output.split(".").pop()?.toLowerCase();
   if (type === "gif") return ["-vf", "split[a][b];[a]palettegen[p];[b][p]paletteuse", "-loop", "0"];
   if (type === "mov" && options.transparent) return ["-c:v", "prores_ks", "-profile:v", "4444", "-pix_fmt", "yuva444p10le"];
   if (type === "webm") return ["-c:v", "libvpx-vp9", "-b:v", "0", "-crf", "30", "-pix_fmt", options.transparent ? "yuva420p" : "yuv420p"];
   if (type === "png") return ["-frames:v", "1"];
-  const h264 = ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", options.draft ? "ultrafast" : "medium", "-crf", options.draft ? "28" : "18"];
+  const [preset, crf] = options.draft ? ["ultrafast", "28"] : type === "mkv" ? ["ultrafast", "8"] : ["medium", "18"];
+  const h264 = ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", preset, "-crf", crf];
   // faststart lets a video start playing on the web before it has fully downloaded.
   return type === "mp4" || type === "m4v" || type === "mov" ? [...h264, "-movflags", "+faststart"] : h264;
 }

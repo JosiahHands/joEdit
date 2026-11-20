@@ -7,7 +7,6 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, s
 import { cpus } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import {
-  concatLine,
   drawText,
   even,
   ffmpeg,
@@ -23,6 +22,7 @@ import {
   runCli,
   skia,
   withTempDir,
+  videoEncoder,
   writeVideo,
   type Brand,
   type Command,
@@ -175,7 +175,7 @@ const BLENDS: Record<string, string> = {
   color: "color", luminosity: "luminosity",
 };
 const DEFAULT_DURATION = 3;
-const CACHE_VERSION = 3; // bump to throw away old cached scenes after changing how scenes render
+const CACHE_VERSION = 4; // bump to throw away old cached scenes after changing how scenes render
 // How many scenes render at the same time (each encode already uses several cores).
 const SCENES_AT_ONCE = Math.min(4, Math.max(1, Math.floor(cpus().length / 4)));
 
@@ -459,9 +459,11 @@ const SILENCE = ["-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo"];
 
 // Encoder settings. Drafts are fast and rough. The finished film (final) is slow and clean. Cached scenes,
 // which are usually encoded once more when joined, are fast and nearly lossless.
+// Scenes and other working files (.mkv) are near-lossless, fast to write and read, with uncompressed sound.
+// The finished picture is the one encode at final quality. Drafts are fast and small everywhere.
 function encoder(ctx: Context, final = false): string[] {
-  const [preset, crf] = ctx.draft ? ["ultrafast", "28"] : final ? ["medium", "18"] : ["veryfast", "14"];
-  return ["-c:v", "libx264", "-preset", preset, "-crf", crf, "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k"];
+  const [preset, crf] = ctx.draft ? ["ultrafast", "28"] : final ? ["medium", "18"] : ["ultrafast", "8"];
+  return ["-c:v", "libx264", "-preset", preset, "-crf", crf, "-pix_fmt", "yuv420p", ...(final ? ["-c:a", "aac", "-b:a", "192k"] : ["-c:a", "pcm_s16le"])];
 }
 
 // Sound at another speed (atempo takes 0.5 and up per step, so slow motion chains a few). "" for normal speed.
@@ -506,7 +508,7 @@ function sceneKey(scene: Scene, duration: number, ctx: Context): string {
 
 // Render one scene into a segment: exact size, frame rate, length and stereo sound.
 async function renderScene(scene: Scene, n: number, duration: number, ctx: Context): Promise<{ file: string; cached: boolean }> {
-  const output = join(ctx.cache, `scene-${sceneKey(scene, duration, ctx)}.mp4`);
+  const output = join(ctx.cache, `scene-${sceneKey(scene, duration, ctx)}.mkv`);
   if (existsSync(output)) return { file: output, cached: true };
   const { width, height, fps } = ctx;
   const inputs: string[] = [];
@@ -533,7 +535,7 @@ async function renderScene(scene: Scene, n: number, duration: number, ctx: Conte
     graph += `[0:v]${follow}${retime}${fitFilter(ctx, scene.fit)},tpad=stop_mode=clone:stop_duration=${duration}[base];`;
     graph += hasAudio ? `[0:a]${tempoFilter(speed)}${AUDIO_FORMAT},volume=${scene.volume ?? 1},apad[a]` : `[1:a]${AUDIO_FORMAT}[a]`;
   } else {
-    const made = join(ctx.temp, `scene-${n}.mp4`);
+    const made = join(ctx.temp, `scene-${n}.mkv`); // a working copy (see encoder)
     if (scene.motion?.startsWith("parallax")) {
       // "parallax" is a slow push in; "parallax-orbit", "parallax-pan-left", ... pick another 3D camera move.
       const motion = scene.motion === "parallax" ? "dolly" : scene.motion.slice("parallax-".length);
@@ -547,7 +549,7 @@ async function renderScene(scene: Scene, n: number, duration: number, ctx: Conte
     } else if (scene.canvas) {
       await graphics.canvas(pathFrom(ctx.base, scene.canvas), made, { duration, width, height, fps, data: scene.data, brand: ctx.brand });
     } else {
-      await ffmpegAsync(["-f", "lavfi", "-i", `color=c=${scene.color}:s=${width}x${height}:r=${fps}:d=${duration}`, "-pix_fmt", "yuv420p", made]);
+      await ffmpegAsync(["-f", "lavfi", "-i", `color=c=${scene.color}:s=${width}x${height}:r=${fps}:d=${duration}`, ...videoEncoder(made), made]);
     }
     inputs.push("-i", made, ...SILENCE);
     graph += `[0:v]${fitFilter(ctx)}[base];[1:a]${AUDIO_FORMAT}[a]`;
@@ -571,12 +573,12 @@ async function renderScene(scene: Scene, n: number, duration: number, ctx: Conte
   graph += scene.look ? `;${video.gradeGraph(scene.look, 1, label, "v")}` : `;[${label}]null[v]`;
 
   // Encode to a temporary name first, so a failed or interrupted render never leaves a broken file in the cache.
-  const partial = join(ctx.temp, `partial-${n}.mp4`);
+  const partial = join(ctx.temp, `partial-${n}.mkv`);
   await ffmpegAsync([...inputs, "-filter_complex", graph, "-map", "[v]", "-map", "[a]", ...encoder(ctx), "-r", String(fps), "-t", String(duration), partial], workFolder);
 
   // 4. Layers (Skia) and GPU effects, drawn on every frame.
   if (scene.layers?.length || scene.fx) {
-    const drawn = join(ctx.temp, `drawn-${n}.mp4`);
+    const drawn = join(ctx.temp, `drawn-${n}.mkv`);
     const clip = scene.video ? { from: scene.from ?? 0, fit: scene.fit } : undefined;
     await framePass(partial, drawn, duration, ctx, scene.layers ?? [], fxOf(scene.fx), clip);
     renameSync(drawn, output);
@@ -701,12 +703,12 @@ async function prepareLayer(layer: Layer, sceneLength: number, ctx: Context, cli
   return { draw, close: () => close() };
 }
 
-// Draw layers and run GPU effects on every frame of a clip, keeping its sound.
+// Draw layers and run GPU effects on every frame of a clip, keeping its sound (or `sound`, when given).
 // clip: the scene's video (start and fit), so tracked layers line up with it.
 // before: an ffmpeg graph (from [0:v] to [pre]) run on the frames as they are read, with its extra input files.
 async function framePass(
   input: string, output: string, length: number, ctx: Context, layers: Layer[], effects?: Fx,
-  clip?: { from: number; fit?: string }, before?: { graph: string; inputs: string[] },
+  clip?: { from: number; fit?: string }, before?: { graph: string; inputs: string[] }, sound = input,
 ) {
   const { width, height, fps } = ctx;
   const drawers = await Promise.all(layers.map((layer) => prepareLayer(layer, length, ctx, clip)));
@@ -714,7 +716,7 @@ async function framePass(
   const { createCanvas, ImageData } = await skia();
   const canvas = createCanvas(width, height);
   const c = canvas.getContext("2d");
-  const writer = writeVideo(output, { width, height, fps, audio: input, draft: ctx.draft });
+  const writer = writeVideo(output, { width, height, fps, audio: sound, draft: ctx.draft });
   for await (const frame of readFrames(input, { width, height, ...before })) {
     let pixels: Buffer = frame.pixels;
     if (drawers.length) {
@@ -735,35 +737,31 @@ async function framePass(
 
 // ---------- Joining, sound and finishing ----------
 
-// Join the scenes, with transitions where asked.
-// ffmpeg's transitions (xfade) run inside the join. GPU transitions (fx) are rendered first as short
+// The scenes joined, with transitions where asked, as ffmpeg filter graphs over the scene files: the picture
+// ends in [joined], the sound in [sound]. Nothing is encoded here; the finishing pass reads the picture graph
+// directly, so the film is encoded once.
+// ffmpeg's transitions (xfade) run inside the graph. GPU transitions (fx) are rendered first as short
 // overlap clips (the end of one scene blending into the start of the next) and put between the trimmed scenes.
-async function joinScenes(movie: Movie, files: string[], lengths: number[], output: string, ctx: Context): Promise<void> {
+async function joinGraph(movie: Movie, files: string[], lengths: number[], ctx: Context) {
   const transitions = movie.scenes.map(transitionOf);
-  if (!transitions.some(Boolean)) {
-    // No transitions: join the files directly (very fast, no re-encoding).
-    const list = join(ctx.temp, "scenes.txt");
-    writeFileSync(list, files.map(concatLine).join("\n"));
-    ffmpeg(["-f", "concat", "-safe", "0", "-i", list, "-c", "copy", output]);
-    return;
-  }
   // The GPU overlap clips, added as extra inputs after the scenes. Their length is whole frames.
-  const inputs = files.flatMap((f) => ["-i", f]);
+  const inputs = [...files];
   const overlaps: Record<number, { input: number; duration: number }> = {};
   for (let n = 1; n < files.length; n++) {
     const t = transitions[n];
     if (!t || !isGpuTransition(t.type)) continue;
     const duration = Math.max(1, Math.round(t.duration * ctx.fps)) / ctx.fps;
-    const clip = join(ctx.temp, `overlap-${n}.mp4`);
+    const clip = join(ctx.temp, `overlap-${n}.mkv`);
     const shader = fx.prepareTransition(t.type, fx.parseSet(t.set));
     const writer = writeVideo(clip, { width: ctx.width, height: ctx.height, fps: ctx.fps, draft: ctx.draft });
     for await (const pixels of fx.transitionFrames(shader, files[n - 1], files[n], ctx, lengths[n - 1] - duration, duration)) await writer.write(pixels);
     await writer.finish();
-    overlaps[n] = { input: inputs.length / 2, duration };
-    inputs.push("-i", clip);
+    overlaps[n] = { input: inputs.length, duration };
+    inputs.push(clip);
   }
   // Give every clip the same time base and pixel shape, which xfade and concat need to work together.
-  let graph = inputs.filter((arg) => arg === "-i").map((_, n) => `[${n}:v]settb=AVTB,setsar=1[in${n}];`).join("");
+  let picture = inputs.map((_, n) => `[${n}:v]settb=AVTB,setsar=1[in${n}];`).join("");
+  let sound = "";
   let v = "[in0]";
   let a = "[0:a]";
   let length = lengths[0];
@@ -773,24 +771,28 @@ async function joinScenes(movie: Movie, files: string[], lengths: number[], outp
     if (overlap) {
       // Everything so far minus its last moment, then the overlap clip, then this scene minus its first moment.
       const d = overlap.duration;
-      graph += `${v}trim=end=${round(length - d, 4)},setpts=PTS-STARTPTS[pre${n}];`;
-      graph += `[in${n}]trim=start=${round(d, 4)},setpts=PTS-STARTPTS[post${n}];`;
-      graph += `[pre${n}][in${overlap.input}][post${n}]concat=n=3:v=1:a=0[v${n}];`;
-      graph += `${a}[${n}:a]acrossfade=d=${round(d, 4)}[a${n}];`;
+      picture += `${v}trim=end=${round(length - d, 4)},setpts=PTS-STARTPTS[pre${n}];`;
+      picture += `[in${n}]trim=start=${round(d, 4)},setpts=PTS-STARTPTS[post${n}];`;
+      picture += `[pre${n}][in${overlap.input}][post${n}]concat=n=3:v=1:a=0[v${n}];`;
+      sound += `${a}[${n}:a]acrossfade=d=${round(d, 4)}[a${n}];`;
       length += lengths[n] - d;
     } else if (t) {
-      graph += `${v}[in${n}]xfade=transition=${t.type}:duration=${t.duration}:offset=${round(length - t.duration, 3)}[v${n}];`;
-      graph += `${a}[${n}:a]acrossfade=d=${t.duration}[a${n}];`;
+      picture += `${v}[in${n}]xfade=transition=${t.type}:duration=${t.duration}:offset=${round(length - t.duration, 3)}[v${n}];`;
+      sound += `${a}[${n}:a]acrossfade=d=${t.duration}[a${n}];`;
       length += lengths[n] - t.duration;
     } else {
-      graph += `${v}[in${n}]concat=n=2:v=1:a=0[v${n}];${a}[${n}:a]concat=n=2:v=0:a=1[a${n}];`;
+      picture += `${v}[in${n}]concat=n=2:v=1:a=0[v${n}];`;
+      sound += `${a}[${n}:a]concat=n=2:v=0:a=1[a${n}];`;
       length += lengths[n];
     }
     v = `[v${n}]`;
     a = `[a${n}]`;
   }
-  ffmpeg([...inputs, "-filter_complex", graph.slice(0, -1), "-map", v, "-map", a, ...encoder(ctx, true), output]);
+  return { inputs, picture: `${picture}${v}null[joined]`, sound: `${sound}${a}anull[sound]` };
 }
+
+// ffmpeg's arguments to open a list of files.
+const inputArgs = (files: string[]) => files.flatMap((file) => ["-i", file]);
 
 // A fingerprint of everything that changes the film's picture (not its music, voice-over or sound effects),
 // so a sound-only change reuses the finished picture.
@@ -842,18 +844,20 @@ async function captionWords(movie: Movie, joined: string, length: number, spoken
   return (readJson(transcript).words ?? []) as graphics.CaptionWord[];
 }
 
-// The film-wide pass over the joined scenes, in one encode: look and effects (ffmpeg), captions,
-// then GPU fx and film layers. With none of these the joined file is used as it is.
-async function finishPicture(movie: Movie, joined: string, output: string, length: number, words: graphics.CaptionWord[], ctx: Context) {
-  let graph = "";
-  let label = "0:v";
-  const inputs: string[] = [];
+// The finished picture, in one encode at final quality: the joined scenes (read straight from the join graph),
+// the film-wide look and effects (ffmpeg), captions, then GPU fx and film layers. `sound` is the joined scene sound.
+async function finishPicture(
+  movie: Movie, joined: { inputs: string[]; picture: string }, sound: string, output: string, length: number, words: graphics.CaptionWord[], ctx: Context,
+) {
+  const inputs = [...joined.inputs];
+  let graph = joined.picture;
+  let label = "joined";
   if (movie.look) {
-    graph += `${video.gradeGraph(movie.look, movie.lookStrength ?? 1, label, "graded")};`;
+    graph += `;${video.gradeGraph(movie.look, movie.lookStrength ?? 1, label, "graded")}`;
     label = "graded";
   }
   if (movie.effects) {
-    graph += `${video.effectsGraph(movie.effects, label, "fx")};`;
+    graph += `;${video.effectsGraph(movie.effects, label, "fx")}`;
     label = "fx";
   }
   if (words.length) {
@@ -863,17 +867,19 @@ async function finishPicture(movie: Movie, joined: string, output: string, lengt
       width: ctx.width, height: ctx.height, fps: ctx.fps, duration: length, style: options.style, position: options.position, brand: ctx.brand, speakerColors: options.speakers,
     });
     inputs.push(captionFile);
-    graph += `[${label}][1:v]overlay=0:0:eof_action=pass[cap];`;
+    graph += `;[${label}][${inputs.length - 1}:v]overlay=0:0:eof_action=pass[cap]`;
     label = "cap";
   }
   if (movie.fx || movie.layers?.length) {
     // Frames go through Skia (layers) and the GPU (fx); the ffmpeg part runs as they are read.
-    const before = label === "0:v" ? undefined : { graph: `${graph}[${label}]null[pre]`, inputs };
-    await framePass(joined, output, length, ctx, movie.layers ?? [], fxOf(movie.fx), undefined, before);
-  } else if (label !== "0:v") {
-    ffmpeg(["-i", joined, ...inputs.flatMap((f) => ["-i", f]), "-filter_complex", `${graph}[${label}]format=yuv420p[v]`, "-map", "[v]", "-map", "0:a:0", ...encoder(ctx, true), output]);
+    const before = { graph: `${graph};[${label}]null[pre]`, inputs: inputs.slice(1) };
+    await framePass(inputs[0], output, length, ctx, movie.layers ?? [], fxOf(movie.fx), undefined, before, sound);
   } else {
-    renameSync(joined, output);
+    const soundInput = inputs.length;
+    ffmpeg([
+      ...inputArgs(inputs), "-i", sound, "-filter_complex", `${graph};[${label}]format=yuv420p[v]`,
+      "-map", "[v]", "-map", `${soundInput}:a`, ...encoder(ctx, true), "-t", String(round(length, 3)), output,
+    ]);
   }
 }
 
@@ -973,11 +979,13 @@ export async function renderMovie(file: string, output: string, draft = false, s
     const pictureFile = join(cache, `picture-${pictureKey(movie, segments, lengths, ctx)}.mp4`);
     const pictureCached = existsSync(pictureFile);
     if (!pictureCached) {
-      const joined = join(temp, "joined.mp4");
-      await joinScenes(movie, segments, lengths, joined, ctx);
-      const words = movie.captions ? await captionWords(movie, joined, length, spoken, ctx) : [];
+      // The joined sound first (quick: sound only), for the captions and the picture file.
+      const joined = await joinGraph(movie, segments, lengths, ctx);
+      const sound = join(temp, "joined.wav");
+      ffmpeg([...inputArgs(joined.inputs), "-filter_complex", joined.sound, "-map", "[sound]", "-c:a", "pcm_s16le", sound]);
+      const words = movie.captions ? await captionWords(movie, sound, length, spoken, ctx) : [];
       const partial = join(temp, "picture.mp4");
-      await finishPicture(movie, joined, partial, length, words, ctx);
+      await finishPicture(movie, joined, sound, partial, length, words, ctx);
       renameSync(partial, pictureFile); // only finished pictures go into the cache
     } else {
       utimesSync(pictureFile, new Date(), new Date()); // used now: kept by the clean-up below

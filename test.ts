@@ -1907,6 +1907,31 @@ describe("engine", () => {
     assert.equal(frames.length, 10);
     assert.ok(frames[0] < 30 && frames[9] > 225, `first ${frames[0]}, last ${frames[9]}`);
   });
+
+  test("colours survive frame passes, tagged BT.709 so players show them the same", async () => {
+    // Six bars of strong colours, 64 pixels wide, written as a video and passed through frames once more.
+    const colours = [[230, 40, 40], [40, 200, 60], [40, 60, 220], [240, 220, 50], [200, 60, 200], [128, 128, 128]];
+    const [width, height] = [384, 64];
+    const bars = Buffer.alloc(width * height * 4, 255);
+    for (let i = 0; i < width * height; i++) bars.set(colours[Math.floor((i % width) / 64)], i * 4);
+    const first = writeVideo(file("bars-1.mp4"), { width, height, fps: 10 });
+    for (let i = 0; i < 5; i++) await first.write(bars);
+    await first.finish();
+    const second = writeVideo(file("bars-2.mp4"), { width, height, fps: 10 });
+    for await (const frame of readFrames(file("bars-1.mp4"))) await second.write(frame.pixels);
+    await second.finish();
+    // ffmpeg describes the stream as e.g. "yuv420p(tv, bt709, progressive)": tv range, all three colour tags bt709.
+    const described = spawnSync(FFMPEG, ["-hide_banner", "-i", file("bars-2.mp4")], { encoding: "utf8" }).stderr;
+    assert.match(described, /yuv420p\(tv, bt709[,)]/, described);
+    // The middle of each bar comes back within 3 of 255 on every channel.
+    for await (const frame of readFrames(file("bars-2.mp4"), { count: 1 })) {
+      colours.forEach((colour, k) => {
+        const at = (32 * width + k * 64 + 32) * 4;
+        const got = [...frame.pixels.subarray(at, at + 3)];
+        assert.ok(got.every((v, c) => Math.abs(v - colour[c]) <= 3), `bar ${k}: ${colour} came back as ${got}`);
+      });
+    }
+  });
 });
 
 describe("joedit", () => {

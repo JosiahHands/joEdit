@@ -562,7 +562,7 @@ export async function reframeFollow(input: string, output: string, aspect: strin
 
 // Where the subject is (0..1 across and down) at times on a grid of `every` seconds, for a range of a video.
 // Saved per video in .joedit-cache/follow/ next to it: a retimed or re-trimmed shot reuses the samples it already has,
-// and only the missing part of the range is looked at (the cutout model is the slow part).
+// and only the missing times are looked at (the cutout model is the slow part).
 export async function subjectPath(input: string, from: number, to: number, every = 0.5): Promise<{ centres: { time: number; x: number; y: number }[]; cached: number }> {
   const stat = statSync(input);
   const key = createHash("sha256").update(`${resolve(input)}|${stat.size}|${stat.mtimeMs}|${every}`).digest("hex").slice(0, 16);
@@ -581,25 +581,35 @@ export async function subjectPath(input: string, from: number, to: number, every
   const cached = times.length - missing.length;
 
   if (missing.length) {
-    // One pass over the missing span: small frames, one every `every` seconds, starting on the grid.
-    await withTempDir(async (folder) => {
-      const start = missing[0];
-      const span = missing[missing.length - 1] - start + every / 2;
-      ffmpeg(["-ss", String(start), "-t", String(span), "-i", input, "-vf", `fps=1/${every}:round=near,scale=384:-2`, join(folder, "%05d.png")]);
-      const frames = readdirSync(folder).filter((name) => name.endsWith(".png")).sort();
-      const { subjectMask } = await import("./picture.ts");
-      for (const [n, name] of frames.entries()) {
-        const { mask, width: w, height: h } = await subjectMask(join(folder, name)); // 255 = subject
-        let total = 0, sumX = 0, sumY = 0;
-        for (let i = 0; i < mask.length; i++) {
-          total += mask[i];
-          sumX += (mask[i] * ((i % w) + 0.5)) / w;
-          sumY += (mask[i] * (Math.floor(i / w) + 0.5)) / h;
+    // The missing times as runs of neighbouring grid times: only these are looked at, not the cached ones between them.
+    const runs: number[][] = [];
+    for (const t of missing) {
+      const run = runs.at(-1);
+      if (run && Math.round((t - run[run.length - 1]) / every) === 1) run.push(t);
+      else runs.push([t]);
+    }
+    const { subjectMask } = await import("./picture.ts");
+    for (const run of runs) {
+      // One pass per run: a frame every `every` seconds, starting on the grid, at the 1024x1024 the cutout model sees
+      // (the centre is a 0..1 fraction, so stretching the shape does not move it; smaller frames lose small subjects).
+      await withTempDir(async (folder) => {
+        const start = run[0];
+        const span = run[run.length - 1] - start + every / 2;
+        ffmpeg(["-ss", String(start), "-t", String(span), "-i", input, "-vf", `fps=1/${every}:round=near,scale=1024:1024`, join(folder, "%05d.png")]);
+        const frames = readdirSync(folder).filter((name) => name.endsWith(".png")).sort();
+        for (const [n, name] of frames.entries()) {
+          const { mask, width: w, height: h } = await subjectMask(join(folder, name)); // 255 = subject
+          let total = 0, sumX = 0, sumY = 0;
+          for (let i = 0; i < mask.length; i++) {
+            total += mask[i];
+            sumX += (mask[i] * ((i % w) + 0.5)) / w;
+            sumY += (mask[i] * (Math.floor(i / w) + 0.5)) / h;
+          }
+          // null = no subject here (it covers less than 0.2% of the frame)
+          saved[String(round(start + n * every, 3))] = total > 255 * w * h * 0.002 ? [round(sumX / total, 4), round(sumY / total, 4)] : null;
         }
-        // null = no subject here (it covers less than 0.2% of the frame)
-        saved[String(round(start + n * every, 3))] = total > 255 * w * h * 0.002 ? [round(sumX / total, 4), round(sumY / total, 4)] : null;
-      }
-    });
+      });
+    }
     for (const t of missing) if (!(String(t) in saved)) saved[String(t)] = null; // past the end of the video
     try {
       mkdirSync(dirname(cacheFile), { recursive: true });

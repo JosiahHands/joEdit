@@ -526,19 +526,22 @@ export async function compose(scoreFile: string, output: string, options: { stem
 }
 
 // A whole song (with singing if there are lyrics) from a description, using ACE-Step (song pack).
-// steps: quality (8 = fast turbo setting; 30+ = more detail, slower). guidance: how closely it follows the prompt.
-export function song(output: string, prompt: string, options: { lyrics?: string; duration?: number; seed?: number; bpm?: number; steps?: number; guidance?: number } = {}) {
+// steps: diffusion steps, 1..20 (the turbo model is tuned for 8).
+// The result says how it ran: the GPU memory tier, language model, offload, seconds and (on NVIDIA) peak GPU memory.
+export function song(output: string, prompt: string, options: { lyrics?: string; duration?: number; seed?: number; bpm?: number; steps?: number } = {}) {
   if (!prompt.trim()) throw new Error('Describe the music with --prompt, e.g. --prompt "upbeat indie pop, female vocals, guitar".');
+  if (options.steps !== undefined && !(Number.isInteger(options.steps) && options.steps >= 1 && options.steps <= 20)) {
+    throw new Error("--steps is a whole number from 1 to 20 (the turbo model is tuned for 8).");
+  }
   return withTempDir((folder) => {
     const args = [folder, "--prompt", prompt, "--duration", String(options.duration ?? 30)];
     if (options.lyrics) args.push("--lyrics", options.lyrics);
     if (options.seed !== undefined) args.push("--seed", String(options.seed));
     if (options.bpm) args.push("--bpm", String(options.bpm));
     if (options.steps) args.push("--steps", String(options.steps));
-    if (options.guidance !== undefined) args.push("--guidance", String(options.guidance));
-    const result = runPack("song", args);
-    sound.normalize(result.file, output);
-    return { duration: result.duration, seed: result.seed, device: result.device };
+    const { file, ...result } = runPack("song", args);
+    sound.normalize(file, output);
+    return result;
   });
 }
 
@@ -564,7 +567,7 @@ export const commands: Record<string, Command> = {
     }),
   },
   song: {
-    usage: 'song <output.wav> --prompt "style, mood, instruments, voice" [--lyrics lyrics.txt] [--duration 30] [--bpm N] [--seed N] [--steps 8] [--guidance 1]  (needs: install song)',
+    usage: 'song <output.wav> --prompt "style, mood, instruments, voice" [--lyrics lyrics.txt] [--duration 30] [--bpm N] [--seed N] [--steps 8]  (needs: install song)',
     run: (a) => {
       if (!a.positional[0]) throw new Error("Missing output path.");
       const lyrics = a.flags.lyrics ? readFileSync(requireFile(a.flags.lyrics), "utf8") : undefined;
@@ -574,7 +577,6 @@ export const commands: Record<string, Command> = {
         seed: a.flags.seed === undefined ? undefined : Number(a.flags.seed),
         bpm: a.flags.bpm === undefined ? undefined : Number(a.flags.bpm),
         steps: a.flags.steps === undefined ? undefined : numberFlag(a, "steps"),
-        guidance: a.flags.guidance === undefined ? undefined : numberFlag(a, "guidance"),
       });
     },
   },

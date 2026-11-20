@@ -1,6 +1,6 @@
 # Pictures from a text description with Z-Image Turbo.
 # Usage: python run.py <out.png> --prompt "..." [--width 1024] [--height 1024] [--steps 9] [--seed N]
-# Prints one line of JSON: {"seed", "width", "height", "engine"}.
+# Prints one line of JSON: {"seed", "width", "height", "engine", "seconds"}, plus "vramGb" (peak GPU memory) on NVIDIA.
 import argparse
 import json
 import os
@@ -8,6 +8,7 @@ import platform
 import random
 import subprocess
 import sys
+import time
 
 APPLE = sys.platform == "darwin" and platform.machine() == "arm64"
 MODEL = "filipstrand/Z-Image-Turbo-mflux-4bit" if APPLE else "Tongyi-MAI/Z-Image-Turbo"
@@ -29,6 +30,8 @@ parser.add_argument("--steps", type=int, default=9)
 parser.add_argument("--seed", type=int, default=-1)
 args = parser.parse_args()
 
+started = time.time()
+vram_gb = None
 seed = args.seed if args.seed >= 0 else random.randint(0, 2**31 - 1)
 # The model works in blocks of 16 pixels.
 width = max(256, round(args.width / 16) * 16)
@@ -53,8 +56,9 @@ else:
     device = "cuda" if torch.cuda.is_available() else "cpu"
     pipe = ZImagePipeline.from_pretrained(MODEL, torch_dtype=torch.bfloat16)
     if device == "cuda" and torch.cuda.get_device_properties(0).total_memory < 20 * 1024**3:
-        # Cards under 20 GB (8-16 GB is common) can't hold the whole model: each part moves onto the GPU only while it runs.
-        pipe.enable_model_cpu_offload()
+        # Cards under 20 GB (8-16 GB is common) can't hold the whole model: the weights stay in RAM and each layer
+        # moves onto the GPU only while it runs. Layer by layer fits where whole parts (enable_model_cpu_offload) spill over.
+        pipe.enable_group_offload(onload_device="cuda", offload_device="cpu", offload_type="leaf_level", use_stream=False)
     else:
         pipe = pipe.to(device)
     image = pipe(
@@ -62,5 +66,10 @@ else:
         guidance_scale=0.0, generator=torch.Generator(device).manual_seed(seed),
     ).images[0]
     image.save(args.output)
+    if device == "cuda":
+        vram_gb = round(torch.cuda.max_memory_allocated() / 1024**3, 1)
 
-print(json.dumps({"seed": seed, "width": width, "height": height, "engine": engine}))
+result = {"seed": seed, "width": width, "height": height, "engine": engine, "seconds": round(time.time() - started, 1)}
+if vram_gb is not None:
+    result["vramGb"] = vram_gb  # the most GPU memory the run used
+print(json.dumps(result))

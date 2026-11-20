@@ -24,7 +24,7 @@ Run a tool: `node lib/joedit.ts <area> <command> ...` (Node 24+ runs .ts directl
 Type-check: `cd lib && npx -y -p typescript@5.9.3 tsc -p .`
 Run tests: `node --test test.ts` (tests that need a model, pack, asset, Chrome, Blender or raylib are skipped when it is missing).
 Roadmap: ~/.claude/plans/i-have-vision-to-zazzy-leaf.md (joEdit 2.1: the Windows report's fixes, universal release).
-Versions: major.minor.patch in lib/package.json. To release, bump it and commit as "joEdit X.Y: summary" with a user-facing body; on push to main, .github/workflows/release.yml tags vX.Y.Z and publishes the release with that body as notes. Only versioned commits get releases.
+Versions: major.minor.patch. To release, set lib/package.json's version and commit with the title "vX.Y.Z: summary" and a user-facing body; on push to main, .github/workflows/release.yml tags vX.Y.Z and publishes "joEdit X.Y.Z" with that body as notes. Only commits titled with a version get releases.
 Every command must stay reachable through joedit.ts (a test checks this).
 runCli refuses flags that are not in a command's usage string, so every flag a command reads must appear in its usage. Commands whose usage has `<output…>` get folder creation, safe in-place edits and a `made` summary automatically.
 ---
