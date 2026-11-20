@@ -35,6 +35,12 @@ You can't watch video or hear sound directly, so `look` and `listen` turn them i
 
 Looking at results between steps catches most mistakes early. How often you look is up to you.
 
+## Windows, Linux and macOS
+Everything works the same on all three; `doctor` shows what this computer has and the install command for anything missing, for this system.
+- **Windows:** use `node joedit.ts ...` from PowerShell or cmd. Paths with `C:\`, spaces or quotes are fine. Python packs need `uv` (`winget install astral-sh.uv`) and use the NVIDIA GPU through CUDA when there is one; picture `generate` moves parts of the model to main memory on GPUs under 20 GB. Blender and Chrome/Edge are found in their usual install folders. JSON files saved by Windows editors (with a byte-order mark) read fine.
+- **Linux:** GPU effects (`fx`, transitions, `parallax`) need a display; on a server, run under `xvfb-run`.
+- **Apple Silicon** runs packs and models on the Metal GPU.
+
 ## Commands
 `<in>` is an input file and `<out>` is a new output file.
 
@@ -61,8 +67,9 @@ depth <in> <out.png>                        depth map: near = white, far = black
 parallax <in> <out.mp4> [--motion dolly|orbit|pan-left|pan-right|rise|fall] [--duration 5] [--amount 1] [--depth map.png]
                                             3D camera move inside a still photo, on the GPU: near things move more than far things
 ```
-- `compose` draws a JSON design. Each layer is one of `image`, `text` or `color` (a rectangle), with `x`, `y`, `width`, `height`, `fit` (cover|contain|fill), `opacity`, `blend` (multiply, screen, overlay …), `rotate`, `radius` (rounded corners), and text styling (`size`, `font`, `weight`, `color`, `stroke`, `shadow`, `box`, `align`, `maxWidth`). Colors and fonts can be brand names (`"accent"`, `"heading"`):
+- `compose` draws a JSON design. Each layer is one of `image`, `text` or `color` (a rectangle), with `x`, `y`, `width`, `height`, `fit` (cover|contain|fill), `opacity`, `blend` (multiply, screen, overlay …), `rotate`, `radius` (rounded corners), `shadow`/`shadowColor`, and text styling (`size`, `font`, `weight`, `color`, `stroke`, `shadow`, `box`, `align`, `maxWidth`). Colors and fonts can be brand names (`"accent"`, `"heading"`):
   `{"width": 1280, "height": 720, "background": "photo.jpg", "layers": [{"color": "#00000088", "x": 0, "y": 560, "width": 1280, "height": 160}, {"text": "Big news", "x": 640, "y": 590, "size": 72, "align": "center", "font": "heading", "color": "accent"}, {"image": "logo.png", "x": 1140, "y": 30, "width": 110, "height": 110, "fit": "contain"}]}`
+- On an `image` layer, `shadow`, `glow`/`glowColor` and `outline`/`outlineColor` (pixels) follow the picture's own shape, so a `cutout` gets a sticker edge or a halo: `{"image": "cut.png", "x": 250, "y": 60, "height": 500, "outline": 8, "glow": 30, "glowColor": "#00E0FF"}`.
 - `fit --focus smart` keeps the most detailed, eye-catching part when changing shape.
 - `generate` (`install image`, Z-Image Turbo) makes photoreal or illustrated pictures in seconds on Apple Silicon or an NVIDIA GPU. Describe the subject, setting, light, lens and style in plain words (`"studio portrait, soft window light, 85mm, film grain"`). The same `--seed` and prompt give the same picture, so you can change one word and compare. It renders short text in the picture well.
 - `upscale` (`install upscaler`) restores detail when enlarging: old photos, small web pictures, generated pictures before printing. `--style art` is tuned for drawings, anime and graphics.
@@ -107,7 +114,7 @@ generate <out.mp4> --prompt "..." [--image start.png] [--seconds 5] [--steps 50]
 - `overlay` takes a see-through PNG as it is, so a `picture cutout`, a `graphics lower-third --transparent` still or a logo all sit cleanly on the video. A video on top is silent; the main video's sound is kept.
 - `concat` keeps the sound even when some clips have none (they get silence).
 - `blur-faces` (`install faces`) is for privacy: bystanders, kids, people who did not agree to be shown.
-- `reframe --follow` (`install cutout`) finds the subject every `--every` seconds and glides the crop along its path like a camera operator; `--smooth` is seconds of smoothing (bigger = calmer). The result includes the crop `path`.
+- `reframe --follow` (`install cutout`) finds the subject every `--every` seconds and glides the crop along its path like a camera operator; `--smooth` is seconds of smoothing (bigger = calmer). The result includes the crop `path`. Where the subject is found is cached per clip (`.joedit-cache/follow/` next to it), so a second reframe of the same clip, or of part of it, takes a moment. The subject is the cutout model's main subject; for another thing, use `look track` and steer the crop yourself.
 - `generate` (`install videogen`, Wan 2.2 TI2V-5B) makes a clip from a description, or animates `--image`. It needs a big GPU (24 GB+ of video memory, ~30 GB of models) and takes minutes per clip; on smaller machines, `picture parallax`, `picture animate` and `fx` bring stills to life instead.
 
 **sound** (FFmpeg and Web Audio; also reads the sound of video files)
@@ -130,7 +137,9 @@ sfx <out.wav> --type whoosh|swoosh|hit|boom|riser|pop|click|typewriter|ding|glit
 duck <music> <voice> <out> [--amount 12]    music dips whenever the voice speaks
 denoise <in> <out> [--amount 20]            removes steady hiss/hum/fan; measures the noise itself
 eq <in> <out> [--bass DB] [--treble DB]     e.g. --bass 4 --treble -2
+match <in> <out> --reference ref.wav [--strength 1]   EQ toward the bass/middle/treble balance of a reference track
 ```
+- `match` measures both sounds per octave (`listen bands`), sets an equalizer (at most ±12 dB per band) that moves `<in>` toward the reference, and returns the balance before and after. `--strength 0.5` goes half way. A video keeps its picture.
 - `timeline` takes a list of clips: `[{"file": "music.mp3", "role": "music", "loop": true, "fadeOut": 2}, {"file": "voice.wav", "at": 1.5, "reverb": "room"}, {"file": "whoosh.wav", "at": 3, "role": "effect", "pan": -0.5}]`. Keys: `file, at, from, to, volume, fadeIn, fadeOut, loop, pan, reverb, role` (`voice`, `music` or `effect`). Music dips a moment before anyone speaks and comes back after.
 - `fx --voice` shapes speech: `podcast` (close and clear), `warm`, `radio`, `telephone`, `megaphone`. A video input keeps its picture.
 - `design` runs your script with a Web Audio `OfflineAudioContext`: `export default ({ ctx, duration, noise }) => { const o = ctx.createOscillator(); o.frequency.setValueAtTime(80, 0); o.frequency.exponentialRampToValueAtTime(30, duration); o.connect(ctx.destination); o.start(0); }`. `noise(seconds, "white"|"pink"|"brown")` gives a noise buffer (wind, rain, rumble). Oscillators, filters, gains with automation, delays, convolvers and wave shapers all work: risers, drones, UI sounds, ambiences.
@@ -148,12 +157,12 @@ objects <picture|video> [--what person,car] [--min 0.5] [--every 1] [--draw boxe
 faces <picture|video> [--min 0.6] [--every 1] [--draw boxes.png]
 read <picture|video> [--every 1] [--draw boxes.png]   the text in it (signs, slides, screens), with boxes and times
 track <video> <track.json> [--what person|face|car|dog|...] [--every 0.2] [--draw track.png]   follow one thing through a video
-index <folder> [--output index.json] [--every 2]   one JSON log of all the footage
+index <folder> [--output index.json] [--every 2] [--only cuts,colors,things,faces,text,speech,sounds]   one JSON log of all the footage
 ```
 - `find` (`install vision`) searches what footage shows, not what it is called: `"close-up of hands typing"`, `"crowd cheering"`, `"logo on a white background"`. Each match has the best `time` and the whole moment (`start`–`end`), ready for `video trim` or a movie scene's `from`/`to`. Scores only mean something relative to each other within one search. Frames are cached in `.joedit-cache/`, so further searches of the same footage take seconds.
-- `objects` and `track` need `install objects` (`--what face` needs `install faces`); `read` needs `install read`.
+- `objects` and `track` need `install objects` (`--what face` needs `install faces`); `read` needs `install read`. `objects` knows the 80 everyday COCO kinds (person, car, dog, cup, laptop …); for anything else (a guitar pick, a logo, a character) use `find` with words, or `video reframe --follow` for the main subject.
 - `track` saves `{label, width, height, every, points: [{time, x, y, width, height}]}`: the main thing's box every `--every` seconds, smoothed. Use it in a movie layer's `track` to make text or a picture follow it, or to steer your own crops and effects.
-- `index` uses whichever AI models are installed and skips files that have not changed since the last run.
+- `index` uses whichever AI models are installed and skips files that have not changed since the last run. It prints progress per file to stderr. `--only` picks parts (e.g. `--only cuts,speech` for a quick pass). Each file gets `steady` moments (long stretches without change). Text that is only a letter or two is left out, and speech is only transcribed where there is sound that is speech or singing, so the log does not invent words.
 - `colors` gives a palette to match titles, captions and brand colors to the footage.
 
 **listen**: sound as numbers, text and pictures
@@ -162,13 +171,17 @@ wave <sound> <out.png>                      waveform with a time ruler (tall = l
 spectrum <sound> <out.png>                  spectrogram (pitch over time)
 loudness <sound>                            → lufs, peak, verdict, suggested fixes
 silences <sound> [--db -35] [--min 0.5]     → silent parts (start, end)
-beats <sound>                               → bpm and the time of every beat
+beats <sound> [--beats-per-bar 4]          → bpm, the time of every beat, downbeats (beat 1 of each bar) and bars
+bands <sound> [--reference ref.wav]         → bass/middle/treble balance per octave in dB; with a reference, the difference
+energy <sound> [--every 0.1]                → loudness over time (full and low end) and the biggest jumps (drops, hits)
 transcribe <sound> <out.json|.srt|.vtt> [--model tiny|base|small|turbo] [--language en]   → every word with its time
 subtitles <words.json> <out.srt|.vtt> [--max-chars 42]   a subtitle file from a transcript
 find <sound|video> --query "dog barking" [--top 5] [--window 4]   search sounds by meaning
 speakers <sound> <out.json> [--transcript words.json] [--speakers N]   who speaks when
 ```
 - `transcribe` needs `install whisper` (`whisper-small` or `whisper-turbo` for harder audio). The language is found automatically. A `.srt` or `.vtt` output is a subtitle file for YouTube, Vimeo, players and the web (burned-in captions are `video captions`). `subtitles` makes one from any words file, e.g. after you fix spellings, or from `voice speak --words`.
+- `beats` finds the downbeat from where the low end (kick, bass) is strongest; music with a kick on every beat (four-on-the-floor, constant double kick) can fool it, so treat `downbeats` there as a best guess and check against `energy`.
+- `bands` answers "why does this sound thin or muddy": compare a mix with a reference track you like, then fix with `sound eq`, `sound match` or a part's `fx.eq` in a score. `energy` shows where a song builds and drops, to cut picture to it.
 - `find` (`install sounds`) works best with short labels: `"applause"`, `"glass breaking"`, `"siren"`, `"laughter"`.
 - `speakers` (`install speakers`) saves the transcript with a `speaker` on every word and segment, plus how long each person talks: ready for `video captions --speakers`, or to cut to whoever is speaking.
 
@@ -206,7 +219,7 @@ gallery <out.png> [--kind effects|transitions] [--input picture|video]   every e
 preview <picture|video> [--effect crt] [--set] [--amount] [--lut] [--seconds N]   a live window for a person to watch (Esc closes)
 ```
 - Effects: looks (`bloom dream grain film vignette blur sharpen chromatic glitch crt vhs scanlines pixelate posterize halftone sketch neon light-leak letterbox tilt-shift`), color (`grade duotone tint bw sepia invert thermal night-vision`), distort (`fisheye mirror kaleidoscope wave heat shake`) and particles (`snow rain confetti embers dust bokeh fireflies`). Chain them in order with commas. `--amount` mixes the result with the original (0..1).
-- `--set` changes settings: `bloom.radius=20` for one effect, `strength=1.5` for every effect that has it. Values are numbers, `"0.2 0.4"` for vectors, or `#ff8800` for colors. `list` shows every setting and its default.
+- `--set` changes settings: `bloom.radius=20` for one effect, `strength=1.5` for every effect that has it. Values are numbers, `"0.2 0.4"` for vectors, or `#ff8800` for colors. `list` shows every setting and its default. On footage that is already bright (snow, sky, white walls), `bloom` and `light-leak` wash out quickly: lower `strength` or raise `bloom.threshold`, and check a frame.
 - `--lut look.cube` with `--effect lut` applies any `.cube` color look (from a colorist, a camera maker or a grading app).
 - A picture in and a video out makes a clip of `--duration` seconds: snow over a photo, light leaks over a title card.
 - Your own effect is a `.glsl` file with `vec4 effect(vec2 uv)` (uv 0..1, top-left is 0,0). Ready to use: `pixel(uv)`, `time`, `progress` (0..1 through the clip), `amount`, `resolution`, `ratio`, `random`, `noise`, `luma`, `mirrored`, `blurred(uv, px)`, `edges(uv)`. Example: `vec4 effect(vec2 uv) { vec4 c = pixel(uv); return vec4(c.rgb * (0.8 + 0.2 * sin(time * 6.0)), c.a); }`. Errors come back with your file's line numbers.
@@ -219,7 +232,7 @@ validate <movie.json>                       → every problem, each with a hint 
 templates                                   → starting points: short, ad, explainer, slideshow, lyric, podcast
 template <name> <movie.json>                writes one; replace its placeholder files (validate lists them)
 ```
-A movie file describes the film; joEdit does the cutting, transitions, layers, effects, sound mix, captions and look. Scenes render several at a time and each is cached in `.joedit-cache/` next to the movie file, so after changing one scene only that scene renders again. `--draft` renders at a third of the size, quickly, for checking timing and layout. Paths are relative to the movie file.
+A movie file describes the film; joEdit does the cutting, transitions, layers, effects, sound mix, captions and look. Scenes render several at a time and each is cached in `.joedit-cache/` next to the movie file, so after changing one scene only that scene renders again. The finished picture is cached too: changing only sound (music, audio tracks, sfx, volumes) mixes the sound again and reuses the picture, which takes seconds. The film is encoded at full quality once, at the end. `--draft` renders at a third of the size, quickly, for checking timing and layout. Paths are relative to the movie file.
 ```json
 {
   "size": "1920x1080",                     // or "1080x1920" (phone), "1080x1080" (square)
@@ -231,6 +244,7 @@ A movie file describes the film; joEdit does the cutting, transitions, layers, e
   "scenes": [
     {"title": "Big title", "subtitle": "small line", "duration": 3},
     {"video": "clip.mp4", "from": 2, "to": 8, "volume": 1, "fit": "cover", "transition": "cross-zoom"},
+    {"video": "wide.mp4", "from": 0, "to": 4, "speed": 0.5, "reframe": "follow"},   // slow motion, crop follows the subject
     {"image": "photo.jpg", "motion": "parallax", "duration": 4, "transition": {"type": "fade", "duration": 0.8},
      "fx": {"effect": "bloom,light-leak", "keys": [{"time": 0, "amount": 0}, {"time": 2, "amount": 1}]}},
     {"canvas": "chart.mjs", "data": {"values": [3, 7, 12]}, "duration": 5},
@@ -246,6 +260,7 @@ A movie file describes the film; joEdit does the cutting, transitions, layers, e
        {"image": "flare.png", "width": 1, "blend": "screen", "keys": [{"time": 0, "x": 0.2}, {"time": 4, "x": 0.8}]}
      ]}
   ],
+  "layers": [{"video": "hud.mov", "width": 1, "at": 2, "duration": 6}],   // over the whole film (times from the film's start)
   "audio": [{"file": "music.mp3", "volume": 0.5, "duck": true, "loop": true, "fadeIn": 1, "fadeOut": 2, "from": 10}],
   "sfx": [{"type": "whoosh", "at": 2.9}, {"type": "boom", "at": 0, "volume": 1}],
   "voiceover": {"text": "Every great film starts with a voice.", "voice": "am_michael", "at": 0.5, "reverb": "room"},
@@ -256,9 +271,9 @@ A movie file describes the film; joEdit does the cutting, transitions, layers, e
 }
 ```
 (Comments above are explanations; JSON itself has no comments.)
-- **Scenes** are one of `title`, `video`, `image`, `canvas` (your draw module, like `graphics canvas`), `html` (a page, needs Chrome) or `color`. Non-video scenes last 3 seconds unless `duration` is given. Image `motion` is a flat move (`zoom-in` (default), `zoom-out`, `pan-left/right/up/down`, `none`) or a 3D one: `parallax` (a push in), `parallax-orbit`, `parallax-pan-left/right`, `parallax-rise/fall`. Video scenes use `from`/`to` (or `duration`) and `fit`: `cover` fills the frame and crops the edges, `contain` shows the whole clip on a blurred copy of itself.
+- **Scenes** are one of `title`, `video`, `image`, `canvas` (your draw module, like `graphics canvas`), `html` (a page, needs Chrome) or `color`. Non-video scenes last 3 seconds unless `duration` is given. Image `motion` is a flat move (`zoom-in` (default), `zoom-out`, `pan-left/right/up/down`, `none`) or a 3D one: `parallax` (a push in), `parallax-orbit`, `parallax-pan-left/right`, `parallax-rise/fall`. Video scenes use `from`/`to` (or `duration`) and `fit`: `cover` fills the frame and crops the edges, `contain` shows the whole clip on a blurred copy of itself. `speed` (0.1–10) plays a video scene faster or in slow motion (sound too); the scene lasts `(to - from) / speed`. `"reframe": "follow"` crops a clip of another shape to the movie's shape, following the subject (`install cutout`; the subject's path is cached per clip, like `video reframe --follow`).
 - **Transitions** belong to the scene they lead into. Any fx transition works (`cube`, `cross-zoom`, `whip-left` …, with `"set"` for its settings), and so do ffmpeg's fast ones: `fade`, `fadeblack`, `fadewhite`, `dissolve`, `wipeleft/right/up/down`, `slideleft/right/up/down`, `smoothleft/right/up/down`, `circleopen`, `radial`, `pixelize`, `zoomin` and more (names that exist in both use ffmpeg's). Each transition overlaps the two scenes, so the film gets shorter by its duration.
-- **Layers** go on top of a scene, in order: `image`, `video` (silent) or `text` (with `style`: `size` in pixels at full size, `font`, `weight`, `color`, `stroke`, `shadow`, `box`, `maxWidth`). Positions are fractions of the frame: `x`, `y` is the layer's centre (default 0.5, 0.5), `width` is a fraction of the frame width (default 0.3). Also `scale`, `rotate` (degrees), `opacity`, `blend` (`normal multiply screen overlay add darken lighten soft-light hard-light difference color-dodge color-burn …`), `at`/`duration` (seconds within the scene), `fadeIn`/`fadeOut`. `keys` animate `x, y, width, scale, rotate, opacity`: each key is `{"time": seconds from the layer's start, ...values}` and values glide smoothly between keys. `track` (a `look track` file of this scene's video) makes the layer follow that thing; `x`/`y` then become offsets and `anchor` (`top` (default), `center`, `bottom`) picks where it sits on the box.
+- **Layers** go on top of a scene, in order: `image`, `video` (silent) or `text` (with `style`: `size` in pixels at full size, `font`, `weight`, `color`, `stroke`, `shadow`, `box`, `maxWidth`). Positions are fractions of the frame: `x`, `y` is the layer's centre (default 0.5, 0.5), `width` is a fraction of the frame width (default 0.3). Also `scale`, `rotate` (degrees), `opacity`, `blend` (`normal multiply screen overlay add darken lighten soft-light hard-light difference color-dodge color-burn …`), `at`/`duration` (seconds within the scene), `fadeIn`/`fadeOut`. `keys` animate `x, y, width, scale, rotate, opacity`: each key is `{"time": seconds from the layer's start, ...values}` and values glide smoothly between keys. `track` (a `look track` file of this scene's video) makes the layer follow that thing; `x`/`y` then become offsets and `anchor` (`top` (default), `center`, `bottom`) picks where it sits on the box. The movie's own `layers` work the same way but lie over the whole film, across cuts and transitions (a HUD, a logo bug, a frame), with `at` counted from the film's start; they have no `track`.
 - **fx** (on a scene or the whole film): `"bloom,grain"` or `{"effect": "...", "set": {...}, "amount": 1, "lut": "look.cube", "keys": [{"time": 0, "amount": 0}, ...]}`. Your own `.glsl` files work here too.
 - **Sound:** scene sound, `audio` tracks and `sfx` are mixed together and set to -14 LUFS. Tracks with `"duck": true` go quiet whenever the other sound (speech) is loud. Tracks also take `pan` and `reverb`. `at` is seconds from the start of the film.
 - **Music** is made once and cached: a `score` is composed (with exact beat times for `beatSync`), a `song` is generated by the song pack, a `file` is used as it is. It ducks under speech unless `"duck": false`, and fades out over 2 seconds unless `fadeOut` says otherwise.
@@ -279,9 +294,9 @@ stems <music> <folder> [--only vocals|drums|bass|other]   → vocals.wav drums.w
 
 **music**: write music as a score, or generate whole songs
 ```
-compose <score.json> <out.wav|.mp3|.mid>    play a score with real instruments (install instruments)
-instruments                                 → the 128 instrument names, short names, drum sounds, drum styles, rhythms, chords
-song <out.wav> --prompt "style, mood, instruments, voice" [--lyrics lyrics.txt] [--duration 30] [--bpm N] [--seed N]
+compose <score.json> <out.wav|.mp3|.mid> [--stems folder]   play a score with real instruments (install instruments)
+instruments                                 → the 128 instrument names, short names, drum sounds, drum styles, rhythms, chords, amps
+song <out.wav> --prompt "style, mood, instruments, voice" [--lyrics lyrics.txt] [--duration 30] [--bpm N] [--seed N] [--steps 8] [--guidance 1]
 ```
 A score is JSON. You decide every note, so the music fits the film exactly (length, tempo, mood, where it builds):
 ```json
@@ -298,11 +313,12 @@ A score is JSON. You decide every note, so the music fits the film exactly (leng
 }
 ```
 - Times are in beats from the start. `melody` notes last 1 beat unless written `C5:2` (2 beats) or `G4:0.5`; `-` is a rest.
-- `chords` are names like `C Am F G7 Dm7 Fmaj7 Esus4 Cadd9 C/E`, one per bar unless `beatsPerChord`. `rhythm`: `pad` (held), `block` (each beat), `arp` (broken chord in eighths), `strum` (guitar pattern), `pulse` (eighth-note synth), `bass` (bass line from the chord roots).
-- `instrument`: any General MIDI name (`acoustic grand piano`, `cello`, `warm pad`, `steel drums` …) or short names: piano, electric piano, organ, guitar, electric guitar, bass, synth bass, strings, violin, cello, harp, choir, trumpet, brass, sax, flute, lead, pad, bells, music box, marimba.
+- `chords` are names like `C Am F G7 Dm7 Fmaj7 Esus4 Cadd9 C/E`, one per bar unless `beatsPerChord`. `rhythm`: `pad` (held), `block` (each beat), `arp` (broken chord in eighths), `strum` (guitar pattern), `pulse` (eighth-note synth), `bass` (bass line from the chord roots), `chug` (palm-muted eighths, for rock and metal). A chord written `E5` is a power chord.
+- `instrument`: any General MIDI name (`acoustic grand piano`, `cello`, `warm pad`, `steel drums` …) or short names: piano, electric piano, organ, guitar, electric guitar, bass, synth bass, strings, violin, cello, harp, choir, trumpet, brass, sax, flute, lead, pad, bells, music box, marimba. `pluck` is a real plucked string (each note a little different, short notes palm-muted): with an amp it is the best rock and metal guitar here.
+- Each part can have its own `fx`: `{"amp": "clean|crunch|metal", "drive": 0..1, "eq": {"low": dB, "mid": dB, "high": dB}, "reverb": "room|hall|...", "mix": 0.2}`. `"double": true` plays the part twice, hard left and right (the wide wall of rock guitars). Example rhythm guitar: `{"instrument": "pluck", "chords": "E5 E5 G5 A5", "rhythm": "chug", "octave": 2, "double": true, "fx": {"amp": "metal", "eq": {"mid": -3}}}`. `--stems folder` also saves each part and the drums as its own `.wav` for mixing.
 - `drums`: a `style` (`four-on-floor`, `hiphop`, `rock`, `halftime`, `trap`, `bossa`, `waltz`) or your own `pattern`: `{"kick": "x...x...x...x...", "snare": "....x.......x...", "hat": "x.x.x.x.x.x.x.x."}`. Each character is a 16th note: `x` hit, `X` accent, `o` soft, `.` rest. Drums: kick, snare, rim, clap, hat, openhat, pedalhat, crash, ride, hightom, midtom, lowtom, tambourine, cowbell, shaker, conga, bongo.
 - Ideas: start sparse and add parts every 8 bars to build energy; set `tempo` so that 1 bar = a scene length; make the score exactly as long as the film (`bars` = seconds × tempo / 60 / 4). `.mid` output opens in any music app.
-- `song` (`install song`, ACE-Step 1.5, ~10 GB of models) makes a full produced song: describe genre, mood, instruments and voice in `--prompt`; lyrics use section tags like `[verse]`, `[chorus]`, `[bridge]`. Without lyrics it is instrumental. Same `--seed` = same song. To check the singing (or time lyric captions), split it first: `voice stems song.wav stems --only vocals`, then `listen transcribe stems/vocals.wav words.json`.
+- `song` (`install song`, ACE-Step 1.5, ~10 GB of models) makes a full produced song: describe genre, mood, instruments and voice in `--prompt`; lyrics use section tags like `[verse]`, `[chorus]`, `[bridge]`. Without lyrics it is instrumental. Same `--seed` = same song. It is strongest at pop, electronic, hip-hop, ambient, cinematic and singer-songwriter; heavy rock and metal come out soft (little 1–5 kHz bite), and its beat grid is its own. For rock or metal, or music that must hit exact times, `compose` a score (pluck + amp) instead, or check the song with `listen bands` and `listen beats`. `--steps` (default 8, the fast setting; 30–50 adds detail) and `--guidance` (default 1; higher follows the prompt more closely) trade time for quality. To check the singing (or time lyric captions), split it first: `voice stems song.wav stems --only vocals`, then `listen transcribe stems/vocals.wav words.json`.
 
 **3d**: real 3D scenes rendered by Blender (free; `doctor` shows how to install it)
 ```
@@ -337,7 +353,8 @@ orbit_camera(radius=7, height=2.5, turns=0.25)
 ```
 - Units are meters (things about 1–3 m across look right with the default camera), angles are degrees, Z is up, the camera looks toward +Y.
 - `eevee` renders in seconds and looks great. `cycles` traces real light (glass, caustics, soft shadows); its first render on a machine compiles GPU code for a few minutes, after that it is quick. `--draft` (half size, few samples) is for checking motion; `render` to a `.png` with `--frame N` checks one moment.
-- An error in the script comes back with the script's own line number.
+- An error in the script comes back with the script's own line number. What the script `print`s comes back under `printed` (and with the error), handy for measuring a scene from Python.
+- `--frame N` with a `.png` renders frame N of a scene that is `--duration` long, so `FRAMES` and `seconds()` mean the same as in the video.
 - `--transparent` with `.mov`, `.webm` or `.png` keeps only the objects, ready to lay over video (with `--engine cycles`, `ground(shadow_only=True)` keeps their shadows too).
 - Ideas: 3D logo reveals (`title`), product spins from a model (`turntable`), charts as 3D bars (`shape("cube")` scaled by data), a generated picture on a `plane` as a backdrop, exporting what you build (`bpy.ops.export_scene.gltf(filepath=...)`) for Three.js pages.
 

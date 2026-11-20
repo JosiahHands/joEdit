@@ -64,13 +64,16 @@ export type Command = {
 
 // Run a program (ffmpeg, uv, blender ...) and return its stdout. "ffmpeg" means joEdit's own ffmpeg.
 // Throws an Error containing stderr if the program fails.
-export function run(program: string, args: string[], env?: Record<string, string>): string {
+// cwd: the folder to run in (lets ffmpeg filters use short file names, with no "C:" to escape).
+export function run(program: string, args: string[], env?: Record<string, string>, cwd?: string): string {
   try {
     return execFileSync(program === "ffmpeg" ? FFMPEG : program, args, {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
       maxBuffer: 256 * 1024 * 1024, // transcripts and analysis output can be large
       env: env ? { ...process.env, ...env } : process.env,
+      cwd,
+      shell: isWindowsScript(program), // Windows runs .cmd files (npx.cmd) only through a shell
     });
   } catch (error: any) {
     if (error.code === "ENOENT") throw new Error(`"${program}" is not installed. Run: node joedit.ts doctor`);
@@ -80,19 +83,40 @@ export function run(program: string, args: string[], env?: Record<string, string
 }
 
 // True if a program can be found on this computer.
+// Windows has `where` instead of `which`.
 export function hasProgram(program: string): boolean {
-  return spawnSync("which", [program]).status === 0;
+  return spawnSync(process.platform === "win32" ? "where" : "which", [program]).status === 0;
 }
+
+// On Windows, npx and npm are .cmd scripts: their name gets ".cmd" and they run through a shell.
+export const isWindowsScript = (program: string) => process.platform === "win32" && /\.cmd$/i.test(program);
+export const npx = process.platform === "win32" ? "npx.cmd" : "npx";
 
 // Run ffmpeg quietly, always overwriting the output. Used by video.ts and sound.ts.
-export function ffmpeg(args: string[]): void {
-  run("ffmpeg", ["-hide_banner", "-loglevel", "error", "-y", ...args]);
+// cwd: see run().
+export function ffmpeg(args: string[], cwd?: string): void {
+  run("ffmpeg", ["-hide_banner", "-loglevel", "error", "-y", ...args], undefined, cwd);
 }
 
-// The same, without waiting: other work (more scenes, Chrome renders) keeps going while ffmpeg runs.
-export function ffmpegAsync(args: string[]): Promise<void> {
+// Read a JSON file. A byte-order mark (Windows PowerShell adds one) is ignored, and a mistake names the file.
+export function readJson(path: string): any {
+  const text = readFileSync(requireFile(path), "utf8").replace(/^﻿/, "");
+  try {
+    return JSON.parse(text);
+  } catch (error: any) {
+    throw new Error(`${path} is not valid JSON (${error.message}).`);
+  }
+}
+
+// One line of an ffmpeg concat list. Quotes in the path are escaped, so "O'Brien/clip.mp4" works.
+export function concatLine(path: string): string {
+  return `file '${path.replace(/'/g, "'\\''")}'`;
+}
+
+// The same, without waiting: other work (more scenes, Chrome renders) keeps going while ffmpeg runs. cwd: see run().
+export function ffmpegAsync(args: string[], cwd?: string): Promise<void> {
   return new Promise((done, fail) => {
-    const child = spawn(FFMPEG, ["-hide_banner", "-loglevel", "error", "-y", ...args], { stdio: ["ignore", "ignore", "pipe"] });
+    const child = spawn(FFMPEG, ["-hide_banner", "-loglevel", "error", "-y", ...args], { stdio: ["ignore", "ignore", "pipe"], cwd });
     let errors = "";
     child.stderr.on("data", (chunk) => (errors += chunk));
     child.on("error", (error: any) => fail(error.code === "ENOENT" ? new Error('"ffmpeg" is not installed. Run: node joedit.ts doctor') : error));
@@ -105,8 +129,9 @@ export function ffmpegAsync(args: string[]): Promise<void> {
 // kind: "video" uses -vf, "audio" uses -af.
 export function analyze(input: string, kind: "video" | "audio", filter: string): string {
   requireFile(input);
-  const option = kind === "video" ? "-vf" : "-af";
-  const result = spawnSync(FFMPEG, ["-hide_banner", "-nostats", "-i", input, option, filter, "-f", "null", "-"], {
+  // Only the stream being measured is decoded (-an / -vn): reading a big video's picture for a sound check is slow.
+  const only = kind === "video" ? ["-an", "-vf"] : ["-vn", "-af"];
+  const result = spawnSync(FFMPEG, ["-hide_banner", "-nostats", "-i", input, ...only, filter, "-f", "null", "-"], {
     encoding: "utf8",
     maxBuffer: 256 * 1024 * 1024,
   });
@@ -154,6 +179,7 @@ export function even(value: number): number {
 export function probe(input: string): { streams: any[]; format: any } {
   requireFile(input);
   const av = need("node-av");
+  av.Log.setLevel(av.AV_LOG_QUIET); // no stray warnings (e.g. iPhone spatial-audio tracks); errors are thrown below
   let demuxer: any;
   try {
     demuxer = av.Demuxer.openSync(input);
@@ -199,9 +225,10 @@ export type Frame = { time: number; pixels: Buffer; width: number; height: numbe
 // fps: take this many frames per second (default: every frame). width: scale to this width.
 // width + height: exactly this size, filling the frame (the middle is kept, extra edges are cut).
 // start / duration / count: only part of the video (count = at most this many frames).
+// graph: an ffmpeg filter graph run first, from [0:v] to [pre] (e.g. a color grade); inputs: more files it uses ([1:v] ...).
 export async function* readFrames(
   input: string,
-  options: { fps?: number; width?: number; height?: number; start?: number; duration?: number; count?: number } = {},
+  options: { fps?: number; width?: number; height?: number; start?: number; duration?: number; count?: number; graph?: string; inputs?: string[] } = {},
 ): AsyncGenerator<Frame> {
   const video = probe(input).streams.find((s) => s.codec_type === "video");
   if (!video) throw new Error(`"${input}" has no picture.`);
@@ -211,32 +238,46 @@ export async function* readFrames(
   const fps = options.fps ?? (den ? num / den : 30);
   const scale = options.height ? `scale=${width}:${height}:force_original_aspect_ratio=increase,crop=${width}:${height}` : `scale=${width}:${height}`;
   const filters = [...(options.fps ? [`fps=${options.fps}`] : []), scale, "format=rgba"];
+  const filterArgs = options.graph
+    ? ["-filter_complex", `${options.graph};[pre]${filters.join(",")}[out]`, "-map", "[out]"]
+    : ["-vf", filters.join(",")];
   const child = spawn(FFMPEG, [
     "-hide_banner", "-loglevel", "error",
     ...(options.start ? ["-ss", String(options.start)] : []), "-i", input,
+    ...(options.inputs ?? []).flatMap((file) => ["-i", file]),
     ...(options.duration ? ["-t", String(options.duration)] : []),
     ...(options.count ? ["-frames:v", String(options.count)] : []),
-    "-vf", filters.join(","), "-f", "rawvideo", "-",
+    ...filterArgs, "-f", "rawvideo", "-",
   ], { stdio: ["ignore", "pipe", "pipe"] });
   let errors = "";
   child.stderr.on("data", (chunk) => (errors += chunk));
   const closed = new Promise<number>((done) => child.on("close", (code) => done(code ?? 1)));
+  // Pipe chunks are copied straight into the frame being filled (one copy per byte, no joining of chunks).
   const size = width * height * 4;
-  let waiting: Buffer[] = [];
-  let buffered = 0;
+  let frame = Buffer.allocUnsafe(size);
+  let filled = 0;
   let index = 0;
-  for await (const chunk of child.stdout) {
-    waiting.push(chunk);
-    buffered += chunk.length;
-    while (buffered >= size) {
-      const all = Buffer.concat(waiting);
-      yield { time: (options.start ?? 0) + index / fps, pixels: all.subarray(0, size), width, height };
-      index++;
-      waiting = [all.subarray(size)];
-      buffered -= size;
+  try {
+    for await (const chunk of child.stdout as AsyncIterable<Buffer>) {
+      let offset = 0;
+      while (offset < chunk.length) {
+        const take = Math.min(size - filled, chunk.length - offset);
+        chunk.copy(frame, filled, offset, offset + take);
+        filled += take;
+        offset += take;
+        if (filled === size) {
+          yield { time: (options.start ?? 0) + index / fps, pixels: frame, width, height };
+          index++;
+          frame = Buffer.allocUnsafe(size);
+          filled = 0;
+        }
+      }
     }
+    if ((await closed) !== 0) throw new Error(`ffmpeg failed: ${errors.trim()}`);
+  } finally {
+    // Stopped early (only part of the frames were wanted): stop ffmpeg too, or it waits forever.
+    if (child.exitCode === null) child.kill();
   }
-  if ((await closed) !== 0) throw new Error(`ffmpeg failed: ${errors.trim()}`);
 }
 
 // One frame of a video at `time` seconds, as RGBA pixels (null if there is no frame there).
@@ -252,7 +293,8 @@ export function writeVideo(output: string, options: { width: number; height: num
   const child = spawn(FFMPEG, [
     "-hide_banner", "-loglevel", "error", "-y",
     "-f", "rawvideo", "-pix_fmt", "rgba", "-s", `${width}x${height}`, "-r", String(fps), "-i", "-",
-    ...(options.audio ? ["-i", options.audio, "-map", "0:v", "-map", "1:a", "-c:a", "aac", "-b:a", "192k", "-shortest"] : []),
+    // Only the first sound track (iPhones add a second, spatial one that other tools can't play).
+    ...(options.audio ? ["-i", options.audio, "-map", "0:v", "-map", "1:a:0?", "-c:a", "aac", "-b:a", "192k", "-shortest"] : []),
     ...videoEncoder(output, { transparent: options.transparent, draft: options.draft }),
     output,
   ], { stdio: ["pipe", "ignore", "pipe"] });
@@ -672,12 +714,16 @@ function packEnvironment(name: string): Record<string, string> {
   return { UV_PROJECT_ENVIRONMENT: home, HF_HOME: join(home, "models"), TORCH_HOME: join(home, "models") };
 }
 
+// How to install uv on this system.
+export const UV_INSTALL =
+  process.platform === "win32" ? "winget install astral-sh.uv" : process.platform === "darwin" ? "brew install uv   (or: curl -LsSf https://astral.sh/uv/install.sh | sh)" : "curl -LsSf https://astral.sh/uv/install.sh | sh";
+
 // Install a pack: its Python libraries, then its models (`run.py --download`). This is the only time it goes online.
 // The first install can take a while (libraries and models are big).
 export function installPack(name: string): { pack: string; installed: boolean } {
   const folder = packRecipe(name);
   if (!hasProgram("uv")) {
-    throw new Error("Packs need uv (a Python installer). Install it with: brew install uv   (or: curl -LsSf https://astral.sh/uv/install.sh | sh)");
+    throw new Error(`Packs need uv (a Python installer). Install it with: ${UV_INSTALL}`);
   }
   const env = { ...process.env, ...packEnvironment(name) };
   try {
@@ -904,7 +950,7 @@ export const ASSET_LIST: Asset[] = [
     name: "browser",
     description: "A headless Chrome for HTML pages (graphics render and still), only needed if Google Chrome or Chromium is not installed.",
     license: "BSD (Chromium)",
-    command: ["npx", "-y", "@puppeteer/browsers", "install", "chrome-headless-shell@stable", "--path"],
+    command: [npx, "-y", "@puppeteer/browsers", "install", "chrome-headless-shell@stable", "--path"],
   },
 ];
 
@@ -934,13 +980,19 @@ export async function installAsset(name: string): Promise<{ asset: string; insta
   mkdirSync(folder, { recursive: true });
   if (asset.command) {
     const [program, ...args] = asset.command;
-    execFileSync(program, [...args, folder], { stdio: ["ignore", "ignore", "inherit"] });
+    try {
+      execFileSync(program, [...args, folder], { stdio: ["ignore", "ignore", "inherit"], shell: isWindowsScript(program) });
+    } catch {
+      throw new Error(`Installing "${name}" failed. See the messages above (it needs Node's npx).`);
+    }
   }
   for (const file of asset.files ?? []) {
     const target = join(folder, file.path); // paths may include sub-folders
     await download(file.url, target);
     if (file.unzip) {
-      run("unzip", ["-o", "-q", target, "-d", folder]);
+      // Windows 10+ has tar (it unpacks zips too); macOS and Linux have unzip.
+      if (process.platform === "win32") run("tar", ["-xf", target, "-C", folder]);
+      else run("unzip", ["-o", "-q", target, "-d", folder]);
       rmSync(target);
       // Zips do not always keep the "can run" flag, so set it on the programs inside.
       for (const name of readdirSync(folder)) {
@@ -985,10 +1037,10 @@ export function loadBrand(path?: string): Brand {
   if (!path) return DEFAULT_BRAND;
   let custom;
   try {
-    custom = JSON.parse(readFileSync(requireFile(path), "utf8"));
+    custom = readJson(path);
   } catch (error: any) {
     if (error.message.startsWith("File not found")) throw error;
-    throw new Error(`${path} is not valid JSON (${error.message}). Example: {"colors": {"primary": "#7C5CFF"}, "fonts": {"heading": "Montserrat"}}`);
+    throw new Error(`${error.message} Example: {"colors": {"primary": "#7C5CFF"}, "fonts": {"heading": "Montserrat"}}`);
   }
   const brand: Brand = {
     colors: { ...DEFAULT_BRAND.colors, ...custom.colors },

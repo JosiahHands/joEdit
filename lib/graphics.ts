@@ -4,7 +4,7 @@
 // Library: import { render } from "./joEdit/graphics.ts"
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -13,6 +13,7 @@ import {
   FFMPEG,
   FONT_FAMILIES,
   FONTS,
+  concatLine,
   drawText,
   hasProgram,
   inOut,
@@ -20,6 +21,7 @@ import {
   measureText,
   numberFlag,
   optionalNumberFlag,
+  readJson,
   requireFile,
   round,
   run,
@@ -40,24 +42,44 @@ import * as listen from "./listen.ts";
 
 // ---------- Chrome ----------
 
+// Where Chrome (or Edge, which speaks the same DevTools protocol) is installed on Windows.
+function windowsChromes(): string[] {
+  const roots = [process.env.ProgramFiles, process.env["ProgramFiles(x86)"], process.env.LOCALAPPDATA].filter(Boolean) as string[];
+  return roots.flatMap((root) => [
+    join(root, "Google", "Chrome", "Application", "chrome.exe"),
+    join(root, "Chromium", "Application", "chrome.exe"),
+    join(root, "Microsoft", "Edge", "Application", "msedge.exe"),
+  ]);
+}
+
+// The headless Chrome program inside a folder made by `install browser` (chrome-headless-shell, .exe on Windows).
+// It sits inside folders of the same name, so only files count.
+export function headlessShellIn(folder: string): string | undefined {
+  if (!existsSync(folder)) return undefined;
+  const file = readdirSync(folder, { recursive: true })
+    .map(String)
+    .find((p) => /^chrome-headless-shell(\.exe)?$/.test(basename(p)) && statSync(join(folder, p)).isFile());
+  return file ? join(folder, file) : undefined;
+}
+
 // Find a Chrome or Chromium to render with.
 export function findChrome(): string {
   const paths = [
     process.env.JOEDIT_CHROME ?? "",
     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
     "/Applications/Chromium.app/Contents/MacOS/Chromium",
+    ...(process.platform === "win32" ? windowsChromes() : []),
   ];
   const found = paths.find((p) => p && existsSync(p));
   if (found) return found;
-  for (const name of ["google-chrome", "google-chrome-stable", "chromium", "chromium-browser"]) {
-    if (hasProgram(name)) return name;
+  if (process.platform !== "win32") {
+    for (const name of ["google-chrome", "google-chrome-stable", "chromium", "chromium-browser"]) {
+      if (hasProgram(name)) return name;
+    }
   }
   // A headless Chrome downloaded with: node joedit.ts install browser
-  const folder = join(ASSETS, "browser");
-  if (existsSync(folder)) {
-    const file = readdirSync(folder, { recursive: true }).map(String).find((p) => basename(p) === "chrome-headless-shell");
-    if (file) return join(folder, file);
-  }
+  const shell = headlessShellIn(join(ASSETS, "browser"));
+  if (shell) return shell;
   throw new Error("Graphics needs Chrome. Install Google Chrome, or run: node joedit.ts install browser");
 }
 
@@ -254,7 +276,7 @@ export async function render(file: string, output: string, options: RenderOption
   }
 
   const format = transparent ? "png" : "jpeg";
-  const soundArgs = options.audio ? ["-i", options.audio, "-map", "0:v", "-map", "1:a", "-c:a", "aac", "-shortest"] : [];
+  const soundArgs = options.audio ? ["-i", options.audio, "-map", "0:v", "-map", "1:a:0", "-c:a", "aac", "-shortest"] : [];
   const encoder = spawn(
     FFMPEG,
     [
@@ -699,9 +721,9 @@ export async function captionsOverlay(
       pictures.set(key, file);
     }
     // An ffmpeg "concat" list: each picture with how long it stays on screen.
-    const pictureOf = (s: State) => pictures.get(`${s.group}_${s.active}`);
-    const list = states.map((s) => `file '${pictureOf(s)}'\nduration ${round(s.end - s.start, 3)}`);
-    list.push(`file '${pictureOf(states[states.length - 1])}'`);
+    const pictureOf = (s: State) => pictures.get(`${s.group}_${s.active}`)!;
+    const list = states.map((s) => `${concatLine(pictureOf(s))}\nduration ${round(s.end - s.start, 3)}`);
+    list.push(concatLine(pictureOf(states[states.length - 1])));
     writeFileSync(join(folder, "list.txt"), list.join("\n"));
     run("ffmpeg", [
       "-hide_banner", "-loglevel", "error", "-y",
@@ -728,7 +750,7 @@ function sizeFlags(a: Args) {
 
 // --data file.json is read and given to the page as window.joedit.data.
 function dataFlag(a: Args): unknown {
-  return a.flags.data ? JSON.parse(readFileSync(requireFile(a.flags.data), "utf8")) : undefined;
+  return a.flags.data ? readJson(a.flags.data) : undefined;
 }
 
 // The output path for commands that only make something (no input file).

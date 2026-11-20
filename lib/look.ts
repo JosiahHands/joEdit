@@ -25,6 +25,7 @@ import {
   numberFlag,
   openPicture,
   optionalNumberFlag,
+  readJson,
   requireFile,
   round,
   runCli,
@@ -200,7 +201,10 @@ function unit(vector: Float32Array): Float32Array {
 export async function pictureVectors(pictures: string[], cacheFile?: string): Promise<Float32Array[]> {
   const names = pictures.map((p) => basename(p));
   if (cacheFile && existsSync(cacheFile)) {
-    const saved = JSON.parse(readFileSync(cacheFile, "utf8"));
+    let saved: any = {};
+    try {
+      saved = JSON.parse(readFileSync(cacheFile, "utf8"));
+    } catch {} // a broken cache file is made again below
     if (JSON.stringify(saved.names) === JSON.stringify(names)) {
       const all = new Float32Array(new Uint8Array(Buffer.from(saved.vectors, "base64")).buffer);
       return names.map((_, n) => all.subarray(n * saved.size, (n + 1) * saved.size));
@@ -752,9 +756,17 @@ export async function read(input: string, options: { every?: number; draw?: stri
 
 const SOUND_FILE = /\.(wav|mp3|m4a|aac|flac|ogg|opus|aiff?)$/i;
 
+// The parts of an index entry, each one switched on or off with --only.
+export const INDEX_PARTS = ["cuts", "colors", "things", "faces", "text", "speech", "sounds"];
+
+// Text worth keeping: at least 3 letters (the text model also "reads" patterns in gravel or leaves).
+const looksLikeText = (text: string) => (text.match(/\p{L}/gu) ?? []).length >= 3;
+
 // Everything joEdit can tell about one file, using the AI models that are installed.
-async function indexFile(file: string, every: number, cache: string): Promise<Record<string, any>> {
-  const has = (model: string) => isModelInstalled(model);
+// Guesses the models make on weak evidence are left out: text seen in only one check of a video, things seen
+// in only one check, and speech in sound that is too quiet (or, with the sounds model, does not sound like speech).
+async function indexFile(file: string, every: number, cache: string, parts: string[]): Promise<Record<string, any>> {
+  const want = (part: string, model?: string) => parts.includes(part) && (!model || isModelInstalled(model));
   const kind = PICTURE_FILE.test(file) ? "picture" : VIDEO_FILE.test(file) ? "video" : "sound";
   const entry: Record<string, any> = { kind };
   const details = kind === "picture" ? null : video.info(file);
@@ -763,33 +775,47 @@ async function indexFile(file: string, every: number, cache: string): Promise<Re
     Object.assign(entry, { width, height });
   } else {
     entry.duration = round(details!.duration, 2);
-    if (kind === "video") Object.assign(entry, { width: details!.width, height: details!.height, fps: details!.fps, cuts: scenes(file).cuts });
+    if (kind === "video") Object.assign(entry, { width: details!.width, height: details!.height, fps: details!.fps });
+    if (kind === "video" && want("cuts")) entry.cuts = scenes(file).cuts;
   }
+  // A moment that lasts more than one check (one check alone is often a false alarm).
+  const steady = (moments: [number, number][]) => moments.filter(([start, end]) => end - start > every * 1.5);
   // What it looks like.
   if (kind !== "sound") {
-    entry.colors = (await colors(file, 5)).colors.map((c) => c.hex);
-    if (has("objects")) {
+    if (want("colors")) entry.colors = (await colors(file, 5)).colors.map((c) => c.hex);
+    if (want("things", "objects")) {
       const found: any = await objects(file, { every });
-      entry.things = kind === "picture" ? count(found.things.map((t: Thing) => t.label)) : found.seen.map((s: any) => ({ label: s.label, most: s.most, moments: s.moments }));
+      entry.things = kind === "picture"
+        ? count(found.things.map((t: Thing) => t.label))
+        : found.seen.map((s: any) => ({ label: s.label, most: s.most, moments: steady(s.moments) })).filter((s: any) => s.moments.length);
     }
-    if (has("faces")) {
+    if (want("faces", "faces")) {
       const found: any = await faces(file, { every });
-      entry.faces = kind === "picture" ? found.count : { most: found.seen[0]?.most ?? 0, moments: found.seen[0]?.moments ?? [] };
+      entry.faces = kind === "picture" ? found.count : { most: found.seen[0]?.most ?? 0, moments: steady(found.seen[0]?.moments ?? []) };
     }
-    if (has("read")) {
+    if (want("text", "read")) {
       const found: any = await read(file, { every });
-      entry.text = kind === "picture" ? found.text : found.texts.map((t: any) => ({ text: t.text, start: t.start, end: t.end }));
+      entry.text = kind === "picture"
+        ? found.lines.map((l: any) => l.text).filter(looksLikeText).join("\n")
+        : found.texts.filter((t: any) => looksLikeText(t.text) && t.end - t.start > every * 1.5).map((t: any) => ({ text: t.text, start: t.start, end: t.end }));
     }
   }
   // What it sounds like.
   if (kind === "sound" || details?.hasAudio) {
     entry.lufs = listen.loudness(file).lufs;
-    if (has("whisper")) {
-      const words = join(cache, `${basename(file)}.words.json`);
-      const said = await listen.transcribe(file, words);
-      entry.speech = { language: said.language, words: said.words, text: said.text, transcript: words };
+    const sounds = want("sounds", "sounds") ? await listen.soundTags(file) : undefined;
+    if (sounds) entry.sounds = sounds;
+    if (want("speech", "whisper")) {
+      // Speech-to-text "hears" words in wind and hum, so it only runs when there can be speech.
+      const heardSpeech = !sounds || sounds.some((s) => ["speech", "singing"].includes(s.label));
+      if (entry.lufs < -40) entry.speech = { skipped: `too quiet for speech (${entry.lufs} LUFS)` };
+      else if (!heardSpeech) entry.speech = { skipped: "no speech heard (sounds model)" };
+      else {
+        const words = join(cache, `${basename(file)}.words.json`);
+        const said = await listen.transcribe(file, words);
+        entry.speech = { language: said.language, words: said.words, text: said.text, transcript: words };
+      }
     }
-    if (has("sounds")) entry.sounds = await listen.soundTags(file);
   }
   return entry;
 }
@@ -804,36 +830,49 @@ function count(labels: string[]): Record<string, number> {
 // One JSON log of every picture, video and sound in a folder: size, length, cuts, colors, things, faces,
 // text on screen, loudness, what is said and what can be heard. Read it to know the footage without opening each file.
 // Files that did not change since the last index are not looked at again. Each AI part runs only when its model is installed.
-export async function index(folder: string, output?: string, options: { every?: number } = {}) {
+// only: some of INDEX_PARTS (default all). Progress is printed to stderr, one line per file.
+export async function index(folder: string, output?: string, options: { every?: number; only?: string[] } = {}) {
   requireFile(folder);
   if (!statSync(folder).isDirectory()) throw new Error("index looks at a folder. For one file, use look objects, look read or listen transcribe.");
   const every = options.every ?? 2;
+  const parts = options.only ?? INDEX_PARTS;
+  const unknown = parts.filter((p) => !INDEX_PARTS.includes(p));
+  if (unknown.length) throw new Error(`Unknown part "${unknown[0]}" for --only. Parts: ${INDEX_PARTS.join(", ")}.`);
   const target = output ?? join(folder, "index.json");
   const cache = join(folder, ".joedit-cache", "index");
   mkdirSync(cache, { recursive: true });
-  const before: Record<string, any> = existsSync(target) ? JSON.parse(readFileSync(target, "utf8")).files ?? {} : {};
+  // Files already in the index are skipped when unchanged. A broken index.json is simply made again.
+  let before: Record<string, any> = {};
+  try {
+    if (existsSync(target)) before = readJson(target).files ?? {};
+  } catch {}
   const names = readdirSync(folder).filter((n) => PICTURE_FILE.test(n) || VIDEO_FILE.test(n) || SOUND_FILE.test(n)).sort();
   if (!names.length) throw new Error("No pictures, videos or sounds in this folder.");
   const files: Record<string, any> = {};
   let looked = 0;
-  for (const name of names) {
+  const partsKey = parts.join(",");
+  for (const [n, name] of names.entries()) {
     const path = join(folder, name);
     const { size, mtimeMs } = statSync(path);
     const old = before[name];
-    if (old && old.bytes === size && old.modified === Math.round(mtimeMs) && old.every === every) {
+    if (old && old.bytes === size && old.modified === Math.round(mtimeMs) && old.every === every && (old.parts ?? INDEX_PARTS.join(",")) === partsKey) {
       files[name] = old;
       continue;
     }
     looked++;
+    const started = Date.now();
+    process.stderr.write(`index: ${n + 1}/${names.length} ${name} ...`);
     try {
-      files[name] = { bytes: size, modified: Math.round(mtimeMs), every, ...(await indexFile(path, every, cache)) };
+      files[name] = { bytes: size, modified: Math.round(mtimeMs), every, parts: partsKey, ...(await indexFile(path, every, cache, parts)) };
     } catch (error) {
-      files[name] = { bytes: size, modified: Math.round(mtimeMs), every, error: (error as Error).message };
+      files[name] = { bytes: size, modified: Math.round(mtimeMs), every, parts: partsKey, error: (error as Error).message };
     }
+    process.stderr.write(` ${round((Date.now() - started) / 1000, 1)}s\n`);
     writeFileSync(target, JSON.stringify({ folder: resolve(folder), files }, null, 1)); // saved after each file, so a stop loses little
   }
   writeFileSync(target, JSON.stringify({ folder: resolve(folder), files }, null, 1));
-  const missing = ["objects", "faces", "read", "whisper", "sounds"].filter((m) => !isModelInstalled(m));
+  const modelOf: Record<string, string> = { things: "objects", faces: "faces", text: "read", speech: "whisper", sounds: "sounds" };
+  const missing = parts.map((p) => modelOf[p]).filter((m) => m && !isModelInstalled(m));
   return {
     output: target,
     files: names.length,
@@ -869,8 +908,12 @@ export const commands: Record<string, Command> = {
       }),
   },
   index: {
-    usage: "index <folder> [--output index.json] [--every 2]  (one JSON log of all the footage; uses the AI models that are installed)",
-    run: (a) => index(requireFile(a.positional[0]), a.flags.output, { every: optionalNumberFlag(a, "every", 2) }),
+    usage: "index <folder> [--output index.json] [--every 2] [--only cuts,colors,things,faces,text,speech,sounds]  (one JSON log of all the footage; uses the AI models that are installed)",
+    run: (a) =>
+      index(requireFile(a.positional[0]), a.flags.output, {
+        every: optionalNumberFlag(a, "every", 2),
+        only: a.flags.only ? a.flags.only.split(",").map((p) => p.trim()).filter(Boolean) : undefined,
+      }),
   },
   read: {
     usage: "read <picture|video> [--every 1] [--draw boxes.png]  (the text in it, with boxes; video: when each text shows; needs: install read)",

@@ -13,6 +13,7 @@ import {
   need,
   requireModel,
   optionalNumberFlag,
+  readJson,
   requireFile,
   round,
   run,
@@ -145,7 +146,7 @@ async function kokoroSpeak(text: string, voice: string, speed: number): Promise<
 // The time of every word: Whisper listens to the speech, then the script's own spelling is used when the words line up.
 async function wordTimes(speech: string, text: string, voice: string, output: string): Promise<number> {
   await listen.transcribe(speech, output, "base", LANGUAGE[voice[0]] ?? "en");
-  const transcript = JSON.parse(readFileSync(output, "utf8"));
+  const transcript = readJson(output);
   const script = text.split(/\s+/).filter(Boolean);
   if (script.length === transcript.words.length) {
     transcript.words.forEach((word: listen.Word, n: number) => (word.word = script[n]));

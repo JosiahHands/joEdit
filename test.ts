@@ -12,12 +12,13 @@ import * as video from "./lib/video.ts";
 import * as sound from "./lib/sound.ts";
 import * as graphics from "./lib/graphics.ts";
 import * as threeD from "./lib/3d.ts";
-import { FFMPEG, isModelInstalled, need, probe, readFrames, writeVideo } from "./lib/shared.ts";
+import * as fx from "./lib/fx.ts";
+import { FFMPEG, concatLine, isModelInstalled, need, probe, readFrames, readJson, writeVideo } from "./lib/shared.ts";
 
 type Tool = "picture" | "video" | "sound" | "look" | "listen" | "graphics" | "fx" | "movie" | "voice" | "music" | "3d" | "joedit";
 
-// GPU effects need raylib (included for macOS in lib/libs/raylib).
-const hasRaylib = existsSync(join("lib", "libs", "raylib", process.platform === "darwin" ? "libraylib.dylib" : "libraylib.so"));
+// GPU effects need raylib (included in lib/libs/raylib for macOS, Windows x64 and Linux).
+const hasRaylib = existsSync(fx.raylibFile());
 
 // Graphics tests need Chrome; they are skipped on machines without it.
 const hasChrome = (() => {
@@ -358,6 +359,24 @@ describe("picture", () => {
     assert.match(cli("picture", ["compose", file("bad-design.json"), file("x.png")]).stderr, /needs an image, a text or a color/);
   });
 
+  test("compose outline and glow follow a cutout's shape, not its box", async () => {
+    // A red circle (radius 30) on a see-through 100x100 picture.
+    await paint(file("dot.png"), 100, 100, (x, y) => (inCircle(x, y, 50, 50, 30) ? RED : CLEAR));
+    writeFileSync(file("sticker.json"), JSON.stringify({
+      width: 400, height: 200, background: "#000000",
+      layers: [
+        { image: "dot.png", x: 50, y: 50, outline: 6, outlineColor: "#FFFFFF" },
+        { image: "dot.png", x: 250, y: 50, glow: 20, glowColor: "#0000FF" },
+      ],
+    }));
+    ok("picture", ["compose", file("sticker.json"), file("sticker.png")]);
+    assert.equal(pixel(file("sticker.png"), 100, 100), "srgb(255,0,0)"); // the circle itself
+    assert.equal(pixel(file("sticker.png"), 133, 100), "srgb(255,255,255)"); // outline just outside the circle
+    assert.equal(pixel(file("sticker.png"), 56, 56), "srgb(0,0,0)"); // the box corner stays empty
+    const [r, , b] = pixel(file("sticker.png"), 336, 100).match(/\d+/g)!.map(Number);
+    assert.ok(b > 20 && r < 20, `no blue glow beside the circle: ${r},${b}`);
+  });
+
   test("batch converts a folder of pictures", async () => {
     mkdirSync(file("batch-in"), { recursive: true });
     await paint(file("batch-in/a.png"), 400, 200, () => RED);
@@ -614,6 +633,27 @@ describe("video", () => {
     assert.ok(result.path.at(-1).x > result.path[0].x + 200, JSON.stringify(result.path));
     frameAt(file("follow.mp4"), 1.5, file("follow-mid.png"));
     assert.match(pixel(file("follow-mid.png"), 101, 180), /^srgb\(2[0-5]\d,[0-4]?\d,[0-4]?\d\)$/);
+    // Where the ball is was cached: the same clip again (another shape) finds it without looking.
+    const again = JSON.parse(ok("video", ["reframe", file("moving.mp4"), file("follow-square.mp4"), "--aspect", "1:1", "--follow"]));
+    assert.ok(result.cached === 0 && again.cached >= again.samples - 1, JSON.stringify({ first: result.cached, again: again.cached, samples: again.samples }));
+  });
+
+  test("paths with quotes work in commands that list files for ffmpeg", () => {
+    const folder = file("it's here");
+    mkdirSync(folder, { recursive: true });
+    ok("video", ["trim", file("in.mp4"), join(folder, "clip.mp4"), "--start", "0", "--end", "2"]);
+    ok("video", ["reverse", join(folder, "clip.mp4"), join(folder, "back.mp4")]);
+    near(video.info(join(folder, "back.mp4")).duration, 2);
+    assert.equal(concatLine("/a/it's.mp4"), "file '/a/it'\\''s.mp4'");
+  });
+
+  test("a clip with two sound tracks (like iPhone spatial audio) keeps only the first", () => {
+    execFileSync(FFMPEG, [
+      "-loglevel", "error", "-y", "-f", "lavfi", "-i", "testsrc=s=320x240:d=2", "-f", "lavfi", "-i", "sine=f=440:d=2", "-f", "lavfi", "-i", "sine=f=1000:d=2",
+      "-map", "0", "-map", "1", "-map", "2", "-pix_fmt", "yuv420p", "-c:a", "aac", file("two-tracks.mp4"),
+    ]);
+    ok("video", ["grade", file("two-tracks.mp4"), file("two-graded.mp4"), "--look", "warm"]);
+    assert.equal(probe(file("two-graded.mp4")).streams.filter((s: any) => s.codec_type === "audio").length, 1);
   });
 
   test("generate explains what it needs", () => {
@@ -856,6 +896,44 @@ describe("movie", () => {
       assert.ok(offBeat < 0.08, `cut at ${cut} is not on a beat`);
     }
   });
+
+  test("exact length with odd transitions, scene speed, film layers, and a sound change reuses the picture", async () => {
+    await paint(file("white.png"), 40, 40, () => WHITE);
+    const film = {
+      size: "160x90",
+      scenes: [
+        { color: "#ff0000", duration: 1.37 },
+        { video: "in.mp4", from: 0, to: 2, speed: 2, transition: { type: "fade", duration: 0.33 } }, // 1 second
+        { color: "#0000ff", duration: 1.1, transition: { type: "wipeleft", duration: 0.27 } },
+      ],
+      layers: [{ image: "white.png", width: 0.2 }], // over the whole film, across the cuts
+      audio: [{ file: "sound.mp3", volume: 0.5 }],
+    };
+    write("exact.json", film);
+    const first = JSON.parse(ok("movie", ["render", file("exact.json"), file("exact.mp4")]));
+    near(first.duration, 1.37 + 1 + 1.1 - 0.33 - 0.27, 0.05);
+    near(video.info(file("exact.mp4")).duration, first.duration, 0.05);
+    assert.equal(first.picture, "rendered");
+    for (const time of [0.3, 2.7]) {
+      frameAt(file("exact.mp4"), time, file("exact.png"));
+      assert.ok(mean(file("exact.png"), "8x8+76+41") > 0.9, `no film layer at ${time}s`);
+    }
+    // Only the music volume changes: the picture comes from the cache and only the sound is mixed again.
+    film.audio[0].volume = 0.2;
+    write("exact.json", film);
+    const again = JSON.parse(ok("movie", ["render", file("exact.json"), file("exact2.mp4")]));
+    assert.match(again.picture, /cached/);
+    near(again.duration, first.duration, 0.01);
+  });
+
+  test("validate explains speed, reframe and film layers", () => {
+    write("bad3.json", {
+      scenes: [{ color: "red", speed: 2 }, { video: "in.mp4", speed: 50, reframe: "spin" }],
+      layers: [{ image: "in.png", track: "box-track.json" }],
+    });
+    const all = JSON.parse(ok("movie", ["validate", file("bad3.json")])).errors.join("\n");
+    for (const hint of [/speed and reframe are for video scenes/, /speed is between 0\.1/, /reframe is "follow"/, /track/]) assert.match(all, hint);
+  });
 });
 
 describe("voice", () => {
@@ -972,6 +1050,28 @@ describe("music", () => {
     assert.equal(level.verdict, "good");
   });
 
+  test("compose: a plucked guitar through a metal amp has bite, and --stems saves each part", (t) => {
+    if (!hasInstruments()) return t.skip("instruments asset missing");
+    const metal = {
+      tempo: 140, bars: 4,
+      tracks: [
+        { instrument: "pluck", chords: "E5 E5 G5 A5", rhythm: "chug", octave: 2, double: true, fx: { amp: "metal" } },
+        { instrument: "bass", chords: "E5 E5 G5 A5", rhythm: "bass", fx: { amp: "crunch", eq: { low: 3 } } },
+      ],
+      drums: { style: "rock" },
+    };
+    writeFileSync(file("metal.json"), JSON.stringify(metal));
+    const result = JSON.parse(ok("music", ["compose", file("metal.json"), file("metal.wav"), "--stems", file("metal-stems")]));
+    assert.deepEqual(result.stems.map((s: string) => s.split(/[\\/]/).pop()), ["1-pluck.wav", "2-bass.wav", "drums.wav"]);
+    // Distorted guitars put real energy at 1-4 kHz (soft generated rock sits near -17 dB there).
+    const bands = JSON.parse(ok("listen", ["bands", file("metal.wav")])).bands;
+    assert.ok(bands["2 kHz"] > -10, JSON.stringify(bands));
+    // In time, and bar 1 starts where the music starts.
+    const beats = JSON.parse(ok("listen", ["beats", file("metal.wav")]));
+    assert.ok(Math.abs(beats.bpm - 140) < 1, `bpm ${beats.bpm}`);
+    assert.ok(beats.downbeats[0] < 0.1, `first downbeat ${beats.downbeats[0]}`);
+  });
+
   test("compose explains bad chords, notes and instruments", () => {
     const bad = (part: object) => {
       writeFileSync(file("bad-score.json"), JSON.stringify({ tracks: [part] }));
@@ -981,7 +1081,8 @@ describe("music", () => {
     assert.match(bad({ melody: "C4 Q9" }).stderr, /not a note/);
     assert.match(bad({ instrument: "kazoo", melody: "C4" }).stderr, /Unknown instrument/);
     const list = JSON.parse(ok("music", ["instruments"]));
-    assert.equal(list.instruments.length, 128);
+    assert.equal(list.instruments.length, 129); // the 128 General MIDI instruments and pluck
+    assert.deepEqual(list.amps, ["clean", "crunch", "metal"]);
     assert.ok(list.drumStyles.includes("hiphop"));
   });
 
@@ -1123,6 +1224,23 @@ describe("3d", () => {
     frameAt(file("scene.mp4"), 0, file("scene-start.png"));
     frameAt(file("scene.mp4"), 0.45, file("scene-end.png"));
     assert.ok(regionDiff(file("scene-start.png"), file("scene-end.png"), "160x90+0+0") > 0.02);
+  });
+
+  test("--frame renders one moment of the full-length scene, and print() output comes back", (t) => {
+    if (!hasBlender) return t.skip("Blender not found");
+    writeFileSync(file("frames.py"), 'shape("cube")\nprint("frames", FRAMES)\n');
+    const result = JSON.parse(ok("3d", ["render", file("frames.py"), file("frame30.png"), "--duration", "2", "--frame", "30", "--fps", "30", "--width", "160", "--height", "90", "--draft"]));
+    assert.deepEqual(result.printed, ["frames 60"]);
+  });
+
+  test("Blender is found in the Windows install folders, newest version first", () => {
+    const root = file("Blender Foundation");
+    for (const version of ["Blender 4.2", "Blender 4.10", "Blender 5.0", "Blender 3.6"]) {
+      mkdirSync(join(root, version), { recursive: true });
+      if (version !== "Blender 5.0") writeFileSync(join(root, version, "blender.exe"), ""); // 5.0 is half-uninstalled
+    }
+    const found = threeD.windowsBlenders(root).map((p) => p.split(/[\\/]/).at(-2));
+    assert.deepEqual(found, ["Blender 4.10", "Blender 4.2", "Blender 3.6"]);
   });
 
   test("a broken scene script reports its own line", (t) => {
@@ -1350,6 +1468,16 @@ describe("sound", () => {
     assert.equal(cli("sound", ["eq", file("hiss.wav"), file("x.wav")]).code, 1);
   });
 
+  test("match moves the tonal balance toward a reference", () => {
+    // A dull sound (low hum) matched to a bright one (high tone with noise) gets more treble.
+    execFileSync(FFMPEG, ["-loglevel", "error", "-y", "-f", "lavfi", "-i", "sine=f=110:d=4", "-f", "lavfi", "-i", "anoisesrc=d=4:a=0.05", "-filter_complex", "amix=inputs=2", file("dull.wav")]);
+    execFileSync(FFMPEG, ["-loglevel", "error", "-y", "-f", "lavfi", "-i", "sine=f=3000:d=4", "-f", "lavfi", "-i", "anoisesrc=d=4:a=0.3", "-filter_complex", "amix=inputs=2", file("bright.wav")]);
+    const result = JSON.parse(ok("sound", ["match", file("dull.wav"), file("matched.wav"), "--reference", file("bright.wav")]));
+    const gap = (levels: Record<string, number>) => Math.abs(levels["4 kHz"] - result.reference["4 kHz"]);
+    assert.ok(gap(result.after) < gap(result.before), JSON.stringify(result));
+    near(sound.info(file("matched.wav")).duration, 4);
+  });
+
   test("errors: missing file and help", () => {
     assert.equal(cli("sound", ["volume", file("nope.mp3"), file("x.mp3"), "--factor", "2"]).code, 1);
     assert.equal(cli("sound", ["mix", file("sound.mp3"), file("x.mp3")]).code, 1);
@@ -1474,6 +1602,13 @@ describe("look", () => {
     assert.ok(Math.abs(log["clip.mp4"].duration - 2) < 0.1 && log["clip.mp4"].lufs < 0);
     const again = JSON.parse(ok("look", ["index", folder]));
     assert.deepEqual([again.looked, again.reused], [0, 2]);
+    // --only picks parts; asking for other parts looks again. Progress goes to stderr, the result to stdout.
+    const only = cli("look", ["index", folder, "--only", "cuts", "--output", join(folder, "cuts.json")]);
+    assert.equal(only.code, 0, only.stderr);
+    assert.match(only.stderr, /index: 1\/2/);
+    const cuts = JSON.parse(readFileSync(join(folder, "cuts.json"), "utf8")).files;
+    assert.ok(!("colors" in cuts["clip.mp4"]) && "cuts" in cuts["clip.mp4"], JSON.stringify(cuts["clip.mp4"]));
+    assert.match(cli("look", ["index", folder, "--only", "smells"]).stderr, /smells/);
   });
 
   test("objects and track follow a thing moving through a video", (t) => {
@@ -1571,6 +1706,31 @@ describe("listen", () => {
     }
   });
 
+  test("beats finds downbeats: the click track's loud first click of each bar", () => {
+    // 120 BPM, the first click of every 4 is a loud low thump: downbeats every 2 seconds, from the start.
+    execFileSync(FFMPEG, [
+      "-loglevel", "error", "-y", "-f", "lavfi",
+      "-i", "aevalsrc='0.4*sin(2*PI*1000*t)*lt(mod(t,0.5),0.03)+0.9*sin(2*PI*60*t)*lt(mod(t,2),0.08)':s=44100:d=8",
+      file("bars120.wav"),
+    ]);
+    const result = JSON.parse(ok("listen", ["beats", file("bars120.wav")]));
+    assert.ok(result.bars >= 3, JSON.stringify(result));
+    for (const time of result.downbeats) assert.ok(Math.abs(time - Math.round(time / 2) * 2) < 0.08, `downbeat at ${time}`);
+  });
+
+  test("bands and energy describe tonal balance and where it gets loud", () => {
+    // Low hum for 3 seconds, then a bright tone joins (a "drop").
+    execFileSync(FFMPEG, [
+      "-loglevel", "error", "-y", "-f", "lavfi", "-i", "sine=f=60:d=6", "-f", "lavfi", "-i", "sine=f=4000:d=3",
+      "-filter_complex", "[1]adelay=3000|3000,volume=4[b];[0][b]amix=inputs=2:duration=first", file("drop.wav"),
+    ]);
+    const bands = JSON.parse(ok("listen", ["bands", file("drop.wav"), "--reference", file("click120.wav")]));
+    assert.ok(bands.bands["63 Hz"] > bands.bands["1 kHz"], JSON.stringify(bands));
+    assert.ok("difference" in bands && "4 kHz" in bands.difference);
+    const energy = JSON.parse(ok("listen", ["energy", file("drop.wav")]));
+    assert.ok(energy.jumps.some((j: any) => Math.abs((j.time ?? j) - 3) < 0.3), JSON.stringify(energy.jumps));
+  });
+
   test("beats needs at least 3 seconds", () => {
     ok("sound", ["trim", file("click120.wav"), file("short.wav"), "--start", "0", "--end", "2"]);
     assert.equal(cli("listen", ["beats", file("short.wav")]).code, 1);
@@ -1628,6 +1788,14 @@ describe("fx", () => {
     const [ar, ag, ab] = actual.match(/\d+/g)!.map(Number);
     assert.ok(Math.abs(ar - r) <= 6 && Math.abs(ag - g) <= 6 && Math.abs(ab - b) <= 6, `${actual} is not near ${r},${g},${b}`);
   };
+
+  test("raylib is included for every system, and missing driver functions are explained", () => {
+    for (const [platform, arch] of [["darwin", "arm64"], ["win32", "x64"], ["linux", "x64"], ["linux", "arm64"]]) {
+      assert.ok(existsSync(fx.raylibFile(platform as NodeJS.Platform, arch as NodeJS.Architecture)), `${platform} ${arch}`);
+    }
+    // On Windows the shader functions come from the driver by name; a driver without one says so.
+    assert.throws(() => fx.driverFunction(need("koffi"), "uint glCreateShader(uint)", () => null), /graphics driver has no glCreateShader/);
+  });
 
   test("list names the effects and about 80 transitions", (t) => {
     if (!hasRaylib) return t.skip("raylib not included for this system");
@@ -1698,6 +1866,23 @@ describe("engine", () => {
     assert.match(FFMPEG, /node-av-ffmpeg/);
     const filters = execFileSync(FFMPEG, ["-hide_banner", "-filters"], { encoding: "utf8" });
     for (const name of ["drawtext", "subtitles", "lut3d", "xfade", "ebur128"]) assert.match(filters, new RegExp(` ${name} `));
+  });
+
+  test("JSON saved by Windows editors (with a byte-order mark) reads fine; broken JSON names the file", () => {
+    writeFileSync(file("bom.json"), "﻿" + JSON.stringify({ size: "160x90", scenes: [{ color: "red", duration: 1 }] }));
+    assert.equal(readJson(file("bom.json")).size, "160x90");
+    assert.equal(JSON.parse(ok("movie", ["validate", file("bom.json")])).valid, true);
+    writeFileSync(file("broken.json"), "{ size: ");
+    assert.throws(() => readJson(file("broken.json")), /broken\.json is not valid JSON/);
+  });
+
+  test("a downloaded headless Chrome is found inside its folder", () => {
+    const folder = file("browser-asset");
+    mkdirSync(join(folder, "chrome-headless-shell-win64"), { recursive: true });
+    mkdirSync(join(folder, "chrome-headless-shell"), { recursive: true }); // a folder with the same name is not the program
+    writeFileSync(join(folder, "chrome-headless-shell-win64", "chrome-headless-shell.exe"), "");
+    assert.match(graphics.headlessShellIn(folder)!, /chrome-headless-shell-win64[\\/]chrome-headless-shell\.exe$/);
+    assert.equal(graphics.headlessShellIn(file("no-such-folder")), undefined);
   });
 
   test("probe reads streams and shows rotated phone video upright", () => {

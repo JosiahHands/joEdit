@@ -51,7 +51,12 @@ else:
 
     engine = "diffusers"
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    pipe = ZImagePipeline.from_pretrained(MODEL, torch_dtype=torch.bfloat16).to(device)
+    pipe = ZImagePipeline.from_pretrained(MODEL, torch_dtype=torch.bfloat16)
+    if device == "cuda" and torch.cuda.get_device_properties(0).total_memory < 20 * 1024**3:
+        # Cards under 20 GB (8-16 GB is common) can't hold the whole model: each part moves onto the GPU only while it runs.
+        pipe.enable_model_cpu_offload()
+    else:
+        pipe = pipe.to(device)
     image = pipe(
         prompt=args.prompt, width=width, height=height, num_inference_steps=args.steps,
         guidance_scale=0.0, generator=torch.Generator(device).manual_seed(seed),

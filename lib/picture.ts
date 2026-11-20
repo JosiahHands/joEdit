@@ -1,7 +1,7 @@
 // Picture editing, built on sharp (libvips: fast, any format) and Skia (text and design).
 // CLI:     node joedit.ts picture <command> <input> <output> [--flags]
 // Library: import { resize } from "./joEdit/picture.ts"
-import { existsSync, mkdirSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync } from "node:fs";
 import { dirname, join, parse, resolve } from "node:path";
 import {
   AI_MODELS,
@@ -21,6 +21,7 @@ import {
   optionalNumberFlag,
   pictureCanvas,
   probe,
+  readJson,
   requireFile,
   run,
   runCli,
@@ -166,6 +167,11 @@ export type Layer = TextStyle & {
   blend?: string; // normal, multiply, screen, overlay, darken, lighten, soft-light, hard-light, difference, color-dodge ...
   rotate?: number; // degrees clockwise, around the layer's centre
   radius?: number; // rounded corners for images and rectangles
+  // Images: shadow, glow and outline follow the picture's own shape (a cutout PNG gets a cutout-shaped edge).
+  outline?: number; // outline thickness in pixels around the picture's shape
+  outlineColor?: string; // default white
+  glow?: number; // soft glow size in pixels
+  glowColor?: string; // default white
 };
 
 export type Design = { width?: number; height?: number; background?: string; layers: Layer[] };
@@ -193,6 +199,10 @@ export async function loadPicture(path: string): Promise<any> {
 export async function drawLayer(ctx: any, layer: Layer, folder = ".", brand?: Brand): Promise<void> {
   const blend = layer.blend ?? "normal";
   if (!BLENDS.includes(blend)) throw new Error(`Unknown blend "${blend}". Blends: ${BLENDS.join(", ")}`);
+  for (const key of ["shadow", "glow", "outline"] as const) {
+    const value = layer[key];
+    if (value !== undefined && !(typeof value === "number" && value >= 0)) throw new Error(`A layer's "${key}" is a size in pixels (0 or more), got ${JSON.stringify(value)}.`);
+  }
   const x = layer.x ?? 0;
   const y = layer.y ?? 0;
   ctx.save();
@@ -223,36 +233,61 @@ export async function drawLayer(ctx: any, layer: Layer, folder = ".", brand?: Br
   if (layer.text !== undefined) {
     drawText(ctx, layer.text, x, y, style);
   } else {
-    const path = () => {
-      ctx.beginPath();
-      ctx.roundRect(box.x, box.y, box.width, box.height, layer.radius ?? 0);
-    };
-    if (layer.shadow) {
-      // The shadow is drawn from the layer's shape, so it also works with rounded corners.
-      ctx.save();
-      ctx.shadowColor = layer.shadowColor ?? "rgba(0,0,0,0.5)";
-      ctx.shadowBlur = layer.shadow;
-      ctx.shadowOffsetY = layer.shadow / 4;
-      ctx.fillStyle = style.color ?? "#000000";
-      path();
-      ctx.fill();
-      ctx.restore();
-    }
     if (picture) {
-      path();
-      ctx.clip();
+      // Draw the fitted picture once on its own canvas, then use that for shadow, glow, outline and the picture itself.
+      const { createCanvas } = await skia();
+      const sprite = createCanvas(Math.max(1, Math.ceil(box.width)), Math.max(1, Math.ceil(box.height)));
+      const s = sprite.getContext("2d");
+      s.beginPath();
+      s.roundRect(0, 0, box.width, box.height, layer.radius ?? 0);
+      s.clip();
       const fitMode = layer.fit ?? "cover";
       // cover: crop the picture to the box's shape. contain: show all of it inside the box. fill: stretch.
       const scale = fitMode === "contain" ? Math.min(box.width / picture.width, box.height / picture.height) : Math.max(box.width / picture.width, box.height / picture.height);
-      if (fitMode === "fill") ctx.drawImage(picture, box.x, box.y, box.width, box.height);
-      else {
-        const w = picture.width * scale;
-        const h = picture.height * scale;
-        ctx.drawImage(picture, box.x + (box.width - w) / 2, box.y + (box.height - h) / 2, w, h);
+      if (fitMode === "fill") s.drawImage(picture, 0, 0, box.width, box.height);
+      else s.drawImage(picture, (box.width - picture.width * scale) / 2, (box.height - picture.height * scale) / 2, picture.width * scale, picture.height * scale);
+      if (layer.shadow) {
+        ctx.save();
+        ctx.shadowColor = branded(layer.shadowColor, brand) ?? "rgba(0,0,0,0.5)";
+        ctx.shadowBlur = layer.shadow;
+        ctx.shadowOffsetY = layer.shadow / 4;
+        ctx.drawImage(sprite, box.x, box.y);
+        ctx.restore();
       }
+      if (layer.glow) {
+        // Two passes make the glow visible around thin shapes too.
+        ctx.save();
+        ctx.shadowColor = branded(layer.glowColor, brand) ?? "#FFFFFF";
+        ctx.shadowBlur = layer.glow;
+        ctx.drawImage(sprite, box.x, box.y);
+        ctx.drawImage(sprite, box.x, box.y);
+        ctx.restore();
+      }
+      if (layer.outline) {
+        // The picture's shape in one color, drawn in a ring around the picture, makes an outline that follows its edge.
+        const shape = createCanvas(sprite.width, sprite.height);
+        const c = shape.getContext("2d");
+        c.drawImage(sprite, 0, 0);
+        c.globalCompositeOperation = "source-in";
+        c.fillStyle = branded(layer.outlineColor, brand) ?? "#FFFFFF";
+        c.fillRect(0, 0, shape.width, shape.height);
+        const steps = Math.max(16, Math.ceil(layer.outline * 4));
+        for (let i = 0; i < steps; i++) {
+          const angle = (i / steps) * Math.PI * 2;
+          ctx.drawImage(shape, box.x + Math.cos(angle) * layer.outline, box.y + Math.sin(angle) * layer.outline);
+        }
+      }
+      ctx.drawImage(sprite, box.x, box.y);
     } else if (style.color) {
+      // A rectangle. Its shadow is drawn from its shape, so it also works with rounded corners.
+      if (layer.shadow) {
+        ctx.shadowColor = branded(layer.shadowColor, brand) ?? "rgba(0,0,0,0.5)";
+        ctx.shadowBlur = layer.shadow;
+        ctx.shadowOffsetY = layer.shadow / 4;
+      }
       ctx.fillStyle = style.color;
-      path();
+      ctx.beginPath();
+      ctx.roundRect(box.x, box.y, box.width, box.height, layer.radius ?? 0);
       ctx.fill();
     } else {
       throw new Error("Every layer needs an image, a text or a color.");
@@ -263,7 +298,7 @@ export async function drawLayer(ctx: any, layer: Layer, folder = ".", brand?: Br
 
 // Make a picture from a design (JSON): a background and layers of pictures, text and shapes.
 export async function compose(designFile: string, output: string, brandFile?: string) {
-  const design: Design = JSON.parse(readFileSync(requireFile(designFile), "utf8"));
+  const design: Design = readJson(designFile);
   if (!Array.isArray(design.layers)) throw new Error('A design needs "layers": [ ... ].');
   const brand = loadBrand(brandFile); // the default brand when no file is given
   const folder = dirname(resolve(designFile));

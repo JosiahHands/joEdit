@@ -4,13 +4,14 @@
 //        node joedit.ts            (lists every command)
 // This file also holds the top-level commands: doctor and check.
 import { cpus, totalmem } from "node:os";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { join } from "node:path";
 import {
   DEFAULT_FONT,
   FFMPEG,
   LIB,
   LIBS,
+  UV_INSTALL,
   analyze,
   closest,
   formatTime,
@@ -19,6 +20,7 @@ import {
   listModels,
   listPacks,
   probe,
+  readJson,
   requireFile,
   round,
   run,
@@ -82,6 +84,17 @@ function chrome(): Tool {
   }
 }
 
+// Blender renders the 3d area. Found the same way 3d.ts finds it (app folders too, not only the PATH).
+function blender(): Tool {
+  const neededFor = "3d (Blender scenes, 3D titles, turntables)";
+  try {
+    const path = threeD.findBlender();
+    return { name: "blender", found: true, version: versionOf(path, ["--version"]) || path, path, neededFor, optional: true };
+  } catch (error: any) {
+    return { name: "blender", found: false, neededFor, optional: true, fix: error.message.replace(/^.*Install it: /, "") };
+  }
+}
+
 // joEdit's engine: npm libraries that `npm install` puts in libs/.
 const LIBRARIES = [
   { name: "node-av", does: "reads media files; its FFmpeg 8 (@seydx/node-av-ffmpeg) encodes and decodes everything" },
@@ -102,15 +115,14 @@ function library(name: string): { name: string; found: boolean; version?: string
   const does = LIBRARIES.find((l) => l.name === name)!.does;
   const file = join(LIBS, "node_modules", name, "package.json");
   if (!existsSync(file)) return { name, found: false, does };
-  return { name, found: true, version: JSON.parse(readFileSync(file, "utf8")).version, does };
+  return { name, found: true, version: readJson(file).version, does };
 }
 
 // Check everything joEdit needs and say exactly how to install what is missing.
 // Three groups: what joEdit needs (tools + libraries), downloads it makes on first use (assets, packs),
 // and optional outside programs that unlock extra areas. Agents install optional ones only when a task needs them.
 export function doctor() {
-  const mac = process.platform === "darwin";
-  const tool = (name: string, args: string[], neededFor: string, fix: string): Tool => {
+  const tool =(name: string, args: string[], neededFor: string, fix: string): Tool => {
     const version = versionOf(name, args);
     return version ? { name, found: true, version, neededFor } : { name, found: false, neededFor, fix };
   };
@@ -139,14 +151,14 @@ export function doctor() {
       found: existsSync(fx.raylibFile()),
       version: fx.raylibFile(),
       neededFor: "fx (GPU effects, particles, transitions, LUTs)",
-      fix: existsSync(fx.raylibFile()) ? undefined : `joEdit includes raylib for macOS; on this system place raylib 6 at ${fx.raylibFile()}`,
+      fix: existsSync(fx.raylibFile()) ? undefined : `joEdit includes raylib 6.2 for macOS, Windows x64 and Linux x64/arm64; on this system place it at ${fx.raylibFile()}`,
     },
   ];
   // Outside programs that unlock extra areas. Install one only when a task needs it.
   const optional: Tool[] = [
     chrome(),
-    tool("blender", ["--version"], "3d (Blender scenes, 3D titles, turntables)", mac ? "brew install --cask blender" : "install Blender: https://www.blender.org/download/"),
-    tool("uv", ["--version"], "Python AI packs: song, image, clone, stems, videogen", mac ? "brew install uv" : "curl -LsSf https://astral.sh/uv/install.sh | sh"),
+    blender(),
+    tool("uv", ["--version"], "Python AI packs: song, image, clone, stems, videogen", UV_INSTALL),
   ];
 
   const missingLibraries = libraries.filter((l) => !l.found);
@@ -199,7 +211,21 @@ function cutFix(file: string, start: number, end: number, duration: number): str
 
 // Look for black picture, frozen picture, long silence and bad loudness.
 // Every problem comes with a joEdit command that fixes it.
-export function check(file: string): Report {
+// Black and frozen stretches of a video's picture, as [start, end] seconds (the slow part of check: every frame is read).
+export type PictureMoments = { black: number[][]; frozen: number[][] };
+export function pictureMoments(file: string): PictureMoments {
+  const duration = Number(probe(file).format.duration ?? 0);
+  // pix_th 0.03: only near-pure black counts, so dark design colors (like #0B0B0F) are not reported.
+  // pic_th 0.999: a frame is black only if 99.9% of it is, so a title on a dark card is not reported.
+  const log = analyze(file, "video", "blackdetect=d=0.5:pix_th=0.03:pic_th=0.999,freezedetect=n=-60dB:d=2");
+  const black = [...log.matchAll(/black_start:\s*([\d.]+)\s+black_end:\s*([\d.]+)/g)].map((m) => [Number(m[1]), Number(m[2])]);
+  const freezeEnds = [...log.matchAll(/freeze_end: ([\d.]+)/g)].map((m) => Number(m[1]));
+  const frozen = [...log.matchAll(/freeze_start: ([\d.]+)/g)].map((m, n) => [Number(m[1]), freezeEnds[n] ?? duration]);
+  return { black, frozen };
+}
+
+// moments: the picture's black and frozen stretches when already known (movie render reuses them with a cached picture).
+export function check(file: string, moments?: PictureMoments): Report {
   const data = probe(file);
   const duration = Number(data.format.duration ?? 0);
   // Cover art inside music files counts as a "video" stream, so it is ignored here.
@@ -209,19 +235,13 @@ export function check(file: string): Report {
   const notes: string[] = [];
 
   if (hasVideo) {
-    // pix_th 0.03: only near-pure black counts, so dark design colors (like #0B0B0F) are not reported.
-    // pic_th 0.999: a frame is black only if 99.9% of it is, so a title on a dark card is not reported.
-    const log = analyze(file, "video", "blackdetect=d=0.5:pix_th=0.03:pic_th=0.999,freezedetect=n=-60dB:d=2");
-    for (const m of log.matchAll(/black_start:\s*([\d.]+)\s+black_end:\s*([\d.]+)/g)) {
-      const [start, end] = [Number(m[1]), Number(m[2])];
+    const { black, frozen } = moments ?? pictureMoments(file);
+    for (const [start, end] of black) {
       problems.push({ problem: "black picture", at: `${formatTime(start)}-${formatTime(end)}`, fix: cutFix(file, start, end, duration) });
     }
-    const freezeStarts = [...log.matchAll(/freeze_start: ([\d.]+)/g)].map((m) => Number(m[1]));
-    const freezeEnds = [...log.matchAll(/freeze_end: ([\d.]+)/g)].map((m) => Number(m[1]));
-    freezeStarts.forEach((start, n) => {
-      const end = freezeEnds[n] ?? duration;
+    for (const [start, end] of frozen) {
       problems.push({ problem: "frozen picture (nothing moves)", at: `${formatTime(start)}-${formatTime(end)}`, fix: cutFix(file, start, end, duration) });
-    });
+    }
   }
 
   if (hasAudio) {

@@ -1,5 +1,5 @@
 # Whole songs from a description (and lyrics) with ACE-Step 1.5.
-# Usage: python run.py <work-folder> --prompt "..." [--lyrics "..."] [--duration 30] [--bpm N] [--seed N]
+# Usage: python run.py <work-folder> --prompt "..." [--lyrics "..."] [--duration 30] [--bpm N] [--seed N] [--steps 8] [--guidance 1]
 # Prints one line of JSON: {"file", "duration", "seed", "device"}.
 # The models (several GB) download into checkpoints/ next to this pack's environment the first time.
 import argparse
@@ -19,6 +19,9 @@ parser.add_argument("--lyrics", default="")
 parser.add_argument("--duration", type=float, default=30)
 parser.add_argument("--bpm", type=int, default=None)
 parser.add_argument("--seed", type=int, default=-1)
+# Quality: more steps = more detail and slower (8 is the fast "turbo" setting); guidance = how closely it follows the prompt.
+parser.add_argument("--steps", type=int, default=8)
+parser.add_argument("--guidance", type=float, default=1.0)
 args = parser.parse_args()
 
 # Keep ACE-Step's models inside joEdit's pack folder (lib/.packs/song/checkpoints).
@@ -70,8 +73,8 @@ params = GenerationParams(
     instrumental=not lyrics,
     bpm=args.bpm,
     duration=args.duration,
-    inference_steps=8,
-    guidance_scale=1.0,
+    inference_steps=args.steps,
+    guidance_scale=args.guidance,
     seed=args.seed,
 )
 # A fixed seed (>= 0) makes the same song again; -1 picks a new random one.

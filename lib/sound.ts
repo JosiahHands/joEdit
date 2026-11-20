@@ -2,7 +2,7 @@
 // CLI:     node joedit.ts sound <command> <input> <output> [--flags]
 // Library: import { fade } from "./joEdit/sound.ts"
 import { execFileSync } from "node:child_process";
-import { readFileSync, writeFileSync } from "node:fs";
+import { writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import {
@@ -14,6 +14,7 @@ import {
   numberFlag,
   optionalNumberFlag,
   probe,
+  readJson,
   requireFile,
   round,
   runCli,
@@ -29,7 +30,7 @@ export const RATE = 48000;
 
 // Decode any sound (or a video's sound) into [left, right], from `from` to `to` seconds.
 export function decode(input: string, from = 0, to?: number): Float32Array[] {
-  requireFile(input);
+  info(input); // a clear message when the file has no sound (a picture, a silent video)
   const bytes = execFileSync(FFMPEG, [
     "-hide_banner", "-loglevel", "error", ...(from ? ["-ss", String(from)] : []), "-i", input,
     ...(to !== undefined ? ["-t", String(Math.max(0.01, to - from))] : []),
@@ -62,7 +63,13 @@ export function writeWav(output: string, channels: Float32Array[], rate = RATE):
   data.writeUInt16LE(32, 34);
   data.write("data", 36);
   data.writeUInt32LE(frames * count * 4, 40);
-  for (let i = 0; i < frames; i++) for (let c = 0; c < count; c++) data.writeFloatLE(channels[c][i], 44 + (i * count + c) * 4);
+  // Channels interleaved (left, right, left, right ...) into one block of floats, copied in at once.
+  const samples = new Float32Array(frames * count);
+  for (let c = 0; c < count; c++) {
+    const channel = channels[c];
+    for (let i = 0; i < frames; i++) samples[i * count + c] = channel[i];
+  }
+  Buffer.from(samples.buffer).copy(data, 44);
   writeFileSync(output, data);
 }
 
@@ -127,6 +134,89 @@ export function noise(ctx: any, seconds: number, color = "white"): any {
   return audioBuffer(ctx, channels);
 }
 
+// ---------- Tonal balance (how much bass, middle and treble) ----------
+
+// Octave bands, by their middle frequency in Hz.
+export const BAND_CENTERS = [31, 63, 125, 250, 500, 1000, 2000, 4000, 8000, 16000];
+export const bandName = (hz: number) => (hz >= 1000 ? `${hz / 1000} kHz` : `${hz} Hz`);
+
+// A fast Fourier transform (in place; the size is a power of two): turns a block of sound into its frequencies.
+function fft(re: Float64Array, im: Float64Array): void {
+  const n = re.length;
+  for (let i = 1, j = 0; i < n; i++) {
+    let bit = n >> 1;
+    for (; j & bit; bit >>= 1) j ^= bit;
+    j ^= bit;
+    if (i < j) {
+      [re[i], re[j]] = [re[j], re[i]];
+      [im[i], im[j]] = [im[j], im[i]];
+    }
+  }
+  for (let size = 2; size <= n; size <<= 1) {
+    const angle = (-2 * Math.PI) / size;
+    for (let start = 0; start < n; start += size) {
+      for (let k = 0; k < size / 2; k++) {
+        const [wr, wi] = [Math.cos(angle * k), Math.sin(angle * k)];
+        const a = start + k;
+        const b = a + size / 2;
+        const tr = re[b] * wr - im[b] * wi;
+        const ti = re[b] * wi + im[b] * wr;
+        re[b] = re[a] - tr;
+        im[b] = im[a] - ti;
+        re[a] += tr;
+        im[a] += ti;
+      }
+    }
+  }
+}
+
+// How strong each octave band is, in dB compared with the whole sound (0 dB = all of it; -20 dB = a hundredth).
+// Looks at up to 400 blocks spread over the sound.
+export function bandLevels(mono: Float32Array, rate = RATE): number[] {
+  const SIZE = 8192;
+  if (mono.length < SIZE) throw new Error("The sound is too short to measure (needs a quarter of a second or more).");
+  const power = new Float64Array(SIZE / 2);
+  const step = Math.max(SIZE, Math.floor((mono.length - SIZE) / 400));
+  const re = new Float64Array(SIZE);
+  const im = new Float64Array(SIZE);
+  for (let start = 0; start + SIZE <= mono.length; start += step) {
+    for (let i = 0; i < SIZE; i++) {
+      re[i] = mono[start + i] * (0.5 - 0.5 * Math.cos((2 * Math.PI * i) / (SIZE - 1))); // soft edges (Hann window)
+      im[i] = 0;
+    }
+    fft(re, im);
+    for (let k = 0; k < SIZE / 2; k++) power[k] += re[k] * re[k] + im[k] * im[k];
+  }
+  const hz = (k: number) => (k * rate) / SIZE;
+  let total = 0;
+  for (let k = 0; k < SIZE / 2; k++) if (hz(k) >= 22 && hz(k) < 22600) total += power[k];
+  return BAND_CENTERS.map((center) => {
+    let sum = 0;
+    for (let k = 0; k < SIZE / 2; k++) if (hz(k) >= center / Math.SQRT2 && hz(k) < center * Math.SQRT2) sum += power[k];
+    return round(10 * Math.log10(Math.max(sum, 1e-20) / Math.max(total, 1e-20)), 1);
+  });
+}
+
+// Both channels of a sound averaged into one.
+export function monoOf(input: string): Float32Array {
+  const [left, right] = decode(input);
+  return left.map((v, i) => (v + right[i]) / 2);
+}
+
+// EQ a sound toward the tonal balance of a reference (a track that sounds the way you want):
+// one gentle filter per octave, each at most 12 dB up or down. strength: 0..1 of the way there.
+export function match(input: string, output: string, reference: string, strength = 1) {
+  const before = bandLevels(monoOf(input));
+  const target = bandLevels(monoOf(reference));
+  const gains = before.map((level, k) => round(Math.max(-12, Math.min(12, (target[k] - level) * strength)), 1));
+  const filter = BAND_CENTERS.map((center, k) => `equalizer=f=${center}:t=o:w=1:g=${gains[k]}`).join(",");
+  // A video keeps its picture as it is.
+  ffmpeg(["-i", input, "-af", `${filter},alimiter=limit=0.95`, "-c:v", "copy", output]);
+  const after = bandLevels(monoOf(output));
+  const named = (values: number[]) => Object.fromEntries(BAND_CENTERS.map((c, k) => [bandName(c), values[k]]));
+  return { before: named(before), reference: named(target), after: named(after), gains: named(gains) };
+}
+
 // ---------- Rooms (reverb) ----------
 
 // seconds: how long the echo lasts. dark: how fast high sounds die away (0 = bright, 1 = dark).
@@ -138,8 +228,15 @@ export const ROOMS: Record<string, { seconds: number; predelay: number; dark: nu
   cathedral: { seconds: 5.5, predelay: 0.05, dark: 0.75 },
 };
 
+// A soft-clipping curve for a WaveShaper: the bigger `drive`, the more crunch (1 = barely, 30+ = heavy distortion).
+export function driveCurve(drive: number): Float32Array {
+  const curve = new Float32Array(2048);
+  for (let i = 0; i < curve.length; i++) curve[i] = Math.tanh(drive * (i / 1023.5 - 1)) / Math.tanh(drive);
+  return curve;
+}
+
 // The echo of a room, made from decaying noise (left and right differ, which gives width).
-function roomEcho(ctx: any, name: string): any {
+export function roomEcho(ctx: any, name: string): any {
   const room = ROOMS[name];
   if (!room) throw new Error(`Unknown reverb "${name}". Rooms: ${Object.keys(ROOMS).join(", ")}`);
   const length = Math.round((room.seconds + room.predelay) * RATE);
@@ -208,10 +305,8 @@ export async function fx(input: string, output: string, options: { reverb?: stri
       }
       if (style.drive) {
         // Soft clipping: the harder the drive, the more crunch.
-        const curve = new Float32Array(1024);
-        for (let i = 0; i < curve.length; i++) curve[i] = Math.tanh(style.drive * (i / 511.5 - 1)) / Math.tanh(style.drive);
         const shaper = ctx.createWaveShaper();
-        shaper.curve = curve;
+        shaper.curve = driveCurve(style.drive);
         last = last.connect(shaper);
       }
       const squash = ctx.createDynamicsCompressor();
@@ -254,7 +349,7 @@ export async function fx(input: string, output: string, options: { reverb?: stri
     withTempDir((folder) => {
       const sound = join(folder, "sound.wav");
       writeWav(sound, result);
-      ffmpeg(["-i", input, "-i", sound, "-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-shortest", output]);
+      ffmpeg(["-i", input, "-i", sound, "-map", "0:v", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-shortest", output]);
     });
   }
   return { reverb, voice, pan, width };
@@ -454,17 +549,24 @@ export function reverse(input: string, output: string): void {
 
 // Make the loudness even and standard for online video: -14 LUFS, peaks below -1.5 dB.
 // Two passes: first measure the sound, then apply one exact correction (accurate even for short clips).
-export function normalize(input: string, output: string): void {
+// Silence (quieter than -60 LUFS) is left as it is. Returns the loudness it measured.
+export function normalize(input: string, output: string): { lufs: number } {
   const target = "I=-14:TP=-1.5:LRA=11";
   // Pass 1: measure. loudnorm prints its measurements as JSON at the end of the log.
   const log = analyze(input, "audio", `loudnorm=${target}:print_format=json`);
   const measured = JSON.parse(log.slice(log.lastIndexOf("{"), log.lastIndexOf("}") + 1));
+  const lufs = Number(measured.input_i);
+  if (!(lufs > -60)) {
+    ffmpeg(["-i", input, "-ar", "48000", output]);
+    return { lufs: Number.isFinite(lufs) ? lufs : -70 };
+  }
   // Pass 2: correct, using the measurements.
   const filter =
     `loudnorm=${target}:measured_I=${measured.input_i}:measured_TP=${measured.input_tp}` +
     `:measured_LRA=${measured.input_lra}:measured_thresh=${measured.input_thresh}:offset=${measured.target_offset}:linear=true`;
   // loudnorm works at a very high sample rate inside, so set a normal one (48000) for the output.
   ffmpeg(["-i", input, "-filter:a", filter, "-ar", "48000", output]);
+  return { lufs };
 }
 
 // Repeat the sound `times` times in a row.
@@ -589,7 +691,7 @@ export async function duck(music: string, voice: string, output: string, amount 
 // Mix a timeline from a JSON file: [{ "file": "music.mp3", "role": "music", "loop": true }, { "file": "voice.wav", "at": 1.5 }, ...]
 // Paths are relative to the JSON file.
 export async function timeline(json: string, output: string, options: { length?: number; duck?: number } = {}) {
-  const clips: Clip[] = JSON.parse(readFileSync(requireFile(json), "utf8"));
+  const clips: Clip[] = readJson(json);
   if (!Array.isArray(clips)) throw new Error("The timeline must be a JSON list of clips: [{ \"file\": \"a.wav\", \"at\": 0 }, ...]");
   const folder = dirname(resolve(json));
   return mixClips(clips.map((clip) => ({ ...clip, file: resolve(folder, clip.file) })), output, options);
@@ -674,7 +776,16 @@ export const commands: Record<string, Command> = {
     usage: "normalize <input> <output>",
     run: (a) => {
       const { input, output } = inOut(a);
-      normalize(input, output);
+      return normalize(input, output);
+    },
+  },
+  match: {
+    usage: "match <input> <output> --reference ref.wav [--strength 1]  (EQ toward the bass/middle/treble balance of a reference)",
+    run: (a) => {
+      const { input, output } = inOut(a);
+      const strength = optionalNumberFlag(a, "strength", 1);
+      if (!(strength >= 0 && strength <= 1)) throw new Error("--strength is from 0 (no change) to 1 (all the way to the reference).");
+      return match(input, output, requireFile(stringFlag(a, "reference")), strength);
     },
   },
   loop: {

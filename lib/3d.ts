@@ -3,12 +3,13 @@
 // CLI:     node joedit.ts 3d <command> ...
 // Library: import { render } from "./joEdit/3d.ts"
 import { spawnSync } from "node:child_process";
-import { existsSync, readdirSync, writeFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import {
   FONTS,
   LIB,
   ffmpeg,
+  hasProgram,
   inOut,
   loadBrand,
   numberFlag,
@@ -21,21 +22,35 @@ import {
   type Command,
 } from "./shared.ts";
 
-// Blender: on the PATH, or in the usual app folder on macOS / Windows.
+// The Windows installer puts Blender in a folder per version ("Blender 4.5", "Blender 5.0"): newest first.
+// `root` is a parameter so tests can point it at a made-up folder.
+export function windowsBlenders(root = join(process.env.ProgramFiles ?? "C:\\Program Files", "Blender Foundation")): string[] {
+  if (!existsSync(root)) return [];
+  const version = (name: string) => (name.match(/[\d.]+/)?.[0] ?? "0").split(".").map(Number);
+  const newerFirst = (a: string, b: string) => {
+    const [x, y] = [version(a), version(b)];
+    for (let i = 0; i < Math.max(x.length, y.length); i++) if ((x[i] ?? 0) !== (y[i] ?? 0)) return (y[i] ?? 0) - (x[i] ?? 0);
+    return 0;
+  };
+  return readdirSync(root)
+    .filter((name) => name.startsWith("Blender"))
+    .sort(newerFirst)
+    .map((name) => join(root, name, "blender.exe"))
+    .filter((file) => existsSync(file));
+}
+
+// Blender: JOEDIT_BLENDER, the usual app folders (macOS, Windows), or the PATH.
 export function findBlender(): string {
   const places = [
     process.env.JOEDIT_BLENDER ?? "",
     "/Applications/Blender.app/Contents/MacOS/Blender",
-    "C:\\Program Files\\Blender Foundation\\Blender\\blender.exe",
+    ...(process.platform === "win32" ? windowsBlenders() : []),
   ];
-  const onPath = spawnSync("blender", ["--version"], { encoding: "utf8" });
-  if (onPath.status === 0) return "blender";
   const found = places.find((place) => place && existsSync(place));
-  if (!found) {
-    const fix = process.platform === "darwin" ? "brew install --cask blender" : "install Blender from https://www.blender.org/download/";
-    throw new Error(`3D needs Blender. Install it: ${fix}`);
-  }
-  return found;
+  if (found) return found;
+  if (hasProgram("blender")) return "blender";
+  const fix = process.platform === "darwin" ? "brew install --cask blender" : process.platform === "win32" ? "winget install BlenderFoundation.Blender" : "install Blender from https://www.blender.org/download/";
+  throw new Error(`3D needs Blender. Install it: ${fix}`);
 }
 
 export const ENGINES = ["eevee", "cycles"];
@@ -62,7 +77,10 @@ export function render(script: string, output: string, options: RenderOptions = 
   const draft = options.draft ?? false;
   const fps = options.fps ?? 30;
   const still = PICTURE.test(output);
-  const frames = still ? Math.max(options.frame ?? 1, 1) : Math.max(1, Math.round((options.duration ?? 4) * fps));
+  // FRAMES is always the whole animation, so a still of frame N shows the scene as it is at N
+  // (keyframes set at FRAMES stay at the end instead of collapsing onto N).
+  const frames = Math.max(1, Math.round((options.duration ?? 4) * fps));
+  const stillFrame = Math.max(options.frame ?? 1, 1);
   const scale = draft ? 0.5 : 1;
   const even = (n: number) => Math.round((n * scale) / 2) * 2;
   const width = even(options.width ?? 1920);
@@ -75,18 +93,23 @@ export function render(script: string, output: string, options: RenderOptions = 
     const frameFolder = join(folder, "frames");
     writeFileSync(settings, JSON.stringify({
       script: resolve(script), folder: frameFolder, width, height, fps, frames, engine, samples,
-      transparent: options.transparent ?? false, fonts: FONTS, still: still ? frames : 0,
+      transparent: options.transparent ?? false, fonts: FONTS, still: still ? stillFrame : 0,
+      printed: join(folder, "printed.txt"),
     }));
     const blender = spawnSync(
       findBlender(),
       ["-b", "--factory-startup", "--python-exit-code", "1", "--python", join(LIB, "packs", "blender", "run.py"), "--", settings],
       { encoding: "utf8", maxBuffer: 256 * 1024 * 1024 },
     );
+    // What the scene script printed (its print() calls), so the agent can debug with it.
+    const printedFile = join(folder, "printed.txt");
+    const printed = existsSync(printedFile) ? readFileSync(printedFile, "utf8").trim() : "";
     if (blender.status !== 0) {
       // Show the scene script's own error when there is one, otherwise the end of Blender's log.
       const log = `${blender.stdout}\n${blender.stderr}`;
       const scriptError = log.match(/Error in the scene script:[\s\S]*/)?.[0];
-      throw new Error(scriptError ?? `Blender failed:\n${log.trim().split("\n").slice(-15).join("\n")}`);
+      const message = scriptError ?? `Blender failed:\n${log.trim().split("\n").slice(-15).join("\n")}`;
+      throw new Error(printed ? `${message}\nThe script printed:\n${printed}` : message);
     }
     if (still) {
       ffmpeg(["-i", join(frameFolder, "still.png"), "-frames:v", "1", "-update", "1", output]);
@@ -95,7 +118,10 @@ export function render(script: string, output: string, options: RenderOptions = 
       if (count === 0) throw new Error("Blender rendered no frames.");
       ffmpeg(["-framerate", String(fps), "-start_number", "1", "-i", join(frameFolder, "%04d.png"), ...videoEncoder(output, { transparent: options.transparent }), output]);
     }
-    return { width, height, frames: still ? 1 : frames, engine, samples, draft, seconds: round((Date.now() - started) / 1000, 1) };
+    return {
+      width, height, frames: still ? 1 : frames, engine, samples, draft, seconds: round((Date.now() - started) / 1000, 1),
+      ...(printed ? { printed: printed.split("\n") } : {}),
+    };
   });
 }
 

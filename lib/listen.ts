@@ -3,7 +3,7 @@
 // CLI:     node joedit.ts listen <command> ...
 // Library: import { beats } from "./joEdit/listen.ts"
 import { execFileSync } from "node:child_process";
-import { readFileSync, writeFileSync } from "node:fs";
+import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   FFMPEG,
@@ -16,6 +16,7 @@ import {
   inOut,
   numberFlag,
   optionalNumberFlag,
+  readJson,
   requireFile,
   round,
   runCli,
@@ -122,7 +123,7 @@ const WINDOW = 256; // samples in each loudness measurement
 
 // Decode any sound to mono numbers between -1 and 1.
 function samples(input: string): Float32Array {
-  requireFile(input);
+  sound.info(input); // a clear message when the file has no sound
   const bytes = execFileSync(
     FFMPEG,
     ["-hide_banner", "-loglevel", "error", "-i", input, "-ac", "1", "-ar", String(RATE), "-f", "f32le", "-"],
@@ -186,13 +187,19 @@ function beatPeriod(strength: number[], framesPerSecond: number): number {
   return bestLag;
 }
 
+// How well a beat grid (period and first beat, in frames) lines up with the hits: the strength under each beat.
+function gridScore(strength: number[], period: number, offset: number): number {
+  let score = 0;
+  for (let f = offset; f < strength.length; f += period) score += strength[Math.round(f)] ?? 0;
+  return score;
+}
+
 // Find where the first beat is, so the beat grid lines up with the actual hits.
 function beatOffset(strength: number[], period: number): number {
   let bestOffset = 0;
   let bestScore = -1;
   for (let offset = 0; offset < period; offset++) {
-    let score = 0;
-    for (let f = offset; f < strength.length; f += period) score += strength[Math.round(f)];
+    const score = gridScore(strength, period, offset);
     if (score > bestScore) {
       bestScore = score;
       bestOffset = offset;
@@ -201,18 +208,117 @@ function beatOffset(strength: number[], period: number): number {
   return bestOffset;
 }
 
-// Tempo (BPM) and the time of every beat. Use the times to cut video on the beat.
-export function beats(input: string): { bpm: number; beats: number[]; count: number } {
+// The beat length in whole frames is only roughly right (140 BPM would read as 139.7). Try lengths between
+// the neighbouring frames, in small steps, and keep the one that lines up best over the whole song.
+function finePeriod(strength: number[], period: number): { period: number; offset: number } {
+  let best = { period, offset: beatOffset(strength, period), score: -1 };
+  for (let p = period - 1; p <= period + 1; p += 0.01) {
+    const offset = beatOffset(strength, p);
+    const score = gridScore(strength, p, offset);
+    if (score > best.score) best = { period: p, offset, score };
+  }
+  return best;
+}
+
+// Tempo (BPM), the time of every beat, and the downbeats (the first beat of each bar, where the kick drum lands).
+// Use the times to cut video on the beat, and the downbeats for the big cuts.
+export function beats(input: string, beatsPerBar = 4): { bpm: number; beats: number[]; count: number; downbeats: number[]; bars: number } {
   const data = samples(input);
   if (data.length < RATE * 3) throw new Error("The sound is too short to find a beat (needs 3+ seconds).");
   const framesPerSecond = RATE / HOP;
   const strength = onsetStrength(data);
-  const period = beatPeriod(strength, framesPerSecond);
-  const offset = beatOffset(strength, period);
-  const times: number[] = [];
+  const { period, offset } = finePeriod(strength, beatPeriod(strength, framesPerSecond));
+  // The grid may start a beat late (the very first hit has nothing before it to compare with): step back while a beat fits.
+  let first = offset;
+  while (first - period > -2) first -= period;
+  const frames: number[] = [];
+  for (let f = Math.max(0, first); f < strength.length; f += period) frames.push(f);
   // Each strength value describes the sound at the end of its measurement window.
-  for (let f = offset; f < strength.length; f += period) times.push(round((f * HOP + WINDOW) / RATE));
-  return { bpm: round((framesPerSecond * 60) / period, 1), beats: times, count: times.length };
+  const time = (f: number) => round((f * HOP + WINDOW) / RATE);
+  // Downbeats: of the beatsPerBar ways to group the beats into bars, the one whose first beats have the most low end
+  // (the kick and bass land on beat 1), helped by how big the hit is (chords change and cymbals crash on beat 1).
+  const low = lowPass(data, 150);
+  const lowEnergy = (f: number) => {
+    const start = Math.round(f * HOP + WINDOW / 2);
+    let sum = 0;
+    for (let i = start; i < Math.min(low.length, start + Math.round(0.06 * RATE)); i++) sum += low[i] * low[i];
+    return sum;
+  };
+  const hitSize = (f: number) => Math.max(...[-2, -1, 0, 1, 2].map((d) => strength[Math.round(f) + d] ?? 0));
+  const phaseAverage = (measure: (f: number) => number) =>
+    Array.from({ length: beatsPerBar }, (_, k) => {
+      const values = frames.filter((_, n) => n % beatsPerBar === k).map(measure);
+      return values.reduce((s, v) => s + v, 0) / Math.max(1, values.length);
+    });
+  const lows = phaseAverage(lowEnergy);
+  const hits = phaseAverage(hitSize);
+  const share = (values: number[], k: number) => values[k] / Math.max(1e-12, values.reduce((s, v) => s + v, 0));
+  // Most music starts on beat 1, so the first beat with sound gets a small bonus. It only decides near-ties,
+  // e.g. rock with the kick on beats 1 and 3, or a kick on every beat.
+  const loudestHit = Math.max(...frames.map(hitSize));
+  const firstSounding = Math.max(0, frames.findIndex((f) => hitSize(f) > 0.3 * loudestHit)) % beatsPerBar;
+  const scores = lows.map((_, k) => share(lows, k) + 0.5 * share(hits, k) + (k === firstSounding ? 0.05 : 0));
+  const phase = scores.indexOf(Math.max(...scores));
+  const downbeats = frames.filter((_, n) => n % beatsPerBar === phase).map(time);
+  return { bpm: round((framesPerSecond * 60) / period, 1), beats: frames.map(time), count: frames.length, downbeats, bars: downbeats.length };
+}
+
+// Keep only the low sound (below `hz`): two simple smoothing passes.
+function lowPass(data: Float32Array, hz: number, rate = RATE): Float32Array {
+  const a = Math.exp((-2 * Math.PI * hz) / rate);
+  const out = new Float32Array(data.length);
+  let one = 0;
+  let two = 0;
+  for (let i = 0; i < data.length; i++) {
+    one = a * one + (1 - a) * data[i];
+    two = a * two + (1 - a) * one;
+    out[i] = two;
+  }
+  return out;
+}
+
+// ---------- Tonal balance and energy ----------
+
+// How much bass, middle and treble a sound has: each octave band in dB compared with the whole sound.
+// With a reference, also how far each band is from it (positive = this sound has more there).
+export function bands(input: string, reference?: string) {
+  const named = (values: number[]) => Object.fromEntries(sound.BAND_CENTERS.map((c, k) => [sound.bandName(c), values[k]]));
+  const levels = sound.bandLevels(sound.monoOf(requireFile(input)));
+  const strongest = sound.BAND_CENTERS[levels.indexOf(Math.max(...levels))];
+  if (!reference) return { bands: named(levels), strongest: sound.bandName(strongest) };
+  const target = sound.bandLevels(sound.monoOf(requireFile(reference)));
+  const difference = levels.map((v, k) => round(v - target[k], 1));
+  return { bands: named(levels), strongest: sound.bandName(strongest), reference: named(target), difference: named(difference) };
+}
+
+// The loudness over time (dB), for the whole sound and for the low end (below 150 Hz: kick and bass),
+// plus the biggest jumps: the moments the sound gets much louder (drops), to check that they land on cuts.
+export function energy(input: string, every = 0.1) {
+  const data = samples(input);
+  const low = lowPass(data, 150);
+  const size = Math.max(1, Math.round(every * RATE));
+  const db = (values: Float32Array, start: number) => {
+    let sum = 0;
+    for (let i = start; i < start + size; i++) sum += values[i] * values[i];
+    return round(10 * Math.log10(sum / size + 1e-10), 1);
+  };
+  const full: number[] = [];
+  const bass: number[] = [];
+  for (let start = 0; start + size <= data.length; start += size) {
+    full.push(db(data, start));
+    bass.push(db(low, start));
+  }
+  // A jump: the half second after is much louder than the half second before.
+  const reach = Math.max(1, Math.round(0.5 / every));
+  const average = (from: number, to: number) => full.slice(Math.max(0, from), to).reduce((s, v) => s + v, 0) / Math.max(1, Math.min(to, full.length) - Math.max(0, from));
+  const rises = full.map((_, i) => (i < reach || i + reach > full.length ? 0 : average(i, i + reach) - average(i - reach, i)));
+  const jumps = rises
+    .map((rise, i) => ({ time: round(i * every, 2), rise: round(rise, 1) }))
+    .filter((j, i) => j.rise >= 6 && rises[i] === Math.max(...rises.slice(Math.max(0, i - reach), i + reach + 1)))
+    .sort((a, b) => b.rise - a.rise)
+    .slice(0, 10)
+    .sort((a, b) => a.time - b.time);
+  return { every, full, low: bass, jumps };
 }
 
 // ---------- Words ----------
@@ -411,7 +517,7 @@ export function subtitleText(words: Word[], format: "srt" | "vtt", maxChars = 42
 export function subtitles(transcript: string, output: string, maxChars = 42) {
   const format = subtitleFormat(output);
   if (!format) throw new Error("The output must be a .srt or .vtt file.");
-  const words: Word[] = JSON.parse(readFileSync(requireFile(transcript), "utf8")).words ?? [];
+  const words: Word[] = readJson(transcript).words ?? [];
   if (!words.length) throw new Error(`${transcript} has no words. Make one with: node joedit.ts listen transcribe <sound> words.json`);
   writeFileSync(output, subtitleText(words, format, maxChars));
   return { lines: wordGroups(words, maxChars).length, format };
@@ -567,10 +673,10 @@ async function voicePrint(audio: Float32Array): Promise<Float32Array> {
 export async function speakers(input: string, output: string, options: { transcript?: string; count?: number; model?: string } = {}) {
   const audio = monoSamples(input, 16000);
   let transcript: Transcript;
-  if (options.transcript) transcript = JSON.parse(readFileSync(requireFile(options.transcript), "utf8"));
+  if (options.transcript) transcript = readJson(options.transcript);
   else {
     await transcribe(input, output, options.model ?? "base");
-    transcript = JSON.parse(readFileSync(output, "utf8"));
+    transcript = readJson(output);
   }
   // Long sentences are split into pieces of up to 8 s (a speaker can change inside a long run of words).
   const pieces: { start: number; end: number; words: Word[] }[] = [];
@@ -659,8 +765,24 @@ export const commands: Record<string, Command> = {
     run: (a) => silences(requireFile(a.positional[0]), optionalNumberFlag(a, "db", -35), optionalNumberFlag(a, "min", 0.5)),
   },
   beats: {
-    usage: "beats <sound>",
-    run: (a) => beats(requireFile(a.positional[0])),
+    usage: "beats <sound> [--beats-per-bar 4]  (beat times, downbeats and bars)",
+    run: (a) => {
+      const perBar = optionalNumberFlag(a, "beats-per-bar", 4);
+      if (!Number.isInteger(perBar) || perBar < 1 || perBar > 16) throw new Error("--beats-per-bar is a whole number from 1 to 16 (4 for most music, 3 for a waltz).");
+      return beats(requireFile(a.positional[0]), perBar);
+    },
+  },
+  bands: {
+    usage: "bands <sound> [--reference ref.wav]  (bass/middle/treble balance per octave, in dB; with a reference: the difference)",
+    run: (a) => bands(requireFile(a.positional[0]), a.flags.reference),
+  },
+  energy: {
+    usage: "energy <sound> [--every 0.1]  (loudness over time, full and low end, and the biggest jumps)",
+    run: (a) => {
+      const every = optionalNumberFlag(a, "every", 0.1);
+      if (!(every >= 0.02 && every <= 10)) throw new Error("--every is seconds between measurements, from 0.02 to 10.");
+      return energy(requireFile(a.positional[0]), every);
+    },
   },
   transcribe: {
     usage: `transcribe <sound> <output.json|.srt|.vtt> [--model ${Object.keys(WHISPER_MODELS).join("|")}] [--language en]  (language is found automatically if not given; .srt/.vtt = a subtitle file)`,

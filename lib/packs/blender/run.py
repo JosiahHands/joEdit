@@ -1,6 +1,7 @@
 # Runs inside Blender (started by 3d.ts): sets up the render, runs the scene script, renders PNG frames.
 # Usage: blender -b --factory-startup --python run.py -- <settings.json>
-# settings: {script, folder, width, height, fps, frames, engine, samples, transparent, fonts, still}
+# settings: {script, folder, width, height, fps, frames, engine, samples, transparent, fonts, still, printed}
+import contextlib
 import json
 import os
 import sys
@@ -25,13 +26,18 @@ default_lights = kit.studio_light("soft")
 script = settings["script"]
 scope = {name: getattr(kit, name) for name in dir(kit) if not name.startswith("_")}
 scope.update({"bpy": bpy, "kit": kit, "__name__": "__main__", "__file__": script})
+# The script's print() output goes to a file that joEdit shows (Blender's own log is not shown).
+printed = open(settings["printed"], "w", encoding="utf8") if settings.get("printed") else sys.stdout
 try:
-    exec(compile(open(script).read(), script, "exec"), scope)
+    with contextlib.redirect_stdout(printed):
+        exec(compile(open(script, encoding="utf8").read(), script, "exec"), scope)
 except Exception as error:
     # Show the error from the scene script itself (skipping this file's line), then stop.
     lines = traceback.format_exception(type(error), error, error.__traceback__.tb_next)
     print("Error in the scene script:\n" + "".join(lines), file=sys.stderr)
+    printed.flush()
     sys.exit(2)
+printed.flush()
 
 def alive(obj):
     """False if the script already deleted this object (for example with clear())."""

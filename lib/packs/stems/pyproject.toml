@@ -3,4 +3,18 @@ name = "joedit-stems"
 version = "0.1.0"
 description = "Split music into vocals, drums, bass and other (Demucs htdemucs, MIT)."
 requires-python = ">=3.10,<3.13"
-dependencies = ["demucs>=4.0.1", "soundfile>=0.12"]
+dependencies = [
+  "demucs>=4.0.1",
+  "soundfile>=0.12",
+  # Listed here (demucs needs it anyway) so Windows can take the NVIDIA build below.
+  "torch",
+]
+
+# On Windows, PyPI's torch runs on the CPU only: the NVIDIA (CUDA) build comes from PyTorch's own index.
+[[tool.uv.index]]
+name = "pytorch-cuda"
+url = "https://download.pytorch.org/whl/cu121"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cuda", marker = "sys_platform == 'win32'" }]

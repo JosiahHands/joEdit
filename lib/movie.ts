@@ -3,10 +3,11 @@
 // CLI:     node joedit.ts movie <command> ...
 // Library: import { renderMovie } from "./joEdit/movie.ts"
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { cpus } from "node:os";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import {
+  concatLine,
   drawText,
   even,
   ffmpeg,
@@ -17,7 +18,7 @@ import {
   loadBrand,
   measureText,
   readFrames,
-  requireFile,
+  readJson,
   round,
   runCli,
   skia,
@@ -92,6 +93,8 @@ export type Scene = {
   to?: number; // video: end time in the clip
   volume?: number; // video: loudness of the clip's own sound (0 = silent)
   fit?: "cover" | "contain"; // video: fill the frame (crop) or fit inside it (blurred background)
+  speed?: number; // video: 2 = twice as fast, 0.5 = slow motion (the scene lasts (to - from) / speed)
+  reframe?: "follow"; // video: crop to the movie's shape, following the subject (needs: install cutout; tracking is cached)
   motion?: string; // image: zoom-in, zoom-out, pan-left, pan-right, pan-up, pan-down, none, or parallax (3D, needs: install depth)
   subtitle?: string; // title: smaller second line
   data?: unknown; // html: window.joedit.data; canvas: info.data
@@ -124,6 +127,7 @@ export type Movie = {
   lookStrength?: number;
   effects?: video.Effects;
   fx?: string | Fx; // GPU effects over the whole film
+  layers?: Layer[]; // drawn over the whole film ("at" = seconds from the start of the film), e.g. a HUD or a logo
   scenes: Scene[];
   audio?: Track[];
   sfx?: { type: string; at: number; volume?: number; duration?: number }[];
@@ -157,8 +161,8 @@ export const TRANSITIONS = [
 const SCENE_KINDS = ["video", "image", "title", "html", "canvas", "color"];
 // Flat moves (Ken Burns) and 2.5D moves that use the picture's depth.
 const IMAGE_MOTIONS = [...picture.MOTIONS, "parallax", ...picture.PARALLAX_MOTIONS.map((m) => `parallax-${m}`)];
-const SCENE_KEYS = [...SCENE_KINDS, "duration", "from", "to", "volume", "fit", "motion", "subtitle", "data", "look", "transition", "text", "layers", "fx"];
-const MOVIE_KEYS = ["size", "fps", "brand", "look", "lookStrength", "effects", "fx", "scenes", "audio", "sfx", "captions", "voiceover", "music", "beatSync", "notes"];
+const SCENE_KEYS = [...SCENE_KINDS, "duration", "from", "to", "volume", "fit", "speed", "reframe", "motion", "subtitle", "data", "look", "transition", "text", "layers", "fx"];
+const MOVIE_KEYS = ["size", "fps", "brand", "look", "lookStrength", "effects", "fx", "layers", "scenes", "audio", "sfx", "captions", "voiceover", "music", "beatSync", "notes"];
 const TRACK_KEYS = ["file", "at", "volume", "from", "to", "fadeIn", "fadeOut", "loop", "duck", "pan", "reverb"];
 const LAYER_KEYS = ["image", "video", "text", "style", "from", "at", "duration", "x", "y", "width", "scale", "rotate", "opacity", "blend", "fadeIn", "fadeOut", "keys", "track", "anchor"];
 const KEY_VALUES = ["x", "y", "width", "scale", "rotate", "opacity", "amount"];
@@ -171,18 +175,13 @@ const BLENDS: Record<string, string> = {
   color: "color", luminosity: "luminosity",
 };
 const DEFAULT_DURATION = 3;
-const CACHE_VERSION = 2; // bump to throw away old cached scenes after changing how scenes render
+const CACHE_VERSION = 3; // bump to throw away old cached scenes after changing how scenes render
 // How many scenes render at the same time (each encode already uses several cores).
 const SCENES_AT_ONCE = Math.min(4, Math.max(1, Math.floor(cpus().length / 4)));
 
 // Read a movie file. Paths inside it are relative to the movie file.
 export function loadMovie(file: string): { movie: Movie; base: string } {
-  let movie: Movie;
-  try {
-    movie = JSON.parse(readFileSync(requireFile(file), "utf8"));
-  } catch (error) {
-    throw new Error(`${file} is not valid JSON: ${(error as Error).message}`);
-  }
+  const movie: Movie = readJson(file);
   return { movie, base: dirname(resolve(file)) };
 }
 
@@ -243,9 +242,22 @@ function sceneLength(scene: Scene, base: string): number {
   if (scene.duration) return scene.duration;
   if (scene.video) {
     const end = scene.to ?? video.info(pathFrom(base, scene.video)).duration;
-    return end - (scene.from ?? 0);
+    return (end - (scene.from ?? 0)) / (scene.speed ?? 1);
   }
   return DEFAULT_DURATION;
+}
+
+// How long the film is: the scenes, minus the overlap of each transition.
+function filmLength(movie: Movie, lengths: number[]): number {
+  return lengths.reduce((sum, length, n) => sum + length - (n > 0 ? transitionOf(movie.scenes[n])?.duration ?? 0 : 0), 0);
+}
+
+// Transition lengths in whole frames, so the film is exactly as long as planned (no drift over many cuts).
+function transitionsOnFrames(movie: Movie, fps: number): void {
+  for (const scene of movie.scenes) {
+    const t = transitionOf(scene);
+    if (t) scene.transition = { ...t, duration: Math.max(1, Math.round(t.duration * fps)) / fps };
+  }
 }
 
 // ---------- Checking ----------
@@ -315,6 +327,20 @@ export function validate(movie: Movie, base: string): { valid: boolean; errors: 
     checkKeys(where, f.keys, ["amount"]);
   };
   checkFx("fx", movie.fx);
+  // A layer: one picture, video or text, known keys, files that exist. Film layers have no clip to track.
+  const checkLayer = (at: string, layer: Layer, film = false) => {
+    const kinds = ["image", "video", "text"].filter((kind) => layer[kind as keyof Layer] !== undefined);
+    if (kinds.length !== 1) return errors.push(`${at}: give exactly one of image, video or text.`);
+    unknownKeys(at, layer, film ? LAYER_KEYS.filter((k) => k !== "track" && k !== "anchor") : LAYER_KEYS);
+    if (layer.image) file(at, layer.image);
+    if (layer.video) file(at, layer.video);
+    if (layer.track) file(at, layer.track);
+    if (layer.blend && !BLENDS[layer.blend]) errors.push(`${at}: unknown blend "${layer.blend}". Blends: ${Object.keys(BLENDS).join(", ")}.`);
+    if (layer.anchor && !["top", "center", "bottom"].includes(layer.anchor)) errors.push(`${at}: anchor is "top", "center" or "bottom".`);
+    checkKeys(at, layer.keys, KEY_VALUES.filter((v) => v !== "amount"));
+  };
+  if (movie.layers !== undefined && !Array.isArray(movie.layers)) errors.push('layers: a list of layers, e.g. "layers": [{"video": "hud.mov", "width": 1}].');
+  else (movie.layers ?? []).forEach((layer, k) => checkLayer(`layer ${k + 1}`, layer, true));
 
   if (!Array.isArray(movie.scenes) || !movie.scenes.length) {
     errors.push('scenes: add a list of scenes, e.g. "scenes": [{"title": "Hello", "duration": 3}].');
@@ -340,18 +366,11 @@ export function validate(movie: Movie, base: string): { valid: boolean; errors: 
       if (scene.html) file(where, scene.html);
       if (scene.canvas) file(where, scene.canvas);
       checkFx(`${where}, fx`, scene.fx);
-      (scene.layers ?? []).forEach((layer, k) => {
-        const at = `${where}, layer ${k + 1}`;
-        const kinds = ["image", "video", "text"].filter((kind) => layer[kind as keyof Layer] !== undefined);
-        if (kinds.length !== 1) return errors.push(`${at}: give exactly one of image, video or text.`);
-        unknownKeys(at, layer, LAYER_KEYS);
-        if (layer.image) file(at, layer.image);
-        if (layer.video) file(at, layer.video);
-        if (layer.track) file(at, layer.track);
-        if (layer.blend && !BLENDS[layer.blend]) errors.push(`${at}: unknown blend "${layer.blend}". Blends: ${Object.keys(BLENDS).join(", ")}.`);
-        if (layer.anchor && !["top", "center", "bottom"].includes(layer.anchor)) errors.push(`${at}: anchor is "top", "center" or "bottom".`);
-        checkKeys(at, layer.keys, KEY_VALUES.filter((v) => v !== "amount"));
-      });
+      (scene.layers ?? []).forEach((layer, k) => checkLayer(`${where}, layer ${k + 1}`, layer));
+      if (!scene.video && (scene.speed !== undefined || scene.reframe !== undefined)) errors.push(`${where}: speed and reframe are for video scenes.`);
+      if (scene.speed !== undefined && !(scene.speed >= 0.1 && scene.speed <= 10)) errors.push(`${where}: speed is between 0.1 (slow motion) and 10 (fast).`);
+      if (scene.reframe !== undefined && scene.reframe !== "follow") errors.push(`${where}: reframe is "follow" (crop to the movie's shape, following the subject).`);
+      if (scene.reframe && !isModelInstalled("cutout")) errors.push(`${where}: reframe "follow" finds the subject with the cutout model. Run: node joedit.ts install cutout`);
       if (scene.motion && !IMAGE_MOTIONS.includes(scene.motion)) errors.push(`${where}: unknown motion "${scene.motion}". Motions: ${IMAGE_MOTIONS.join(", ")}.`);
       if (scene.duration !== undefined && !(scene.duration > 0)) errors.push(`${where}: duration must be more than 0 seconds.`);
       if (scene.look && !video.LOOKS[scene.look]) errors.push(`${where}: unknown look "${scene.look}". Looks: ${Object.keys(video.LOOKS).join(", ")}.`);
@@ -438,9 +457,24 @@ type Context = {
 const AUDIO_FORMAT = "aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo";
 const SILENCE = ["-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo"];
 
-// Encoder settings. Drafts are fast and rough, finals are slow and clean.
-function encoder(ctx: Context): string[] {
-  return ["-c:v", "libx264", "-preset", ctx.draft ? "ultrafast" : "medium", "-crf", ctx.draft ? "28" : "18", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k"];
+// Encoder settings. Drafts are fast and rough. The finished film (final) is slow and clean. Cached scenes,
+// which are usually encoded once more when joined, are fast and nearly lossless.
+function encoder(ctx: Context, final = false): string[] {
+  const [preset, crf] = ctx.draft ? ["ultrafast", "28"] : final ? ["medium", "18"] : ["veryfast", "14"];
+  return ["-c:v", "libx264", "-preset", preset, "-crf", crf, "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k"];
+}
+
+// Sound at another speed (atempo takes 0.5 and up per step, so slow motion chains a few). "" for normal speed.
+function tempoFilter(speed: number): string {
+  if (speed === 1) return "";
+  const steps: string[] = [];
+  let rest = speed;
+  while (rest < 0.5) {
+    steps.push("atempo=0.5");
+    rest /= 0.5;
+  }
+  steps.push(`atempo=${round(rest, 4)}`);
+  return `${steps.join(",")},`;
 }
 
 // Scale and crop (cover) or fit with a blurred background (contain) to the movie size.
@@ -464,7 +498,9 @@ function sceneKey(scene: Scene, duration: number, ctx: Context): string {
     const stats = statSync(pathFrom(ctx.base, path!));
     return `${path}:${stats.size}:${stats.mtimeMs}`;
   });
-  const recipe = { scene, duration, files, width: ctx.width, height: ctx.height, fps: ctx.fps, draft: ctx.draft, brand: ctx.brand, CACHE_VERSION };
+  // The transition is left out: it happens when scenes are joined, so changing it never re-renders a scene.
+  const { transition, ...look } = scene;
+  const recipe = { scene: look, duration, files, width: ctx.width, height: ctx.height, fps: ctx.fps, draft: ctx.draft, brand: ctx.brand, CACHE_VERSION };
   return createHash("sha256").update(JSON.stringify(recipe)).digest("hex").slice(0, 16);
 }
 
@@ -475,16 +511,27 @@ async function renderScene(scene: Scene, n: number, duration: number, ctx: Conte
   const { width, height, fps } = ctx;
   const inputs: string[] = [];
   let graph = "";
+  let workFolder: string | undefined; // ffmpeg runs here when a filter reads a file by name (reframe follow)
 
   // 1. The picture and sound of the scene.
   if (scene.video) {
     const clip = pathFrom(ctx.base, scene.video);
     const hasAudio = video.info(clip).hasAudio && scene.volume !== 0;
-    inputs.push("-ss", String(scene.from ?? 0), "-t", String(duration), "-i", clip);
+    const from = scene.from ?? 0;
+    const speed = scene.speed ?? 1;
+    inputs.push("-ss", String(from), "-t", String(round(duration * speed, 4)), "-i", clip);
     if (!hasAudio) inputs.push(...SILENCE);
+    // Follow the subject: crop to the movie's shape along its (cached) path, before the speed change.
+    let follow = "";
+    if (scene.reframe === "follow") {
+      workFolder = join(ctx.temp, `follow-${n}`);
+      mkdirSync(workFolder, { recursive: true });
+      follow = `${(await video.followFilter(clip, `${width}:${height}`, workFolder, { from, to: from + duration * speed })).filter},`;
+    }
+    const retime = speed !== 1 ? `setpts=PTS/${speed},` : "";
     // tpad holds the last frame if the clip is shorter than the scene.
-    graph += `[0:v]${fitFilter(ctx, scene.fit)},tpad=stop_mode=clone:stop_duration=${duration}[base];`;
-    graph += hasAudio ? `[0:a]${AUDIO_FORMAT},volume=${scene.volume ?? 1},apad[a]` : `[1:a]${AUDIO_FORMAT}[a]`;
+    graph += `[0:v]${follow}${retime}${fitFilter(ctx, scene.fit)},tpad=stop_mode=clone:stop_duration=${duration}[base];`;
+    graph += hasAudio ? `[0:a]${tempoFilter(speed)}${AUDIO_FORMAT},volume=${scene.volume ?? 1},apad[a]` : `[1:a]${AUDIO_FORMAT}[a]`;
   } else {
     const made = join(ctx.temp, `scene-${n}.mp4`);
     if (scene.motion?.startsWith("parallax")) {
@@ -525,7 +572,7 @@ async function renderScene(scene: Scene, n: number, duration: number, ctx: Conte
 
   // Encode to a temporary name first, so a failed or interrupted render never leaves a broken file in the cache.
   const partial = join(ctx.temp, `partial-${n}.mp4`);
-  await ffmpegAsync([...inputs, "-filter_complex", graph, "-map", "[v]", "-map", "[a]", ...encoder(ctx), "-r", String(fps), "-t", String(duration), partial]);
+  await ffmpegAsync([...inputs, "-filter_complex", graph, "-map", "[v]", "-map", "[a]", ...encoder(ctx), "-r", String(fps), "-t", String(duration), partial], workFolder);
 
   // 4. Layers (Skia) and GPU effects, drawn on every frame.
   if (scene.layers?.length || scene.fx) {
@@ -565,14 +612,16 @@ function trackedBox(track: TrackFile, time: number, ctx: Context, fit = "cover")
 }
 
 // Get a layer ready to draw: load its picture, open its video, size its text.
-// Returns draw(c, t): draw the layer onto canvas context c at `t` seconds into the scene.
+// Returns draw(c, t): draw the layer onto canvas context c at `t` seconds into the scene,
+// and close(): stop reading its video (a layer video can be longer than the scene).
 async function prepareLayer(layer: Layer, sceneLength: number, ctx: Context, clip?: { from: number; fit?: string }) {
   const { createCanvas, loadImage, ImageData } = await skia();
+  let close = async () => {};
   const W = ctx.width;
   const H = ctx.height;
   const start = layer.at ?? 0;
   const length = layer.duration ?? sceneLength - start;
-  const track: TrackFile | undefined = layer.track ? JSON.parse(readFileSync(pathFrom(ctx.base, layer.track), "utf8")) : undefined;
+  const track: TrackFile | undefined = layer.track ? readJson(pathFrom(ctx.base, layer.track)) : undefined;
   if (track && !track.points?.length) throw new Error(`${layer.track} has no points. Make it with: node joedit.ts look track <video> ${layer.track}`);
 
   // The content: something with a natural width and height, and a way to draw it centred at (0, 0).
@@ -588,6 +637,7 @@ async function prepareLayer(layer: Layer, sceneLength: number, ctx: Context, cli
     const frameWidth = Math.max(2, Math.round(((layer.width ?? 0.3) * W) / 2) * 2);
     natural = { width: frameWidth, height: Math.max(2, Math.round((frameWidth * details.height) / details.width / 2) * 2) };
     const frames = readFrames(file, { fps: ctx.fps, start: layer.from ?? 0, width: natural.width, height: natural.height });
+    close = async () => void (await frames.return(undefined));
     const holder = createCanvas(natural.width, natural.height);
     let shown = -1;
     paint = async (c, t, w, h) => {
@@ -619,7 +669,7 @@ async function prepareLayer(layer: Layer, sceneLength: number, ctx: Context, cli
     paint = async (c) => void drawText(c, layer.text!, 0, -measured.height / 2, style);
   }
 
-  return async (c: any, sceneTime: number) => {
+  const draw = async (c: any, sceneTime: number) => {
     const t = sceneTime - start;
     if (t < 0 || t >= length) return;
     const keys = layer.keys;
@@ -648,11 +698,16 @@ async function prepareLayer(layer: Layer, sceneLength: number, ctx: Context, cli
     await paint(c, t, width, height);
     c.restore();
   };
+  return { draw, close: () => close() };
 }
 
 // Draw layers and run GPU effects on every frame of a clip, keeping its sound.
 // clip: the scene's video (start and fit), so tracked layers line up with it.
-async function framePass(input: string, output: string, length: number, ctx: Context, layers: Layer[], effects?: Fx, clip?: { from: number; fit?: string }) {
+// before: an ffmpeg graph (from [0:v] to [pre]) run on the frames as they are read, with its extra input files.
+async function framePass(
+  input: string, output: string, length: number, ctx: Context, layers: Layer[], effects?: Fx,
+  clip?: { from: number; fit?: string }, before?: { graph: string; inputs: string[] },
+) {
   const { width, height, fps } = ctx;
   const drawers = await Promise.all(layers.map((layer) => prepareLayer(layer, length, ctx, clip)));
   const steps = effects ? fx.prepareEffects(fxNames(effects, ctx.base), fx.parseSet(fxSet(effects.set)), effects.lut ? pathFrom(ctx.base, effects.lut) : undefined) : [];
@@ -660,11 +715,11 @@ async function framePass(input: string, output: string, length: number, ctx: Con
   const canvas = createCanvas(width, height);
   const c = canvas.getContext("2d");
   const writer = writeVideo(output, { width, height, fps, audio: input, draft: ctx.draft });
-  for await (const frame of readFrames(input, { width, height })) {
+  for await (const frame of readFrames(input, { width, height, ...before })) {
     let pixels: Buffer = frame.pixels;
     if (drawers.length) {
       c.putImageData(new ImageData(new Uint8ClampedArray(pixels), width, height), 0, 0);
-      for (const draw of drawers) await draw(c, frame.time);
+      for (const layer of drawers) await layer.draw(c, frame.time);
       const data = c.getImageData(0, 0, width, height).data;
       pixels = Buffer.from(data.buffer, data.byteOffset, data.length);
     }
@@ -675,21 +730,22 @@ async function framePass(input: string, output: string, length: number, ctx: Con
     await writer.write(pixels);
   }
   await writer.finish();
+  for (const layer of drawers) await layer.close();
 }
 
 // ---------- Joining, sound and finishing ----------
 
-// Join the scenes, with transitions where asked. Returns the movie length.
+// Join the scenes, with transitions where asked.
 // ffmpeg's transitions (xfade) run inside the join. GPU transitions (fx) are rendered first as short
 // overlap clips (the end of one scene blending into the start of the next) and put between the trimmed scenes.
-async function joinScenes(movie: Movie, files: string[], lengths: number[], output: string, ctx: Context): Promise<number> {
+async function joinScenes(movie: Movie, files: string[], lengths: number[], output: string, ctx: Context): Promise<void> {
   const transitions = movie.scenes.map(transitionOf);
   if (!transitions.some(Boolean)) {
     // No transitions: join the files directly (very fast, no re-encoding).
     const list = join(ctx.temp, "scenes.txt");
-    writeFileSync(list, files.map((f) => `file '${f.replace(/'/g, "'\\''")}'`).join("\n"));
+    writeFileSync(list, files.map(concatLine).join("\n"));
     ffmpeg(["-f", "concat", "-safe", "0", "-i", list, "-c", "copy", output]);
-    return lengths.reduce((sum, l) => sum + l, 0);
+    return;
   }
   // The GPU overlap clips, added as extra inputs after the scenes. Their length is whole frames.
   const inputs = files.flatMap((f) => ["-i", f]);
@@ -733,8 +789,92 @@ async function joinScenes(movie: Movie, files: string[], lengths: number[], outp
     v = `[v${n}]`;
     a = `[a${n}]`;
   }
-  ffmpeg([...inputs, "-filter_complex", graph.slice(0, -1), "-map", v, "-map", a, ...encoder(ctx), output]);
-  return length;
+  ffmpeg([...inputs, "-filter_complex", graph.slice(0, -1), "-map", v, "-map", a, ...encoder(ctx, true), output]);
+}
+
+// A fingerprint of everything that changes the film's picture (not its music, voice-over or sound effects),
+// so a sound-only change reuses the finished picture.
+function pictureKey(movie: Movie, segments: string[], lengths: number[], ctx: Context): string {
+  const stat = (path?: string) => {
+    if (!path) return undefined;
+    const s = statSync(pathFrom(ctx.base, path));
+    return `${path}:${s.size}:${s.mtimeMs}`;
+  };
+  const effects = fxOf(movie.fx);
+  const fxFiles = effects ? [effects.lut, ...effects.effect.split(",").map((n) => n.trim()).filter((n) => n.endsWith(".glsl"))] : [];
+  // Captions come from a transcript, the voice-over, or what is said in the scenes and speech tracks.
+  const captions = movie.captions && {
+    options: movie.captions,
+    transcript: typeof movie.captions === "object" ? stat(movie.captions.transcript) : undefined,
+    voiceover: movie.voiceover && { text: movie.voiceover.text, voice: movie.voiceover.voice, speed: movie.voiceover.speed, at: movie.voiceover.at },
+    speech: speechTracks(movie).map((t) => ({ ...t, file: stat(t.file) })),
+  };
+  const recipe = {
+    scenes: segments.map((file) => basename(file)), lengths, transitions: movie.scenes.map(transitionOf),
+    look: movie.look, lookStrength: movie.lookStrength, effects: movie.effects, fx: movie.fx, fxFiles: fxFiles.map(stat),
+    layers: movie.layers, layerFiles: (movie.layers ?? []).flatMap((l) => [stat(l.image), stat(l.video)]),
+    captions, width: ctx.width, height: ctx.height, fps: ctx.fps, draft: ctx.draft, brand: ctx.brand, CACHE_VERSION,
+  };
+  return createHash("sha256").update(JSON.stringify(recipe)).digest("hex").slice(0, 16);
+}
+
+// Audio tracks that are speech (not music, which ducks): captions listen to these and the scenes.
+function speechTracks(movie: Movie): Track[] {
+  return (movie.audio ?? []).filter((track) => !track.duck);
+}
+
+// The words for the captions: from a transcript, from the voice-over's own word times, or by transcribing
+// what is said in the film (the scenes' sound and speech tracks; not the music, which only confuses it).
+async function captionWords(movie: Movie, joined: string, length: number, spoken: { words: graphics.CaptionWord[] } | undefined, ctx: Context) {
+  const options = typeof movie.captions === "object" ? movie.captions : {};
+  if (options.transcript) return (readJson(pathFrom(ctx.base, options.transcript)).words ?? []) as graphics.CaptionWord[];
+  if (spoken) {
+    const at = movie.voiceover!.at ?? 0;
+    return spoken.words.map((w) => ({ word: w.word, start: w.start + at, end: w.end + at }));
+  }
+  const speech = join(ctx.temp, "speech.wav");
+  const tracks = speechTracks(movie).map(({ duck, ...rest }) => ({ ...rest, file: pathFrom(ctx.base, rest.file), role: "voice" as const }));
+  await sound.mixClips([{ file: joined, role: "voice" }, ...tracks], speech, { length });
+  // With speakers, the voices are also told apart.
+  const transcript = join(ctx.temp, "words.json");
+  if (options.speakers) await listen.speakers(speech, transcript, { model: options.model });
+  else await listen.transcribe(speech, transcript, options.model ?? "base");
+  return (readJson(transcript).words ?? []) as graphics.CaptionWord[];
+}
+
+// The film-wide pass over the joined scenes, in one encode: look and effects (ffmpeg), captions,
+// then GPU fx and film layers. With none of these the joined file is used as it is.
+async function finishPicture(movie: Movie, joined: string, output: string, length: number, words: graphics.CaptionWord[], ctx: Context) {
+  let graph = "";
+  let label = "0:v";
+  const inputs: string[] = [];
+  if (movie.look) {
+    graph += `${video.gradeGraph(movie.look, movie.lookStrength ?? 1, label, "graded")};`;
+    label = "graded";
+  }
+  if (movie.effects) {
+    graph += `${video.effectsGraph(movie.effects, label, "fx")};`;
+    label = "fx";
+  }
+  if (words.length) {
+    const captionFile = join(ctx.temp, "captions.mov");
+    const options = typeof movie.captions === "object" ? movie.captions : {};
+    await graphics.captionsOverlay(words, captionFile, {
+      width: ctx.width, height: ctx.height, fps: ctx.fps, duration: length, style: options.style, position: options.position, brand: ctx.brand, speakerColors: options.speakers,
+    });
+    inputs.push(captionFile);
+    graph += `[${label}][1:v]overlay=0:0:eof_action=pass[cap];`;
+    label = "cap";
+  }
+  if (movie.fx || movie.layers?.length) {
+    // Frames go through Skia (layers) and the GPU (fx); the ffmpeg part runs as they are read.
+    const before = label === "0:v" ? undefined : { graph: `${graph}[${label}]null[pre]`, inputs };
+    await framePass(joined, output, length, ctx, movie.layers ?? [], fxOf(movie.fx), undefined, before);
+  } else if (label !== "0:v") {
+    ffmpeg(["-i", joined, ...inputs.flatMap((f) => ["-i", f]), "-filter_complex", `${graph}[${label}]format=yuv420p[v]`, "-map", "[v]", "-map", "0:a:0", ...encoder(ctx, true), output]);
+  } else {
+    renameSync(joined, output);
+  }
 }
 
 // Mix the scene sound with music, voice-over and sound effects (Web Audio), then make it -14 LUFS.
@@ -752,9 +892,8 @@ async function mixSound(movie: Movie, tracks: Track[], joined: string, length: n
   }
   const raw = join(ctx.temp, "mix.wav");
   await sound.mixClips(clips, raw, { length });
-  // Silent movies stay silent; everything else is set to the online standard loudness.
-  if (listen.loudness(raw).lufs > -60) sound.normalize(raw, output);
-  else ffmpeg(["-i", raw, "-ar", "48000", output]);
+  // Set to the online standard loudness (silent movies stay silent).
+  sound.normalize(raw, output);
 }
 
 // Make the movie's music (cached). Composed scores also give their exact beat times.
@@ -764,7 +903,7 @@ async function makeMusic(spec: MusicSpec, ctx: Context): Promise<{ file: string;
     const scoreFile = pathFrom(ctx.base, spec.score);
     const key = createHash("sha256").update(readFileSync(scoreFile)).digest("hex").slice(0, 16);
     const file = join(ctx.cache, `score-${key}.wav`);
-    const score = JSON.parse(readFileSync(scoreFile, "utf8"));
+    const score = readJson(scoreFile);
     const made = existsSync(file) ? { beats: music.scoreToMidi(score).beats } : await music.compose(scoreFile, file);
     const secondsPerBeat = 60 / (score.tempo ?? 120);
     return { file, beats: Array.from({ length: Math.ceil(made.beats) }, (_, k) => k * secondsPerBeat) };
@@ -783,7 +922,7 @@ async function makeVoiceover(spec: NonNullable<Movie["voiceover"]>, ctx: Context
   if (!existsSync(file) || !existsSync(wordsFile)) {
     await voice.speak(file, spec.text, { voice: spec.voice, speed: spec.speed, words: wordsFile });
   }
-  return { file, words: JSON.parse(readFileSync(wordsFile, "utf8")).words ?? [] };
+  return { file, words: readJson(wordsFile).words ?? [] };
 }
 
 // Render a movie file into a finished video.
@@ -792,6 +931,7 @@ export async function renderMovie(file: string, output: string, draft = false, s
   const { movie, base } = loadMovie(file);
   const { valid, errors } = validate(movie, base);
   if (!valid) throw new Error(`The movie has ${errors.length} problem(s):\n- ${errors.join("\n- ")}`);
+  transitionsOnFrames(movie, movie.fps ?? 30);
 
   const started = Date.now();
   const size = sizeOf(movie);
@@ -825,23 +965,37 @@ export async function renderMovie(file: string, output: string, draft = false, s
     const segments = results.map((r) => r.file);
     const cached = results.filter((r) => r.cached).length;
 
-    // 2. Join (and GPU effects over the whole film), 3. mix the sound.
-    let joined = join(temp, "joined.mp4");
-    const length = await joinScenes(movie, segments, lengths, joined, ctx);
-    if (movie.fx) {
-      const withFx = join(temp, "joined-fx.mp4");
-      await framePass(joined, withFx, length, ctx, [], fxOf(movie.fx));
-      joined = withFx;
+    // 2. The picture: the joined scenes with the film-wide look, effects, captions, GPU fx and layers.
+    // It is cached on its own (with the scenes' sound inside), so a change to only the music, voice-over level
+    // or sound effects re-mixes the sound and keeps the picture.
+    const length = filmLength(movie, lengths);
+    const spoken = movie.voiceover ? await makeVoiceover(movie.voiceover, ctx) : undefined;
+    const pictureFile = join(cache, `picture-${pictureKey(movie, segments, lengths, ctx)}.mp4`);
+    const pictureCached = existsSync(pictureFile);
+    if (!pictureCached) {
+      const joined = join(temp, "joined.mp4");
+      await joinScenes(movie, segments, lengths, joined, ctx);
+      const words = movie.captions ? await captionWords(movie, joined, length, spoken, ctx) : [];
+      const partial = join(temp, "picture.mp4");
+      await finishPicture(movie, joined, partial, length, words, ctx);
+      renameSync(partial, pictureFile); // only finished pictures go into the cache
+    } else {
+      utimesSync(pictureFile, new Date(), new Date()); // used now: kept by the clean-up below
     }
+    // Finished pictures are big: keep the 3 used most recently (e.g. a draft and a final), delete older ones.
+    const pictures = readdirSync(cache).filter((name) => /^picture-\w+\.mp4$/.test(name)).map((name) => join(cache, name));
+    pictures.sort((a, b) => statSync(b).mtimeMs - statSync(a).mtimeMs);
+    for (const old of pictures.slice(3)) for (const path of [old, old.replace(/\.mp4$/, ".json")]) rmSync(path, { force: true });
+
+    // 3. The sound: the scenes' own sound with the music, voice-over and sound effects.
     const tracks = [...(movie.audio ?? [])];
     if (backing) {
       const m = movie.music!;
       tracks.push({ file: backing.file, volume: m.volume ?? 0.8, duck: m.duck ?? true, loop: m.loop, fadeIn: m.fadeIn, fadeOut: m.fadeOut ?? 2 });
     }
-    const spoken = movie.voiceover ? await makeVoiceover(movie.voiceover, ctx) : undefined;
     if (spoken) tracks.push({ file: spoken.file, at: movie.voiceover!.at ?? 0, volume: movie.voiceover!.volume ?? 1, reverb: movie.voiceover!.reverb });
     const mixed = join(temp, "mix-final.wav");
-    await mixSound(movie, tracks, joined, length, mixed, ctx);
+    await mixSound(movie, tracks, pictureFile, length, mixed, ctx);
     // Sound that would be cut off by the end of the film. Not for looped or faded-out tracks (music): those are
     // meant to be cut, and their fade-out happens at the end of the film.
     const warnings: string[] = [];
@@ -854,61 +1008,23 @@ export async function renderMovie(file: string, output: string, draft = false, s
       }
     }
 
-    // 4. Captions: from a transcript, from the voice-over's own word times, or by transcribing the final sound.
-    let captionFile = "";
-    if (movie.captions) {
-      const options = typeof movie.captions === "object" ? movie.captions : {};
-      let words: graphics.CaptionWord[] = [];
-      if (options.transcript) {
-        words = JSON.parse(readFileSync(pathFrom(base, options.transcript), "utf8")).words ?? [];
-      } else if (spoken) {
-        const at = movie.voiceover!.at ?? 0;
-        words = spoken.words.map((w) => ({ word: w.word, start: w.start + at, end: w.end + at }));
-      } else {
-        // Transcribe the film's sound; with speakers, also tell the voices apart.
-        const transcript = join(temp, "words.json");
-        if (options.speakers) await listen.speakers(mixed, transcript, { model: options.model });
-        else await listen.transcribe(mixed, transcript, options.model ?? "base");
-        words = JSON.parse(readFileSync(transcript, "utf8")).words ?? [];
-      }
-      if (words.length) {
-        captionFile = join(temp, "captions.mov");
-        await graphics.captionsOverlay(words, captionFile, {
-          width, height, fps, duration: length, style: options.style, position: options.position, brand, speakerColors: options.speakers,
-        });
-      }
-    }
+    // 4. Picture and sound together. The picture is copied as it is (no re-encoding).
+    ffmpeg([
+      "-i", pictureFile, "-i", mixed, "-map", "0:v", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+      "-movflags", "+faststart", "-t", String(round(length, 3)), output,
+    ]);
 
-    // 5. One final pass: look, effects, captions and the mixed sound.
-    let graph = "";
-    let label = "0:v";
-    if (movie.look) {
-      graph += `${video.gradeGraph(movie.look, movie.lookStrength ?? 1, label, "graded")};`;
-      label = "graded";
-    }
-    if (movie.effects) {
-      graph += `${video.effectsGraph(movie.effects, label, "fx")};`;
-      label = "fx";
-    }
-    const inputs = ["-i", joined, "-i", mixed];
-    if (captionFile) {
-      inputs.push("-i", captionFile);
-      graph += `[${label}][2:v]overlay=0:0:eof_action=pass[cap];`;
-      label = "cap";
-    }
-    const finish = ["-movflags", "+faststart", "-t", String(round(length, 3)), output];
-    if (label === "0:v") {
-      // Nothing to draw on the picture: keep the joined video as it is (no re-encoding), add the sound.
-      ffmpeg([...inputs, "-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", ...finish]);
-    } else {
-      graph += `[${label}]format=yuv420p[v]`;
-      ffmpeg([...inputs, "-filter_complex", graph, "-map", "[v]", "-map", "1:a", ...encoder(ctx), ...finish]);
-    }
-
-    // 6. Quality check (loaded here because joedit.ts also loads this file). A picture that holds still inside a
+    // 5. Quality check (loaded here because joedit.ts also loads this file). A picture that holds still inside a
     // title, canvas, page, color or unmoving picture scene, or is black inside a color scene, is how it was designed.
-    const { check } = await import("./joedit.ts");
-    const report = check(output);
+    // The picture's part of the check (every frame read) is saved with the cached picture, so a sound-only change skips it.
+    const { check, pictureMoments } = await import("./joedit.ts");
+    const momentsFile = pictureFile.replace(/\.mp4$/, ".json");
+    let moments = existsSync(momentsFile) ? readJson(momentsFile) : undefined;
+    if (!moments) {
+      moments = pictureMoments(output);
+      writeFileSync(momentsFile, JSON.stringify(moments));
+    }
+    const report = check(output, moments);
     const designed = designedScenes(movie, lengths);
     // A film with nothing to hear (no video scenes, audio, sfx, music or voice-over) is silent on purpose.
     const silentByDesign = !movie.scenes.some((s) => s.video) && !tracks.length && !movie.sfx?.length;
@@ -920,7 +1036,9 @@ export async function renderMovie(file: string, output: string, draft = false, s
       return designed.some((range) => kinds.includes(range.kind) && start >= range.start - 0.6 && end <= range.end + 0.6);
     };
     const problems = report.problems.filter((p) => !isExpected(p));
-    const expected = report.problems.filter(isExpected).map((p) => `${p.problem} ${p.at} (a scene designed to hold still)`);
+    const expected = report.problems
+      .filter(isExpected)
+      .map((p) => (p.at ? `${p.problem} ${p.at} (a scene designed to hold still)` : `${p.problem} (nothing in the movie makes sound)`));
     if (sheet) await look.sheet(output, sheet);
     return {
       duration: round(length),
@@ -929,6 +1047,7 @@ export async function renderMovie(file: string, output: string, draft = false, s
       scenes: movie.scenes.length,
       rendered: movie.scenes.length - cached,
       cached,
+      picture: pictureCached ? "cached (only the sound was mixed again)" : "rendered",
       seconds: round((Date.now() - started) / 1000, 1),
       check: { passed: problems.length === 0, problems, ...(expected.length ? { expected } : {}) },
       ...(warnings.length ? { warnings } : {}),

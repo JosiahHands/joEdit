@@ -7,4 +7,17 @@ dependencies = [
   "chatterbox-tts>=0.1.7",
   # The watermarker (resemble-perth) still uses pkg_resources, which newer setuptools removed.
   "setuptools<81",
+  # Listed here (Chatterbox needs them anyway) so Windows can take the NVIDIA builds below.
+  "torch",
+  "torchaudio",
 ]
+
+# On Windows, PyPI's torch runs on the CPU only: the NVIDIA (CUDA) build comes from PyTorch's own index.
+[[tool.uv.index]]
+name = "pytorch-cuda"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cuda", marker = "sys_platform == 'win32'" }]
+torchaudio = [{ index = "pytorch-cuda", marker = "sys_platform == 'win32'" }]

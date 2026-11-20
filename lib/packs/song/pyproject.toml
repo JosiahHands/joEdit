@@ -5,8 +5,12 @@ description = "Full songs with vocals or instrumentals from a description and ly
 requires-python = ">=3.11,<3.13"
 dependencies = [
   "ace-step @ git+https://github.com/ace-step/ACE-Step-1.5.git",
-  # ACE-Step's fast language-model engine for NVIDIA GPUs (not used on Macs).
-  "nano-vllm; sys_platform != 'darwin'",
+  # ACE-Step's fast language-model engine for NVIDIA GPUs on Linux (not used on Macs or Windows).
+  "nano-vllm; sys_platform == 'linux'",
+  # Listed here so Windows can take the NVIDIA builds below.
+  "torch>=2.7",
+  "torchaudio>=2.7",
+  "torchvision",
 ]
 
 [tool.uv]
@@ -15,7 +19,17 @@ override-dependencies = ["torch>=2.7", "torchvision", "torchaudio>=2.7", "setupt
 environments = [
   "sys_platform == 'darwin' and platform_machine == 'arm64'",
   "sys_platform == 'linux' and platform_machine == 'x86_64'",
+  "sys_platform == 'win32' and platform_machine == 'AMD64'",
 ]
+
+# On Windows, PyPI's torch runs on the CPU only: the NVIDIA (CUDA) builds come from PyTorch's own index.
+[[tool.uv.index]]
+name = "pytorch-cuda"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
 
 [tool.uv.sources]
 nano-vllm = { git = "https://github.com/ace-step/ACE-Step-1.5.git", subdirectory = "acestep/third_parts/nano-vllm" }
+torch = [{ index = "pytorch-cuda", marker = "sys_platform == 'win32'" }]
+torchaudio = [{ index = "pytorch-cuda", marker = "sys_platform == 'win32'" }]
+torchvision = [{ index = "pytorch-cuda", marker = "sys_platform == 'win32'" }]

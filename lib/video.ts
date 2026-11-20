@@ -1,9 +1,11 @@
 // Video editing, built on ffmpeg / ffprobe.
 // CLI:     node video.ts <command> <input> <output> [--flags]
 // Library: import { trim } from "./joEdit/video.ts"
-import { readdirSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { createHash } from "node:crypto";
+import { mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
 import {
+  concatLine,
   drawText,
   even,
   ffmpeg,
@@ -18,6 +20,7 @@ import {
   optionalNumberFlag,
   probe,
   readFrames,
+  readJson,
   requireFile,
   round,
   runCli,
@@ -119,7 +122,7 @@ export function extractAudio(input: string, output: string): void {
 // Replace the video's sound with an audio file. Output stops at the shorter of the two.
 export function addAudio(input: string, audio: string, output: string): void {
   requireFile(audio);
-  ffmpeg(["-i", input, "-i", audio, "-map", "0:v", "-map", "1:a", "-c:v", "copy", "-shortest", output]);
+  ffmpeg(["-i", input, "-i", audio, "-map", "0:v", "-map", "1:a:0", "-c:v", "copy", "-shortest", output]);
 }
 
 // Join videos one after another. All are scaled to the size of the first one.
@@ -207,7 +210,7 @@ export function reverse(input: string, output: string): void {
       pieces.push(piece);
     }
     const list = join(folder, "list.txt");
-    writeFileSync(list, pieces.reverse().map((p) => `file '${p}'`).join("\n"));
+    writeFileSync(list, pieces.reverse().map(concatLine).join("\n"));
     ffmpeg(["-f", "concat", "-safe", "0", "-i", list, "-vf", `fps=${fps || 30}`, output]);
   });
 }
@@ -251,7 +254,7 @@ export function overlay(
   const x = `${main.width * (o.x ?? 0.5)}-w/2`;
   const y = `${main.height * (o.y ?? 0.5)}-h/2`;
   const graph = `[1:v]${look}[layer];[0:v][layer]overlay=x=${x}:y=${y}:enable='between(t,${at},${end})':eof_action=pass,format=yuv420p[v]`;
-  ffmpeg(["-i", input, ...source, "-filter_complex", graph, "-map", "[v]", "-map", "0:a?", "-c:a", "copy", "-t", String(main.duration), output]);
+  ffmpeg(["-i", input, ...source, "-filter_complex", graph, "-map", "[v]", "-map", "0:a:0?", "-c:a", "copy", "-t", String(main.duration), output]);
 }
 
 // Make an animated GIF.
@@ -299,7 +302,7 @@ function applyGraph(input: string, output: string, graph: string): void {
   const picture = PICTURE_TYPES.test(output);
   const extra = picture
     ? ["-frames:v", "1", "-update", "1"]
-    : ["-map", "0:a?", "-c:a", "copy", "-pix_fmt", "yuv420p"];
+    : ["-map", "0:a:0?", "-c:a", "copy", "-pix_fmt", "yuv420p"];
   ffmpeg(["-i", input, "-filter_complex", graph, "-map", "[out]", ...extra, output]);
 }
 
@@ -374,7 +377,7 @@ export async function captions(
       transcript = join(folder, "words.json");
       await listen.transcribe(input, transcript, options.model ?? "base");
     }
-    const words = JSON.parse(readFileSync(requireFile(transcript), "utf8")).words ?? [];
+    const words = readJson(transcript).words ?? [];
     if (!words.length) throw new Error("The transcript has no words.");
     const overlay = join(folder, "captions.mov");
     const made = await graphics.captionsOverlay(words, overlay, {
@@ -390,7 +393,7 @@ export async function captions(
     ffmpeg([
       "-i", input, "-i", overlay,
       "-filter_complex", "[0:v][1:v]overlay=0:0:eof_action=pass[v]",
-      "-map", "[v]", "-map", "0:a?", "-c:a", "copy", "-pix_fmt", "yuv420p",
+      "-map", "[v]", "-map", "0:a:0?", "-c:a", "copy", "-pix_fmt", "yuv420p",
       output,
     ]);
     return { words: words.length, groups: made.groups };
@@ -447,7 +450,7 @@ export async function removeFillers(input: string, output: string, options: { tr
       transcript = join(folder, "words.json");
       await listen.transcribe(input, transcript, options.model ?? "base");
     }
-    return JSON.parse(readFileSync(requireFile(transcript), "utf8")).words ?? [];
+    return readJson(transcript).words ?? [];
   });
   const plain = (word: string) => word.toLowerCase().replace(/[^\p{L}\p{N}']/gu, "");
   const pauses = listen.speechPauses(listen.monoSamples(input, 16000));
@@ -547,67 +550,115 @@ export function reframe(input: string, output: string, aspect: string, x = 0.5, 
 // Crop to a new shape while following the main subject (a person, a product) as it moves (cutout model).
 // The subject is found every `every` seconds, its path is smoothed like a camera operator would,
 // and the crop glides along it. smooth: seconds of smoothing (bigger = calmer camera).
-export function reframeFollow(input: string, output: string, aspect: string, every = 0.5, smooth = 2) {
-  const { width, height, fps, duration } = info(input);
-  if (!width) throw new Error("This file has no picture.");
+export async function reframeFollow(input: string, output: string, aspect: string, every = 0.5, smooth = 2) {
+  const { duration } = requirePicture(input);
+  return withTempDir(async (folder) => {
+    const follow = await followFilter(input, aspect, folder, { every, smooth, from: 0, to: duration });
+    // ffmpeg runs inside the temp folder, so the filter names its command file without a "C:" path.
+    ffmpeg(["-i", resolve(input), "-vf", `${follow.filter},setsar=1`, "-map", "0:v", "-map", "0:a:0?", "-c:a", "copy", resolve(output)], folder);
+    return { width: follow.width, height: follow.height, samples: follow.path.length, cached: follow.cached, path: follow.path };
+  });
+}
+
+// Where the subject is (0..1 across and down) at times on a grid of `every` seconds, for a range of a video.
+// Saved per video in .joedit-cache/follow/ next to it: a retimed or re-trimmed shot reuses the samples it already has,
+// and only the missing part of the range is looked at (the cutout model is the slow part).
+export async function subjectPath(input: string, from: number, to: number, every = 0.5): Promise<{ centres: { time: number; x: number; y: number }[]; cached: number }> {
+  const stat = statSync(input);
+  const key = createHash("sha256").update(`${resolve(input)}|${stat.size}|${stat.mtimeMs}|${every}`).digest("hex").slice(0, 16);
+  const cacheFile = join(dirname(resolve(input)), ".joedit-cache", "follow", `${key}.json`);
+  let saved: Record<string, number[] | null> = {};
+  try {
+    saved = JSON.parse(readFileSync(cacheFile, "utf8"));
+  } catch {} // no samples yet (or a broken file): start fresh
+
+  // Grid times that cover the range, one step either side so the smoothing has context.
+  const first = Math.max(0, Math.floor(from / every) - 1);
+  const last = Math.ceil(to / every) + 1;
+  const times: number[] = [];
+  for (let k = first; k <= last; k++) times.push(round(k * every, 3));
+  const missing = times.filter((t) => !(String(t) in saved));
+  const cached = times.length - missing.length;
+
+  if (missing.length) {
+    // One pass over the missing span: small frames, one every `every` seconds, starting on the grid.
+    await withTempDir(async (folder) => {
+      const start = missing[0];
+      const span = missing[missing.length - 1] - start + every / 2;
+      ffmpeg(["-ss", String(start), "-t", String(span), "-i", input, "-vf", `fps=1/${every}:round=near,scale=384:-2`, join(folder, "%05d.png")]);
+      const frames = readdirSync(folder).filter((name) => name.endsWith(".png")).sort();
+      const { subjectMask } = await import("./picture.ts");
+      for (const [n, name] of frames.entries()) {
+        const { mask, width: w, height: h } = await subjectMask(join(folder, name)); // 255 = subject
+        let total = 0, sumX = 0, sumY = 0;
+        for (let i = 0; i < mask.length; i++) {
+          total += mask[i];
+          sumX += (mask[i] * ((i % w) + 0.5)) / w;
+          sumY += (mask[i] * (Math.floor(i / w) + 0.5)) / h;
+        }
+        // null = no subject here (it covers less than 0.2% of the frame)
+        saved[String(round(start + n * every, 3))] = total > 255 * w * h * 0.002 ? [round(sumX / total, 4), round(sumY / total, 4)] : null;
+      }
+    });
+    for (const t of missing) if (!(String(t) in saved)) saved[String(t)] = null; // past the end of the video
+    try {
+      mkdirSync(dirname(cacheFile), { recursive: true });
+      writeFileSync(cacheFile, JSON.stringify(saved));
+    } catch {} // a folder we cannot write to (a camera card, a shared drive): it works, just without the cache
+  }
+
+  // Frames with no subject keep the last centre (or the middle, before the subject first shows up).
+  let held = [0.5, 0.5];
+  const centres = times.map((time) => {
+    held = saved[String(time)] ?? held;
+    return { time, x: held[0], y: held[1] };
+  });
+  return { centres, cached };
+}
+
+// An ffmpeg filter that crops to `aspect` and follows the subject over from..to of the input.
+// Times in the filter start at 0 = `from` (the input is expected to be trimmed to from..to).
+// It writes follow.txt into `folder`: run ffmpeg with that folder as its working folder.
+export async function followFilter(input: string, aspect: string, folder: string, o: { from: number; to: number; every?: number; smooth?: number }) {
+  const { width, height, fps } = info(input);
+  const every = o.every ?? 0.5;
   const a = parseAspect(aspect);
   const cropW = Math.floor(Math.min(width, height * a) / 2) * 2;
   const cropH = Math.floor(Math.min(height, width / a) / 2) * 2;
+  const { centres, cached } = await subjectPath(input, o.from, o.to, every);
 
-  return withTempDir(async (folder) => {
-    // 1. Small frames, one every `every` seconds.
-    ffmpeg(["-i", input, "-vf", `fps=1/${every},scale=384:-2`, join(folder, "%05d.png")]);
-    const frames = readdirSync(folder).filter((name) => name.endsWith(".png")).sort().map((name) => join(folder, name));
-
-    // 2. The centre of the subject in each frame (0..1 across and down). Frames with no subject keep the last centre.
-    const { subjectMask } = await import("./picture.ts");
-    let last = [0.5, 0.5];
-    const centres: number[][] = [];
-    for (const frame of frames) {
-      const { mask, width: w, height: h } = await subjectMask(frame); // 255 = subject
-      let total = 0, sumX = 0, sumY = 0;
-      mask.forEach((v, i) => {
-        total += v;
-        sumX += (v * ((i % w) + 0.5)) / w;
-        sumY += (v * (Math.floor(i / w) + 0.5)) / h;
-      });
-      if (total > 255 * w * h * 0.002) last = [sumX / total, sumY / total]; // the subject covers at least 0.2% of the frame
-      centres.push(last);
-    }
-
-    // 3. Smooth the path with a moving average, then turn centres into crop corners kept inside the frame.
-    const reach = Math.max(1, Math.round(smooth / every / 2));
-    const corners = centres.map((_, k) => {
-      const near = centres.slice(Math.max(0, k - reach), k + reach + 1);
-      const cx = near.reduce((s, c) => s + c[0], 0) / near.length;
-      const cy = near.reduce((s, c) => s + c[1], 0) / near.length;
-      const x = Math.min(Math.max(cx * width - cropW / 2, 0), width - cropW);
-      const y = Math.min(Math.max(cy * height - cropH / 2, 0), height - cropH);
-      return { time: (k + 0.5) * every, x, y };
-    });
-
-    // 4. A crop position for every frame (straight lines between the samples), sent to ffmpeg's crop filter.
-    const lines: string[] = [];
-    for (let frame = 0; frame < Math.ceil(duration * fps); frame++) {
-      const t = frame / fps;
-      const after = corners.findIndex((c) => c.time >= t);
-      const b = corners[after === -1 ? corners.length - 1 : after];
-      const p = corners[Math.max(0, (after === -1 ? corners.length : after) - 1)];
-      const mix = b.time === p.time ? 0 : (t - p.time) / (b.time - p.time);
-      const x = Math.round(p.x + (b.x - p.x) * Math.min(Math.max(mix, 0), 1));
-      const y = Math.round(p.y + (b.y - p.y) * Math.min(Math.max(mix, 0), 1));
-      lines.push(`${t.toFixed(4)} crop@follow x ${x}, crop@follow y ${y};`);
-    }
-    const commands = join(folder, "follow.txt");
-    writeFileSync(commands, lines.join("\n"));
-    const start = corners[0];
-    ffmpeg([
-      "-i", input,
-      "-vf", `sendcmd=f='${commands}',crop@follow=${cropW}:${cropH}:${Math.round(start.x)}:${Math.round(start.y)},setsar=1`,
-      "-c:a", "copy", output,
-    ]);
-    return { width: cropW, height: cropH, samples: corners.length, path: corners.map((c) => ({ time: round(c.time), x: Math.round(c.x), y: Math.round(c.y) })) };
+  // Smooth the path with a moving average (like a calm camera operator), then keep the crop inside the frame.
+  const reach = Math.max(1, Math.round((o.smooth ?? 2) / every / 2));
+  const corners = centres.map((c, k) => {
+    const near = centres.slice(Math.max(0, k - reach), k + reach + 1);
+    const cx = near.reduce((s, n) => s + n.x, 0) / near.length;
+    const cy = near.reduce((s, n) => s + n.y, 0) / near.length;
+    return {
+      time: c.time - o.from,
+      x: Math.min(Math.max(cx * width - cropW / 2, 0), width - cropW),
+      y: Math.min(Math.max(cy * height - cropH / 2, 0), height - cropH),
+    };
   });
+
+  // A crop position for every frame (straight lines between the samples), sent to ffmpeg's crop filter.
+  const lines: string[] = [];
+  for (let frame = 0; frame < Math.ceil((o.to - o.from) * fps); frame++) {
+    const t = frame / fps;
+    const after = corners.findIndex((c) => c.time >= t);
+    const b = corners[after === -1 ? corners.length - 1 : after];
+    const p = corners[Math.max(0, (after === -1 ? corners.length : after) - 1)];
+    const mix = b.time === p.time ? 0 : Math.min(Math.max((t - p.time) / (b.time - p.time), 0), 1);
+    lines.push(`${t.toFixed(4)} crop@follow x ${Math.round(p.x + (b.x - p.x) * mix)}, crop@follow y ${Math.round(p.y + (b.y - p.y) * mix)};`);
+  }
+  writeFileSync(join(folder, "follow.txt"), lines.join("\n"));
+  const start = lines.length ? corners.find((c) => c.time >= 0) ?? corners[0] : corners[0];
+  return {
+    filter: `sendcmd=f=follow.txt,crop@follow=${cropW}:${cropH}:${Math.round(start.x)}:${Math.round(start.y)}`,
+    width: cropW,
+    height: cropH,
+    cached,
+    path: corners.filter((c) => c.time >= 0 && c.time <= o.to - o.from).map((c) => ({ time: round(c.time), x: Math.round(c.x), y: Math.round(c.y) })),
+  };
 }
 
 // Make a short clip from a description, or bring a picture to life (videogen pack: Wan 2.2 TI2V-5B).
@@ -643,7 +694,7 @@ export function pip(main: string, small: string, output: string, corner = "botto
   const position = positions[corner];
   if (!position) throw new Error(`--corner must be one of: ${Object.keys(positions).join(", ")}`);
   const graph = `[1:v]scale=${w}:-2,setsar=1[s];[0:v][s]overlay=${position}:eof_action=pass[v]`;
-  ffmpeg(["-i", main, "-i", small, "-filter_complex", graph, "-map", "[v]", "-map", "0:a?", "-c:a", "copy", "-pix_fmt", "yuv420p", output]);
+  ffmpeg(["-i", main, "-i", small, "-filter_complex", graph, "-map", "[v]", "-map", "0:a:0?", "-c:a", "copy", "-pix_fmt", "yuv420p", output]);
 }
 
 // Smooth slow motion or higher frame rates by inventing in-between frames (motion interpolation).

@@ -38,16 +38,16 @@ type Target = { id: number; texture: Texture; depth: Texture };
 
 let g: any; // raylib and OpenGL functions, loaded on first use
 
-// The raylib library file for this system (joEdit ships the macOS one in libs/raylib).
-export function raylibFile(): string {
-  const name = process.platform === "darwin" ? "libraylib.dylib" : process.platform === "win32" ? "raylib.dll" : "libraylib.so";
+// The raylib 6.2 library file for this system. libs/raylib has macOS (Intel and Apple), Windows x64 and Linux x64/arm64.
+export function raylibFile(platform = process.platform, arch = process.arch): string {
+  const name = platform === "darwin" ? "libraylib.dylib" : platform === "win32" ? "raylib.dll" : arch === "arm64" ? "libraylib-arm64.so" : "libraylib.so";
   return join(LIBS, "raylib", name);
 }
 
 function engine(): any {
   if (g) return g;
   const file = raylibFile();
-  if (!existsSync(file)) throw new Error(`GPU effects need raylib 6 at ${file}. joEdit includes the macOS build; on this system place ${basename(file)} there.`);
+  if (!existsSync(file)) throw new Error(`GPU effects need raylib 6.2 at ${file}. joEdit includes macOS, Windows x64 and Linux builds; for this system place ${basename(file)} there.`);
   const koffi = need("koffi");
   const ray = koffi.load(file);
   const glFile = process.platform === "darwin" ? "/System/Library/Frameworks/OpenGL.framework/OpenGL" : process.platform === "win32" ? "opengl32.dll" : "libGL.so.1";
@@ -73,20 +73,38 @@ function engine(): any {
   const api: any = {};
   for (const signature of functions) api[signature.match(/(\w+)\(/)![1]] = ray.func(signature);
   // OpenGL: read pixels back, and compile shaders to get readable error messages.
-  for (const signature of [
-    "void glReadPixels(int, int, int, int, uint, uint, _Out_ uint8 *)", "uint glCreateShader(uint)",
-    "void glShaderSource(uint, int, const char **, const int *)", "void glCompileShader(uint)", "void glGetShaderiv(uint, uint, _Out_ int *)",
-    "void glGetShaderInfoLog(uint, int, _Out_ int *, _Out_ uint8 *)", "void glDeleteShader(uint)",
-  ]) {
-    api[signature.match(/(\w+)\(/)![1]] = gl.func(signature);
-  }
+  api.glReadPixels = gl.func("void glReadPixels(int, int, int, int, uint, uint, _Out_ uint8 *)");
+  const shaderFunctions = [
+    "uint glCreateShader(uint)", "void glShaderSource(uint, int, const char **, const int *)", "void glCompileShader(uint)",
+    "void glGetShaderiv(uint, uint, _Out_ int *)", "void glGetShaderInfoLog(uint, int, _Out_ int *, _Out_ uint8 *)", "void glDeleteShader(uint)",
+  ];
+  if (process.platform !== "win32") for (const signature of shaderFunctions) api[signature.match(/(\w+)\(/)![1]] = gl.func(signature);
   api.SetTraceLogLevel(5); // only errors
   api.SetConfigFlags(0x80); // hidden window
   api.InitWindow(320, 180, "joEdit fx");
-  if (!api.IsWindowReady()) throw new Error("Could not start the GPU: raylib found no OpenGL 3.3 graphics.");
+  if (!api.IsWindowReady()) {
+    const linux = process.platform === "linux" ? " On Linux it needs a display (X11 or Wayland with Xwayland; on a server run under xvfb-run)." : "";
+    throw new Error(`Could not start the GPU: raylib found no OpenGL 3.3 graphics.${linux}`);
+  }
+  if (process.platform === "win32") {
+    // opengl32.dll only has OpenGL 1.1. The newer functions come from the graphics driver, once the window exists.
+    const lookup = gl.func("void *wglGetProcAddress(str)");
+    for (const signature of shaderFunctions) Object.assign(api, driverFunction(koffi, signature, lookup));
+  }
   api.rlDisableColorBlend(); // shaders write their colors as they are (keeps transparency)
   g = api;
   return g;
+}
+
+// A function the graphics driver gives as an address (Windows OpenGL): `lookup(name)` returns the address,
+// and koffi turns it into a function with the signature. Returns { name: function }.
+export function driverFunction(koffi: any, signature: string, lookup: (name: string) => any): Record<string, any> {
+  const name = signature.match(/(\w+)\(/)![1];
+  const address = lookup(name);
+  // wglGetProcAddress can answer 0, 1, 2, 3 or -1 for "not found".
+  const value = address ? BigInt.asIntN(64, koffi.address(address)) : 0n;
+  if (value >= -1n && value <= 3n) throw new Error(`The graphics driver has no ${name}. Update the graphics driver (OpenGL 3.3 is needed).`);
+  return { [name]: koffi.decode(address, koffi.proto(signature.replace(name, `${name}_driver`))) };
 }
 
 const shaders = new Map<string, any>(); // compiled shaders by source
@@ -239,8 +257,8 @@ const EFFECTS: Record<string, Effect> = {
   // ----- looks -----
   bloom: {
     kind: "look",
-    does: "bright parts glow",
-    settings: { threshold: 0.6, radius: 16, strength: 1.2 },
+    does: "bright parts glow (bright footage: lower strength or raise threshold)",
+    settings: { threshold: 0.7, radius: 16, strength: 0.8 },
     glsl: `vec4 effect(vec2 uv) {
   vec4 c = pixel(uv);
   vec3 glow = vec3(0.0);
@@ -445,8 +463,8 @@ const EFFECTS: Record<string, Effect> = {
   },
   "light-leak": {
     kind: "look",
-    does: "warm light drifting across the picture",
-    settings: { speed: 1, strength: 0.6 },
+    does: "warm light drifting across the picture (bright footage: lower strength)",
+    settings: { speed: 1, strength: 0.4 },
     glsl: `vec4 effect(vec2 uv) {
   vec4 c = pixel(uv);
   vec3 light = vec3(0.0);
