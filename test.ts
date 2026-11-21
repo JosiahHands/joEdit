@@ -7,13 +7,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test, before, after, describe } from "node:test";
 import assert from "node:assert/strict";
-import * as picture from "./lib/picture.ts";
-import * as video from "./lib/video.ts";
-import * as sound from "./lib/sound.ts";
-import * as graphics from "./lib/graphics.ts";
-import * as threeD from "./lib/3d.ts";
-import * as fx from "./lib/fx.ts";
-import { FFMPEG, concatLine, isModelInstalled, need, probe, readFrames, readJson, writeVideo } from "./lib/shared.ts";
+import * as picture from "./lib/areas/picture.ts";
+import * as video from "./lib/areas/video.ts";
+import * as sound from "./lib/areas/sound.ts";
+import * as graphics from "./lib/areas/graphics.ts";
+import * as threeD from "./lib/areas/3d.ts";
+import * as fx from "./lib/areas/fx.ts";
+import * as music from "./lib/areas/music.ts";
+import { FFMPEG, concatLine, isModelInstalled, need, probe, readFrames, readJson, writeVideo } from "./lib/core/shared.ts";
 
 type Tool = "picture" | "video" | "sound" | "look" | "listen" | "graphics" | "fx" | "movie" | "voice" | "music" | "3d" | "joedit";
 
@@ -50,9 +51,9 @@ const hasBlender = (() => {
 const dir = mkdtempSync(join(tmpdir(), "editor-test-"));
 const file = (name: string) => join(dir, name);
 
-// Run a CLI the same way an AI would: node lib/<tool>.ts <command> ...
+// Run a CLI the same way an AI would: node lib/joedit.ts ... or an area on its own, node lib/areas/<tool>.ts <command> ...
 function cli(tool: Tool, args: string[]) {
-  const result = spawnSync("node", [`lib/${tool}.ts`, ...args], { encoding: "utf8" });
+  const result = spawnSync("node", [tool === "joedit" ? "lib/joedit.ts" : `lib/areas/${tool}.ts`, ...args], { encoding: "utf8" });
   return { code: result.status, stdout: result.stdout, stderr: result.stderr };
 }
 
@@ -672,8 +673,36 @@ describe("video", () => {
   });
 
   test("interpolate raises the frame rate", () => {
-    ok("video", ["interpolate", file("silent.mp4"), file("smooth.mp4"), "--fps", "60"]);
+    const result = JSON.parse(ok("video", ["interpolate", file("silent.mp4"), file("smooth.mp4"), "--fps", "60", "--method", "motion"]));
+    assert.equal(result.method, "motion");
     assert.equal(video.info(file("smooth.mp4")).fps, 60);
+  });
+
+  test("interpolate with AI (RIFE) keeps the length and the sound", (t) => {
+    if (!hasAsset("interpolator")) return t.skip("interpolator asset not installed");
+    const result = JSON.parse(ok("video", ["interpolate", file("in.mp4"), file("smooth-ai.mp4"), "--fps", "48"]));
+    assert.equal(result.method, "ai");
+    const made = video.info(file("smooth-ai.mp4"));
+    assert.equal(made.fps, 48);
+    near(made.duration, video.info(file("in.mp4")).duration, 0.1);
+    assert.equal(made.hasAudio, true);
+  });
+
+  test("upscale makes a video bigger with AI detail, keeping its sound", (t) => {
+    if (!hasAsset("upscaler")) return t.skip("upscaler asset not installed");
+    const result = JSON.parse(ok("video", ["upscale", file("in.mp4"), file("big.mp4"), "--width", "640", "--style", "fast"]));
+    const made = video.info(file("big.mp4"));
+    assert.deepEqual([made.width, made.height, result.style], [640, 480, "fast"]); // in.mp4 is 4:3
+    assert.equal(made.hasAudio, true);
+    assert.equal(cli("video", ["upscale", file("in.mp4"), file("x.mp4"), "--width", "100"]).code, 1); // not bigger
+  });
+
+  test("generate makes a clip from a description on this GPU (needs the videogen pack)", (t) => {
+    if (!hasPack("videogen")) return t.skip("videogen pack not installed");
+    const result = JSON.parse(ok("video", ["generate", file("gen.mp4"), "--prompt", "waves rolling onto a beach at sunset", "--seconds", "1", "--width", "256", "--height", "256", "--seed", "1", "--upscale", "none"]));
+    assert.deepEqual([result.frames, result.width, result.height], [25, 256, 256]);
+    assert.ok(["full", "gpu", "offload", "small", "mps", "cpu"].includes(result.memory));
+    near(video.info(file("gen.mp4")).duration, 1.04, 0.05);
   });
 
   test("captions from a transcript appear at the bottom", () => {
@@ -1039,6 +1068,83 @@ describe("music", () => {
     assert.equal(execFileSync("head", ["-c", "4", file("score.mid")], { encoding: "utf8" }), "MThd");
   });
 
+  // Read the note-on times (in beats) of one MIDI channel, optionally only one note number.
+  const onsets = (midi: Buffer, channel: number, pitch?: number) => {
+    const times: number[] = [];
+    for (let at = 14; at < midi.length; ) {
+      const end = at + 8 + midi.readUInt32BE(at + 4);
+      let i = at + 8, ticks = 0, status = 0;
+      const varLength = () => { let v = 0, b; do { b = midi[i++]; v = (v << 7) | (b & 0x7f); } while (b & 0x80); return v; };
+      while (i < end) {
+        ticks += varLength();
+        if (midi[i] & 0x80) status = midi[i++];
+        if (status === 0xff) { i++; i += varLength(); continue; }
+        const kind = status & 0xf0, size = kind === 0xc0 || kind === 0xd0 ? 1 : 2;
+        if (kind === 0x90 && (status & 0x0f) === channel && midi[i + 1] > 0 && (pitch === undefined || midi[i] === pitch)) times.push(ticks / 480);
+        i += size;
+      }
+      at = end;
+    }
+    return times.sort((a, b) => a - b);
+  };
+
+  test("sections: parts play only in their sections, the drums fill into the chorus and stop before the drop", () => {
+    const song = {
+      tempo: 120, feel: "exact" as const, drums: { style: "rock" },
+      sections: [
+        { name: "verse", bars: 2, energy: 2 },
+        { name: "chorus", bars: 2, energy: 4 },
+        { name: "drop", bars: 2, into: "stop" as const, drums: "four-on-floor" },
+      ],
+      tracks: [{ instrument: "piano", chords: "C G", rhythm: "block" }, { instrument: "lead", melody: "E5 G5 C6 G5", sections: ["chorus"] }],
+    };
+    const { midi, beats } = music.scoreToMidi(song);
+    assert.equal(beats, 24);
+    const lead = onsets(midi, 1);
+    assert.ok(lead.length && lead.every((t) => t >= 8 && t < 16), `lead only in the chorus: ${lead}`);
+    assert.ok(onsets(midi, 0).some((t) => t < 8) && onsets(midi, 0).some((t) => t >= 16), "the piano plays everywhere");
+    assert.deepEqual(onsets(midi, 9, 45).length, 2, "a tom fill (low toms) going up into the louder chorus");
+    assert.ok(onsets(midi, 9).every((t) => t < 15 || t >= 16), "the beat before the drop is silent");
+    assert.ok(onsets(midi, 0).every((t) => t < 15 || t >= 16));
+    assert.deepEqual(onsets(midi, 9, 49), [0, 8, 16], "a crash on each new section");
+  });
+
+  test("master: every preset lands on its loudness with peaks under -1 dB; a riser builds into the drop", (t) => {
+    if (!hasInstruments()) return t.skip("instruments asset missing");
+    const song = (master: unknown) => ({
+      tempo: 128, master,
+      sections: [{ name: "build", bars: 2, drums: "halftime" }, { name: "drop", bars: 2, energy: 5, into: "build" }],
+      tracks: [{ instrument: "synth bass", chords: "Am F", rhythm: "bass" }, { instrument: "pad", chords: "Am F" }],
+      drums: { style: "four-on-floor" },
+    });
+    for (const [master, lufs] of [["edm", -14], ["cinematic", -16]] as const) {
+      writeFileSync(file("master.json"), JSON.stringify(song(master)));
+      ok("music", ["compose", file("master.json"), file("master.wav"), "--stems", file("master-stems")]);
+      const level = JSON.parse(ok("listen", ["loudness", file("master.wav")]));
+      assert.ok(Math.abs(level.lufs - lufs) < 0.6 && level.peak <= -0.9, `${master}: ${level.lufs} LUFS, peak ${level.peak}`);
+    }
+    const [riser] = sound.decode(file("master-stems/riser.wav"));
+    const at = (s: number) => Math.max(...riser.subarray(Math.round(s * 48000), Math.round((s + 0.2) * 48000)).map(Math.abs));
+    const drop = (8 * 60) / 128; // the drop starts after 2 bars
+    assert.ok(at(drop - 0.25) > 4 * at(drop - 2.5) && at(drop + 0.05) === 0, "the riser swells and stops on the drop");
+    writeFileSync(file("master.json"), JSON.stringify(song("loud")));
+    assert.match(cli("music", ["compose", file("master.json"), file("master.wav")]).stderr, /Unknown master "loud"/);
+  });
+
+  test("feel: swing moves the off-beats, natural playing drifts a few ms, the same seed plays the same", () => {
+    const groove = { tempo: 120, bars: 2, drums: { style: "rock" }, tracks: [{ instrument: "piano", chords: "C G", rhythm: "pulse" as const }] };
+    const exact = onsets(music.scoreToMidi({ ...groove, feel: "exact" }).midi, 0);
+    assert.ok(exact.every((t) => Math.abs(t * 2 - Math.round(t * 2)) < 1e-9), "exact stays on the 8th-note grid");
+    const swung = onsets(music.scoreToMidi({ ...groove, feel: "exact", swing: 0.66 }).midi, 0);
+    assert.ok(swung.some((t) => Math.abs((t % 1) - 0.66) < 0.01), "swing pushes the off-beat to 2/3 of the beat");
+    const natural = onsets(music.scoreToMidi({ ...groove, feel: "natural" }).midi, 0);
+    const drift = natural.map((t, k) => Math.abs(t - exact[k]) * 500); // in ms at 120 BPM
+    assert.ok(Math.max(...drift) > 0.5 && Math.max(...drift) < 30, `drift ${Math.max(...drift)} ms`);
+    assert.deepEqual(music.scoreToMidi({ ...groove, seed: 3 }).midi, music.scoreToMidi({ ...groove, seed: 3 }).midi);
+    assert.notDeepEqual(music.scoreToMidi({ ...groove, seed: 3 }).midi, music.scoreToMidi({ ...groove, seed: 4 }).midi);
+    assert.equal(music.scoreToMidi({ ...groove, feel: "loose" }).beats, 8, "feel never changes the length");
+  });
+
   test("compose plays the score in time (needs the instruments asset)", (t) => {
     if (!hasInstruments()) return t.skip("instruments asset missing");
     writeFileSync(file("score.json"), JSON.stringify(score));
@@ -1100,6 +1206,69 @@ describe("music", () => {
     const cuts = JSON.parse(ok("look", ["scenes", file("music-movie.mp4")])).cuts;
     assert.equal(cuts.length, 2);
     for (const cut of cuts) assert.ok(Math.abs(cut - Math.round(cut * 2) / 2) < 0.05, `cut at ${cut} is not on a beat`);
+  });
+
+  test("review hears a flat, mono, abrupt track and says how to fix it", () => {
+    // 24 seconds of the same mono chord at one level, cut off at full volume.
+    execFileSync(FFMPEG, ["-loglevel", "error", "-y", "-f", "lavfi", "-i", "sine=f=220:d=24", "-f", "lavfi", "-i", "sine=f=330:d=24",
+      "-filter_complex", "amix=inputs=2,volume=4", "-ac", "2", file("flat.wav")]);
+    const result = JSON.parse(ok("music", ["review", file("flat.wav")]));
+    const problems = result.issues.map((i: any) => i.problem).join(" | ");
+    for (const hint of [/mono/, /flat/, /abrupt/, /thin low end/]) assert.match(problems, hint);
+    assert.ok(result.score <= 5, JSON.stringify(result));
+    assert.ok(result.issues.every((i: any) => i.fix.length > 10));
+    // Against itself as the reference, the tonal balance is fine.
+    const same = JSON.parse(ok("music", ["review", file("flat.wav"), "--reference", file("flat.wav")]));
+    assert.doesNotMatch(same.issues.map((i: any) => i.problem).join(" | "), /thin|muddy|dull|harsh|air/);
+  });
+
+  test("every starter score composes, and sounds finished", (t) => {
+    const names = JSON.parse(ok("music", ["starters"])).starters.map((s: { name: string }) => s.name);
+    assert.equal(names.length, 10);
+    for (const name of names) {
+      ok("music", ["starter", name, file(`starter-${name}.json`)]);
+      ok("music", ["compose", file(`starter-${name}.json`), file(`starter-${name}.mid`)]);
+    }
+    if (!hasInstruments()) return t.skip("instruments asset missing (the MIDI files were made)");
+    for (const name of ["pop", "edm", "jazz"]) {
+      ok("music", ["compose", file(`starter-${name}.json`), file(`starter-${name}.wav`)]);
+      const review = JSON.parse(ok("music", ["review", file(`starter-${name}.wav`)]));
+      assert.ok(review.score >= 8, `${name}: ${review.score} ${review.verdict}`);
+    }
+  });
+
+  test("sounds: a score can play with MuseScore General or any SoundFont file", (t) => {
+    if (!existsSync(join("lib", ".assets", "instruments", "MuseScore_General.sf3"))) return t.skip("MuseScore General not installed");
+    const tune = { tempo: 120, tracks: [{ instrument: "piano", melody: "C5 E5 G5 C6" }] };
+    writeFileSync(file("sounds.json"), JSON.stringify({ ...tune, sounds: "musescore" }));
+    ok("music", ["compose", file("sounds.json"), file("sounds-musescore.wav")]);
+    writeFileSync(file("sounds.json"), JSON.stringify({ ...tune, sounds: join("lib", ".assets", "instruments", "GeneralUser-GS.sf2") }));
+    ok("music", ["compose", file("sounds.json"), file("sounds-file.wav")]);
+    assert.ok(Math.abs(sound.info(file("sounds-musescore.wav")).duration - sound.info(file("sounds-file.wav")).duration) < 0.1);
+    writeFileSync(file("sounds.json"), JSON.stringify({ ...tune, sounds: "nope" }));
+    assert.match(cli("music", ["compose", file("sounds.json"), file("x.wav")]).stderr, /Unknown sounds "nope"/);
+  });
+
+  test("sing and repaint explain what they need", () => {
+    writeFileSync(file("lyrics.txt"), "[verse]\nla la la");
+    assert.match(cli("music", ["sing", file("missing.wav"), file("x.wav"), "--lyrics", file("lyrics.txt"), "--prompt", "pop vocal"]).stderr, /not found/i);
+    assert.match(cli("music", ["repaint", file("lyrics.txt"), file("x.wav"), "--start", "4", "--end", "2", "--prompt", "x"]).stderr, /--end must be after --start/);
+    assert.match(cli("music", ["song", file("x.wav"), "--prompt", "x", "--model", "huge"]).stderr, /--model must be one of/);
+    assert.match(cli("music", ["song", file("x.wav"), "--prompt", "x", "--takes", "20"]).stderr, /--takes is 1 to 8/);
+  });
+
+  test("sing puts a voice on a composed instrumental, which keeps its length (needs the song pack's base model)", (t) => {
+    if (!hasPack("song") || !existsSync(join("lib", ".packs", "song", "checkpoints", "acestep-v15-base"))) return t.skip("song base model not installed");
+    if (!hasInstruments()) return t.skip("instruments asset missing");
+    ok("music", ["starter", "pop", file("sing.json")]);
+    const score = readJson(file("sing.json"));
+    writeFileSync(file("sing.json"), JSON.stringify({ ...score, sections: score.sections.map((s: object) => ({ ...s, bars: 2 })) })); // about 28 s
+    ok("music", ["compose", file("sing.json"), file("beat.wav")]);
+    writeFileSync(file("sing-lyrics.txt"), "[verse]\nWalking down the open road\n[chorus]\nWe are home tonight");
+    const result = JSON.parse(ok("music", ["sing", file("beat.wav"), file("sung.wav"), "--lyrics", file("sing-lyrics.txt"), "--prompt", "warm female pop vocal", "--vocals", file("voice.wav"), "--seed", "1"]));
+    near(sound.info(file("sung.wav")).duration, sound.info(file("beat.wav")).duration, 0.5);
+    assert.equal(result.model, "base");
+    assert.ok(existsSync(file("voice.wav")));
   });
 
   test("song makes music from a description (needs the song pack)", (t) => {
@@ -1997,7 +2166,24 @@ describe("joedit", () => {
     assert.equal(result.ready, true);
     assert.ok(result.tools.find((t: any) => t.name === "ffmpeg").found);
     assert.ok(result.machine.cores > 0);
+    // Memory decides which AI settings fit: RAM, GPU memory (0 without a GPU) and free disk are reported.
+    assert.ok(result.machine.memoryGB > 0 && result.machine.gpuMemoryGB >= 0 && result.machine.diskFreeGB > 0, JSON.stringify(result.machine));
     assert.ok(Array.isArray(result.packs));
+  });
+
+  test("--background runs any command as a job that jobs wait answers", async () => {
+    const started = JSON.parse(ok("joedit", ["picture", "info", file("in.png"), "--background"]));
+    assert.match(started.job, /^\d{4}-\d\d-\d\d-\w+$/);
+    const { job } = JSON.parse(ok("joedit", ["jobs", "wait", started.job, "--timeout", "60"]));
+    assert.equal(job.state, "done", JSON.stringify(job));
+    assert.deepEqual([job.result.width, job.result.height], [400, 300]);
+    assert.ok(JSON.parse(ok("joedit", ["jobs", "list"])).jobs.some((j: any) => j.id === started.job));
+    // A failing command is a failed job, with the reason.
+    const failing = JSON.parse(ok("joedit", ["picture", "info", file("missing.png"), "--background"]));
+    const failed = JSON.parse(ok("joedit", ["jobs", "wait", failing.job, "--timeout", "60"])).job;
+    assert.equal(failed.state, "failed");
+    assert.match(failed.error, /not found/i);
+    assert.equal(cli("joedit", ["jobs", "wait", "no-such-job"]).code, 1);
   });
 
   test("check finds black frames and suggests the exact trim", () => {
@@ -2030,7 +2216,7 @@ describe("joedit", () => {
   test("every command of every area is reachable through joedit.ts", async () => {
     const help = ok("joedit", []);
     for (const area of ["picture", "video", "sound", "look", "listen", "graphics", "fx", "movie", "voice", "music", "3d"]) {
-      const { commands } = await import(`./lib/${area}.ts`);
+      const { commands } = await import(`./lib/areas/${area}.ts`);
       for (const [name, command] of Object.entries(commands) as [string, { usage: string }][]) {
         assert.ok(help.includes(`  ${area} ${command.usage}`), `${area} ${name} is missing from node joedit.ts`);
       }

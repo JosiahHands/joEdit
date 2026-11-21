@@ -3,8 +3,8 @@
 //        node joedit.ts doctor | check <file> | packs | install <model, asset or pack>
 //        node joedit.ts            (lists every command)
 // This file also holds the top-level commands: doctor and check.
-import { cpus, totalmem } from "node:os";
-import { existsSync } from "node:fs";
+import { cpus, tmpdir } from "node:os";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   DEFAULT_FONT,
@@ -15,10 +15,18 @@ import {
   analyze,
   closest,
   formatTime,
+  cancelJob,
+  hardware,
+  hasProgram,
   install,
   listAssets,
+  listJobs,
   listModels,
   listPacks,
+  optionalNumberFlag,
+  packWorker,
+  stopWorkers,
+  waitJob,
   probe,
   readJson,
   requireFile,
@@ -26,18 +34,18 @@ import {
   run,
   runCli,
   type Command,
-} from "./shared.ts";
-import * as fx from "./fx.ts";
-import * as graphics from "./graphics.ts";
-import * as listen from "./listen.ts";
-import * as threeD from "./3d.ts";
-import * as look from "./look.ts";
-import * as movie from "./movie.ts";
-import * as music from "./music.ts";
-import * as picture from "./picture.ts";
-import * as sound from "./sound.ts";
-import * as video from "./video.ts";
-import * as voice from "./voice.ts";
+} from "./core/shared.ts";
+import * as fx from "./areas/fx.ts";
+import * as graphics from "./areas/graphics.ts";
+import * as listen from "./areas/listen.ts";
+import * as threeD from "./areas/3d.ts";
+import * as look from "./areas/look.ts";
+import * as movie from "./areas/movie.ts";
+import * as music from "./areas/music.ts";
+import * as picture from "./areas/picture.ts";
+import * as sound from "./areas/sound.ts";
+import * as video from "./areas/video.ts";
+import * as voice from "./areas/voice.ts";
 
 // Each area is a group of commands: node joedit.ts <area> <command>.
 const areas: Record<string, Record<string, Command>> = {
@@ -67,11 +75,26 @@ function versionOf(program: string, args: string[]): string {
   }
 }
 
-// Describe the graphics chip, which decides how fast AI packs can run.
-function gpu(): string {
-  if (process.platform === "darwin" && process.arch === "arm64") return "Apple Silicon (fast for AI packs)";
-  const nvidia = versionOf("nvidia-smi", ["--query-gpu=name", "--format=csv,noheader"]);
-  return nvidia ? `NVIDIA ${nvidia}` : "none found (AI packs will run on the CPU, slower)";
+// Describe the graphics chip and memory, which decide how fast (and how big) AI packs can run.
+function machine() {
+  const h = hardware();
+  const note = h.unified
+    ? "Apple Silicon: the GPU shares the RAM, fast for AI packs"
+    : h.vramGB
+      ? `${h.vramGB} GB GPU memory; packs move parts of big models to RAM when they don't fit, so RAM matters too`
+      : "no GPU found: AI packs run on the CPU, slower";
+  return {
+    system: `${process.platform} ${process.arch}`,
+    cpu: cpus()[0]?.model ?? "unknown",
+    cores: cpus().length,
+    memoryGB: h.ramGB,
+    ...(h.freeRamGB !== undefined ? { freeMemoryGB: h.freeRamGB } : {}),
+    gpu: h.gpu,
+    gpuMemoryGB: h.vramGB,
+    ...(h.freeVramGB !== undefined ? { freeGpuMemoryGB: h.freeVramGB } : {}),
+    diskFreeGB: h.diskFreeGB,
+    note,
+  };
 }
 
 // Chrome renders HTML pages (graphics render/still, movie scenes with "html"). Titles, captions and canvas use Skia.
@@ -170,13 +193,7 @@ export function doctor() {
       ? { found: false, missing: missingLibraries.map((l) => l.name), fix: `cd ${LIB} && npm install` }
       : { found: true, list: libraries.map((l) => `${l.name} ${l.version}: ${l.does}`) },
     optional,
-    machine: {
-      system: `${process.platform} ${process.arch}`,
-      cpu: cpus()[0]?.model ?? "unknown",
-      cores: cpus().length,
-      memoryGB: round(totalmem() / 1024 ** 3, 1),
-      gpu: gpu(),
-    },
+    machine: machine(),
     models: listModels(),
     assets: listAssets(),
     packs: listPacks(),
@@ -269,6 +286,60 @@ export function check(file: string, moments?: PictureMoments): Report {
   return { passed: problems.length === 0, duration: round(duration), hasVideo, hasAudio, problems, notes };
 }
 
+// ---------- bench: how fast are the AI packs on this computer? ----------
+
+// One fixed job per installed pack, run twice: "cold" (the models load first) and "warm" (the worker has them).
+// Reports time, peak RAM and (on NVIDIA) peak GPU memory, so changes and computers can be compared.
+export async function bench(only: string[] = [], output = "") {
+  const packs = listPacks().filter((p) => p.installed && (!only.length || only.includes(p.name)));
+  const unknown = only.filter((name) => !listPacks().some((p) => p.name === name));
+  if (unknown.length) throw new Error(`Unknown pack ${unknown.join(", ")}. Packs: ${listPacks().map((p) => p.name).join(", ")}`);
+  const folder = mkdtempSync(join(tmpdir(), "joedit-bench-"));
+  const file = (name: string) => join(folder, name);
+  // A 20-second mix of a tone and noise, for packs that need a sound to work on.
+  const mix = file("mix.wav");
+  run("ffmpeg", ["-loglevel", "error", "-y", "-f", "lavfi", "-i", "sine=f=220:d=20", "-f", "lavfi", "-i", "anoisesrc=d=20:a=0.05", "-filter_complex", "amix=inputs=2", "-ac", "2", mix]);
+  const jobs: Record<string, { job: string; run: (n: number) => Promise<any> }> = {
+    image: { job: "768x768 picture", run: (n) => picture.generate(file(`picture-${n}.png`), "a lighthouse on a cliff at dawn, film photo", { width: 768, height: 768, seed: n }) },
+    song: { job: "30 s instrumental song", run: (n) => music.song(file(`song-${n}.wav`), "upbeat indie pop, guitar, drums, bass", { duration: 30, seed: n }) },
+    stems: { job: "split 20 s of sound", run: (n) => voice.stems(mix, file(`stems-${n}`)) },
+    clone: {
+      job: "one cloned sentence",
+      run: async (n) => {
+        if (!existsSync(file("voice.wav"))) await voice.speak(file("voice.wav"), "This is a short sample of a speaking voice, used to measure how fast cloning runs.", { engine: hasProgram("say") ? "say" : "kokoro" });
+        return voice.clone(file(`clone-${n}.wav`), file("voice.wav"), "Every computer can make something wonderful.", "a synthetic voice made by joEdit bench, no person's voice");
+      },
+    },
+    videogen: { job: "5 s clip, 832x480", run: (n) => video.generate(file(`clip-${n}.mp4`), "waves rolling onto a beach at sunset", { seconds: 5, width: 832, height: 480, seed: n }) },
+  };
+  stopWorkers(); // start cold
+  const results = [];
+  try {
+    for (const { name } of packs) {
+      const bench = jobs[name];
+      if (!bench) continue;
+      const runs = [];
+      for (const [n, kind] of ["cold", "warm"].entries()) {
+        const started = Date.now();
+        try {
+          const result = await bench.run(n + 1);
+          runs.push({ kind, seconds: round((Date.now() - started) / 1000, 1), workSeconds: result.seconds, loadSeconds: result.loadSeconds, ramGb: result.ramGb, vramGb: result.vramGb });
+        } catch (error: any) {
+          runs.push({ kind, error: error.message.split("\n")[0] });
+          break;
+        }
+      }
+      results.push({ pack: name, job: bench.job, runs });
+      stopWorkers(); // free its memory before the next pack
+    }
+  } finally {
+    rmSync(folder, { recursive: true, force: true });
+  }
+  const report = { date: new Date().toISOString(), machine: machine(), results };
+  if (output) writeFileSync(output, JSON.stringify(report, null, 2));
+  return report;
+}
+
 // ---------- the CLI ----------
 
 // Top-level commands: node joedit.ts <command>.
@@ -276,7 +347,23 @@ const tools: Record<string, Command> = {
   doctor: { usage: "doctor", run: () => doctor() },
   check: { usage: "check <file>", run: (a) => check(requireFile(a.positional[0])) },
   packs: { usage: "packs  → AI models, assets and packs, and which are installed", run: () => ({ models: listModels(), assets: listAssets(), packs: listPacks() }) },
-  install: { usage: "install <model, asset or pack>", run: (a) => install(a.positional[0] ?? "") },
+  install: { usage: "install <model, asset or pack> [--extra sft,base,xl]  (--extra: the song pack's bigger models)", run: (a) => install(a.positional[0] ?? "", a.flags.extra ?? "") },
+  bench: {
+    usage: "bench [--only image,song] [--save bench.json]  → time, RAM and GPU memory of each installed AI pack (cold and warm)",
+    run: (a) => bench(a.flags.only ? a.flags.only.split(",").map((s) => s.trim()) : [], a.flags.save ?? ""),
+  },
+  jobs: {
+    usage: "jobs list | wait <id> [--timeout 3600] | cancel <id> | stop   (commands run with --background; stop frees the AI packs' memory)",
+    run: async (a) => {
+      const [action, id] = a.positional;
+      if (action === "list" || !action) return { jobs: listJobs(), workers: listPacks().map((p) => ({ pack: p.name, ...packWorker(p.name) })).filter((w) => w.state) };
+      if (action === "stop") return { stopped: stopWorkers() };
+      if (!id) throw new Error(`Give the job id: node joedit.ts jobs ${action} <id>  (see: node joedit.ts jobs list)`);
+      if (action === "wait") return { job: await waitJob(id, optionalNumberFlag(a, "timeout", 3600)) };
+      if (action === "cancel") return { job: cancelJob(id) };
+      throw new Error(`Unknown jobs action "${action}": use list, wait, cancel or stop.`);
+    },
+  },
 };
 
 // The full command list, one line each.

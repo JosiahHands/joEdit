@@ -1,7 +1,7 @@
 // Voices: speak text, speak in a cloned voice (with consent), and split music into stems.
 // speak runs Kokoro inside Node (or macOS `say`); clone (Chatterbox) and stems (Demucs) are optional Python packs.
 // CLI:     node joedit.ts voice <command> ...
-// Library: import { speak } from "./joEdit/voice.ts"
+// Library: import { speak } from "./joEdit/areas/voice.ts"
 import { createHash } from "node:crypto";
 import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
@@ -23,7 +23,7 @@ import {
   withTempDir,
   type Args,
   type Command,
-} from "./shared.ts";
+} from "../core/shared.ts";
 import * as listen from "./listen.ts";
 import * as sound from "./sound.ts";
 
@@ -196,17 +196,17 @@ export function voices() {
 // Say new words in the voice of a short sample (5-20 seconds of clear speech works best).
 // consent: a sentence recording that the person whose voice it is agreed to this use.
 // The consent is saved next to the output and in its metadata, and Chatterbox watermarks the audio.
-export function clone(output: string, sample: string, text: string, consent: string, emotion = 0.5, pace = 0.5) {
+export async function clone(output: string, sample: string, text: string, consent: string, emotion = 0.5, pace = 0.5) {
   requireFile(sample);
   if (!consent || consent.trim().length < 10) {
     throw new Error('Cloning a voice needs --consent "..." : who the voice belongs to and that they agreed, e.g. --consent "Sam Lee agreed on 2026-11-18 to use their voice for the product video".');
   }
   if (!text.trim()) throw new Error("Give the words to say with --text (or --file script.txt).");
-  const result = withTempDir((folder) => {
+  const result = await withTempDir(async (folder) => {
     const prepared = join(folder, "sample.wav");
     ffmpeg(["-i", sample, "-ac", "1", "-ar", "24000", prepared]);
     const raw = join(folder, "speech.wav");
-    const made = runPack("clone", [raw, "--sample", prepared, "--text", text, "--emotion", String(emotion), "--pace", String(pace)]);
+    const made = await runPack("clone", [raw, "--sample", prepared, "--text", text, "--emotion", String(emotion), "--pace", String(pace)]);
     ffmpeg(["-i", raw, "-metadata", `comment=AI voice clone (Chatterbox, watermarked). Consent: ${consent}`, output]);
     return made;
   });
@@ -227,21 +227,22 @@ export const STEMS = ["vocals", "drums", "bass", "other"];
 
 // Split music into vocals, drums, bass and other. `only` keeps one stem plus everything else mixed
 // together (e.g. only "vocals" gives vocals.wav and without-vocals.wav: voice isolation and karaoke).
-export function stems(input: string, folder: string, only = "", model = "htdemucs") {
+export async function stems(input: string, folder: string, only = "", model = "htdemucs") {
   requireFile(input);
   if (only && !STEMS.includes(only)) throw new Error(`--only must be one of: ${STEMS.join(", ")}`);
-  const result = withTempDir((temp) => {
+  const result = await withTempDir(async (temp) => {
     const prepared = join(temp, "music.wav");
     ffmpeg(["-i", input, "-vn", "-ac", "2", "-ar", "44100", prepared]);
     return runPack("stems", [prepared, folder, "--model", model]);
   });
-  if (!only) return { folder, stems: Object.keys(result.stems), device: result.device };
+  const { stems: files, ...measured } = result; // device, seconds, ramGb, ...
+  if (!only) return { folder, stems: Object.keys(files), ...measured };
   // Mix the other stems into one file, then remove them.
   const others = STEMS.filter((name) => name !== only).map((name) => join(folder, `${name}.wav`));
   const rest = join(folder, `without-${only}.wav`);
   ffmpeg([...others.flatMap((f) => ["-i", f]), "-filter_complex", `amix=inputs=${others.length}:normalize=0`, rest]);
   others.forEach((f) => rmSync(f, { force: true }));
-  return { folder, stems: [only, `without-${only}`], device: result.device };
+  return { folder, stems: [only, `without-${only}`], ...measured };
 }
 
 // Text from --text, or from a file with --file (good for long scripts).

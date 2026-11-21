@@ -1,6 +1,6 @@
 // Music and sound editing, built on ffmpeg (edits, loudness) and Web Audio (mixing, effects, sound design).
 // CLI:     node joedit.ts sound <command> <input> <output> [--flags]
-// Library: import { fade } from "./joEdit/sound.ts"
+// Library: import { fade } from "./joEdit/areas/sound.ts"
 import { execFileSync } from "node:child_process";
 import { writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
@@ -21,7 +21,7 @@ import {
   stringFlag,
   withTempDir,
   type Command,
-} from "./shared.ts";
+} from "../core/shared.ts";
 
 // ---------- Sound as numbers ----------
 // Web Audio works on channels of numbers between -1 and 1. joEdit always uses stereo at 48000 per second.
@@ -888,5 +888,5 @@ export const commands: Record<string, Command> = {
 
 // Only run the CLI when this file is executed directly (not when imported).
 if (import.meta.main) {
-  runCli("Sound editor: node sound.ts <command> ...", commands, process.argv.slice(2));
+  runCli("Sound editor: node joedit.ts sound <command> ...", commands, process.argv.slice(2));
 }

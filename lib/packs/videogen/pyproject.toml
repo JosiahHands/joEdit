@@ -1,16 +1,19 @@
 [project]
 name = "joedit-videogen"
-version = "0.1.0"
-description = "Video clips from a description or a starting picture (Wan 2.2 TI2V-5B, Apache-2.0). Needs a big GPU (24 GB+); ~30 GB of models."
+version = "0.2.0"
+description = "Video clips from a description or a starting picture (FastWan 2.2 TI2V-5B, 3 steps, Apache-2.0). Runs on NVIDIA GPUs from 8 GB and Apple Silicon; ~24 GB of models."
 requires-python = ">=3.11,<3.13"
 dependencies = [
-  "diffusers>=0.35",
+  "diffusers>=0.36",
   "transformers>=4.51",
   "torch>=2.5",
   "accelerate",
   "ftfy",
   "sentencepiece",
   "pillow",
+  "numpy",
+  # 4-bit models for GPUs under 10 GB (NVIDIA only).
+  "bitsandbytes>=0.45; sys_platform != 'darwin'",
 ]
 
 [tool.uv]

@@ -1,16 +1,16 @@
 // Shared helpers used by every joEdit module: running programs, reading arguments, the CLI,
 // the native libraries (in node_modules), packs (local AI tools), assets (downloaded fonts and tools) and the brand kit.
 import { execFileSync, spawn, spawnSync } from "node:child_process";
-import { chmodSync, createWriteStream, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, createWriteStream, openSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, statfsSync, statSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
-import { tmpdir } from "node:os";
+import { freemem, tmpdir, totalmem } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 // The folder joEdit lives in, where downloaded assets go, and where AI models are kept.
-export const LIB = dirname(fileURLToPath(import.meta.url));
+export const LIB = dirname(dirname(fileURLToPath(import.meta.url))); // lib/ (this file is lib/core/shared.ts)
 export const ASSETS = join(LIB, ".assets");
 export const MODELS = join(LIB, ".models");
 
@@ -643,7 +643,10 @@ function describeMade(file: string): Record<string, unknown> | undefined {
 //   - the output may be the same file as the input: the edit goes to a temporary file that then replaces it.
 // Flags not in the usage are refused (with a suggestion), so a typo never fails silently.
 export async function runCli(title: string, commands: Record<string, Command>, argv: string[]): Promise<void> {
-  const [name, ...rest] = argv;
+  const [name, ...given] = argv;
+  // --background (anywhere, for any command) runs the command as a job and answers at once with its id.
+  const background = given.includes("--background");
+  const rest = given.filter((item) => item !== "--background");
   const command = name ? commands[name] : undefined;
   if (!command) {
     if (name && name !== "help") {
@@ -672,6 +675,11 @@ export async function runCli(title: string, commands: Record<string, Command>, a
       const all = known.size ? ` This command's flags: ${[...known].map((k) => `--${k}`).join(" ")}` : " This command has no flags.";
       throw new Error(`Unknown flag --${flag}.${guess ? ` Did you mean --${guess}?` : ""}${all}`);
     }
+    if (background) {
+      // The same command line again (area included, e.g. "music song ..."), without --background.
+      console.log(JSON.stringify({ ok: true, ...startJob([process.argv[1], ...process.argv.slice(2).filter((item) => item !== "--background")]) }));
+      return;
+    }
     if (output) {
       mkdirSync(dirname(resolve(output)), { recursive: true });
       // Editing a file in place: write to a temporary file next to it, then swap.
@@ -684,13 +692,113 @@ export async function runCli(title: string, commands: Record<string, Command>, a
     const result = (await command.run(args)) ?? {};
     if (temporary && existsSync(temporary)) renameSync(temporary, output!);
     const made = output ? describeMade(output) : undefined;
-    console.log(JSON.stringify({ ok: true, ...(output ? { output } : {}), ...result, ...(made ? { made } : {}) }));
+    const answer = { ok: true, ...(output ? { output } : {}), ...result, ...(made ? { made } : {}) };
+    finishJob({ state: "done", result: answer });
+    console.log(JSON.stringify(answer));
   } catch (error: any) {
     if (temporary && existsSync(temporary)) rmSync(temporary, { force: true });
+    finishJob({ state: "failed", error: error.message });
     console.error(`Error: ${error.message}`);
     console.error(`Usage: ${command.usage}`);
     process.exitCode = 1;
   }
+}
+
+// ---------- Background jobs ----------
+// A command run with --background starts again as its own program (with JOEDIT_JOB set) and answers at once.
+// Each job is a file in .jobs/<id>.json: { id, command, state: running | done | failed | cancelled, started,
+// finished, progress, result (the command's JSON answer), error, pid }. `jobs list | wait | cancel` read it.
+
+export const JOBS = join(LIB, ".jobs");
+const jobFile = (id: string) => join(JOBS, `${id}.json`);
+
+// Start a command (its node arguments) as a background job.
+function startJob(nodeArgs: string[]): Result {
+  mkdirSync(JOBS, { recursive: true });
+  // Jobs finished over a week ago are forgotten.
+  for (const name of readdirSync(JOBS)) {
+    const path = join(JOBS, name);
+    if (Date.now() - statSync(path).mtimeMs > 7 * 24 * 3600 * 1000) rmSync(path, { force: true });
+  }
+  const id = `${new Date().toISOString().slice(0, 10)}-${Math.random().toString(36).slice(2, 7)}`;
+  const log = openSync(join(JOBS, `${id}.log`), "w");
+  const child = spawn(process.execPath, nodeArgs, {
+    detached: true,
+    stdio: ["ignore", log, log],
+    env: { ...process.env, JOEDIT_JOB: id },
+    windowsHide: true,
+  });
+  child.unref();
+  closeSync(log);
+  writeJsonFile(jobFile(id), { id, command: nodeArgs.slice(1).join(" "), state: "running", started: new Date().toISOString(), pid: child.pid });
+  return { job: id, state: "running", next: `node joedit.ts jobs wait ${id}` };
+}
+
+// The job this program is (when it was started with --background).
+function updateJob(change: Record<string, unknown>): void {
+  const id = process.env.JOEDIT_JOB;
+  if (!id) return;
+  const job = readJsonQuietly(jobFile(id));
+  if (job && job.state === "running") writeJsonFile(jobFile(id), { ...job, ...change });
+}
+
+function finishJob(change: Record<string, unknown>): void {
+  updateJob({ ...change, finished: new Date().toISOString(), progress: undefined });
+}
+
+// What a background job is doing now, e.g. "song: making 40/100, about 20 s left". Saved at most once a second.
+let progressSavedAt = 0;
+export function jobProgress(text: string): void {
+  if (!process.env.JOEDIT_JOB || Date.now() - progressSavedAt < 1000) return;
+  progressSavedAt = Date.now();
+  updateJob({ progress: text });
+}
+
+// Every job, newest first. A job whose program is gone without finishing is reported as failed.
+export function listJobs(): any[] {
+  if (!existsSync(JOBS)) return [];
+  return readdirSync(JOBS)
+    .filter((name) => name.endsWith(".json"))
+    .map((name) => readJsonQuietly(join(JOBS, name)))
+    .filter(Boolean)
+    .map((job) => (job.state === "running" && !isRunning(job.pid) ? { ...job, state: "failed", error: "it stopped without finishing (see its .log)" } : job))
+    .sort((a, b) => String(b.started).localeCompare(String(a.started)));
+}
+
+export function getJob(id: string): any {
+  const job = listJobs().find((j) => j.id === id);
+  if (!job) throw new Error(`No job "${id}". See: node joedit.ts jobs list`);
+  return job;
+}
+
+// Wait until a job finishes (or `timeout` seconds pass) and return it.
+export async function waitJob(id: string, timeout = 3600): Promise<any> {
+  const until = Date.now() + timeout * 1000;
+  for (;;) {
+    const job = getJob(id);
+    if (job.state !== "running" || Date.now() > until) return job;
+    await sleep(500);
+  }
+}
+
+// Stop a job: its program, and any pack work it handed to a worker.
+export function cancelJob(id: string): any {
+  const job = getJob(id);
+  if (job.state !== "running") return job;
+  if (existsSync(QUEUE)) {
+    // Pack jobs carry the id of the program that asked for them: tell the worker to stop, or drop a waiting request.
+    for (const name of readdirSync(QUEUE).filter((n) => n.includes(`-${job.pid}-`) && /\.(json|running)$/.test(n))) {
+      const base = join(QUEUE, name.replace(/\.(json|running)$/, ""));
+      if (name.endsWith(".running")) writeFileSync(`${base}.cancel`, "");
+      else rmSync(join(QUEUE, name), { force: true });
+    }
+  }
+  try {
+    process.kill(job.pid);
+  } catch {}
+  const cancelled = { ...job, state: "cancelled", finished: new Date().toISOString(), progress: undefined };
+  writeJsonFile(jobFile(id), cancelled);
+  return cancelled;
 }
 
 // ---------- Packs ----------
@@ -731,9 +839,42 @@ function packRecipe(name: string): string {
 }
 
 // The pack's environment lives in .packs/<name>, and its models in .packs/<name>/models (not in a cache elsewhere).
+// Packs also get this computer's memory (JOEDIT_VRAM_GB, JOEDIT_RAM_GB) to pick their settings from.
 function packEnvironment(name: string): Record<string, string> {
   const home = join(PACK_ENVIRONMENTS, name);
-  return { UV_PROJECT_ENVIRONMENT: home, HF_HOME: join(home, "models"), TORCH_HOME: join(home, "models") };
+  const { vramGB, ramGB } = hardware();
+  return { UV_PROJECT_ENVIRONMENT: home, HF_HOME: join(home, "models"), TORCH_HOME: join(home, "models"), JOEDIT_VRAM_GB: String(vramGB), JOEDIT_RAM_GB: String(ramGB) };
+}
+
+// ---------- Hardware ----------
+
+export type Hardware = { gpu: string; vramGB: number; freeVramGB?: number; unified: boolean; ramGB: number; freeRamGB?: number; diskFreeGB: number };
+let hardwareFound: Hardware | undefined;
+
+// What this computer has for AI work: the graphics chip and its memory, RAM, and free disk where joEdit lives.
+// vramGB is 0 without a usable GPU. On Apple Silicon the GPU shares the RAM (unified), so vramGB is the RAM.
+// RAM matters as much as GPU memory: models wait in RAM while parts of them run on a small GPU.
+export function hardware(): Hardware {
+  if (hardwareFound) return hardwareFound;
+  const gb = (bytes: number) => round(bytes / 1024 ** 3, 1);
+  const ramGB = gb(totalmem());
+  const disk = statfsSync(LIB);
+  // Free RAM is left out on macOS, where it counts only never-used memory (the system frees cache as needed).
+  const common = { ramGB, ...(process.platform === "darwin" ? {} : { freeRamGB: gb(freemem()) }), diskFreeGB: gb(disk.bavail * disk.bsize) };
+  if (process.platform === "darwin" && process.arch === "arm64") {
+    hardwareFound = { gpu: "Apple Silicon", vramGB: ramGB, unified: true, ...common };
+    return hardwareFound;
+  }
+  // NVIDIA: "NVIDIA GeForce RTX 4060, 8188, 7421" (name, total MiB, free MiB) for the first GPU.
+  let line = "";
+  try {
+    line = run("nvidia-smi", ["--query-gpu=name,memory.total,memory.free", "--format=csv,noheader,nounits"]).trim().split("\n")[0];
+  } catch {} // no NVIDIA GPU (or its driver)
+  const [name, total, free] = line.split(",").map((part) => part.trim());
+  hardwareFound = name && Number(total)
+    ? { gpu: name, vramGB: gb(Number(total) * 1024 ** 2), freeVramGB: gb(Number(free) * 1024 ** 2), unified: false, ...common }
+    : { gpu: "none found", vramGB: 0, unified: false, ...common };
+  return hardwareFound;
 }
 
 // How to install uv on this system.
@@ -742,12 +883,13 @@ export const UV_INSTALL =
 
 // Install a pack: its Python libraries, then its models (`run.py --download`). This is the only time it goes online.
 // The first install can take a while (libraries and models are big).
-export function installPack(name: string): { pack: string; installed: boolean } {
+// extra: optional models the pack adds on request (e.g. the song pack's "sft,xl"), passed as JOEDIT_EXTRA.
+export function installPack(name: string, extra = ""): { pack: string; installed: boolean } {
   const folder = packRecipe(name);
   if (!hasProgram("uv")) {
     throw new Error(`Packs need uv (a Python installer). Install it with: ${UV_INSTALL}`);
   }
-  const env = { ...process.env, ...packEnvironment(name) };
+  const env = { ...process.env, ...packEnvironment(name), JOEDIT_EXTRA: extra };
   try {
     // Progress is shown on stderr so the person waiting can see something is happening.
     execFileSync("uv", ["sync", "--project", folder], { stdio: ["ignore", "ignore", "inherit"], env });
@@ -759,15 +901,149 @@ export function installPack(name: string): { pack: string; installed: boolean } 
   return { pack: name, installed: true };
 }
 
-// Run a pack's run.py with arguments and return the JSON it prints. Packs run offline: their models are already in .packs/.
-export function runPack(name: string, args: string[]): any {
+// ---------- Pack workers ----------
+// A pack runs as a worker (packs/joedit_pack.py): it loads its models once and keeps them for 10 minutes,
+// so the next song or picture skips the loading. runPack hands it a job through files in .packs/queue/ and waits.
+// Only one pack's models use the GPU at a time: a worker waiting for another pack's GPU starts after it leaves.
+
+const QUEUE = join(PACK_ENVIRONMENTS, "queue");
+const sleep = (ms: number) => new Promise((done) => setTimeout(done, ms));
+
+// True if a program with this process id is running.
+export function isRunning(pid: unknown): boolean {
+  if (typeof pid !== "number" || pid <= 0) return false;
+  try {
+    process.kill(pid, 0); // signal 0 only checks
+    return true;
+  } catch (error: any) {
+    return error.code === "EPERM";
+  }
+}
+
+// Write a JSON file in one step (a reader never sees half of it).
+export function writeJsonFile(path: string, data: unknown): void {
+  const temporary = `${path}.${process.pid}.tmp`;
+  writeFileSync(temporary, JSON.stringify(data));
+  renameSync(temporary, path);
+}
+
+function readJsonQuietly(path: string): any {
+  try {
+    return JSON.parse(readFileSync(path, "utf8"));
+  } catch {
+    return undefined; // missing, or being written this moment
+  }
+}
+
+// The pack's worker: { pid, state ("waiting for the GPU", "loading", "ready", "working"), loadSeconds }, if one is running.
+// While it starts, only the id of the program that starts it (uv) is known: { starter, state: "starting" }.
+export function packWorker(name: string): any {
+  const worker = readJsonQuietly(join(PACK_ENVIRONMENTS, name, "worker.json"));
+  return worker && isRunning(worker.pid ?? worker.starter) ? worker : undefined;
+}
+
+// Start the pack's worker unless one is running. Its messages go to .packs/<name>/worker.log.
+function startWorker(name: string): void {
+  if (packWorker(name)) return;
   const folder = packRecipe(name);
-  if (!isPackInstalled(name)) throw new Error(`The "${name}" pack is not installed (or its models are missing). Run: node joedit.ts install ${name}`);
+  const home = join(PACK_ENVIRONMENTS, name);
+  const log = openSync(join(home, "worker.log"), "a");
   const offline = { HF_HUB_OFFLINE: "1", TRANSFORMERS_OFFLINE: "1", HF_DATASETS_OFFLINE: "1" };
-  const output = run("uv", ["run", "--project", folder, "--no-sync", "python", join(folder, "run.py"), ...args], { ...packEnvironment(name), ...offline });
-  // The JSON result is always the last line printed.
-  const lastLine = output.trim().split("\n").pop() ?? "";
-  return JSON.parse(lastLine);
+  const child = spawn("uv", ["run", "--project", folder, "--no-sync", "python", join(folder, "run.py"), "--serve"], {
+    detached: true, // it keeps running after this command ends
+    stdio: ["ignore", log, log],
+    env: { ...process.env, ...packEnvironment(name), ...offline },
+    windowsHide: true,
+  });
+  child.unref();
+  closeSync(log);
+  // The worker replaces this with its own id once Python has started.
+  writeJsonFile(join(home, "worker.json"), { starter: child.pid, state: "starting" });
+}
+
+// The end of a worker's log, to explain a failure.
+function workerLog(name: string): string {
+  try {
+    return readFileSync(join(PACK_ENVIRONMENTS, name, "worker.log"), "utf8").trim().split("\n").slice(-12).join("\n");
+  } catch {
+    return "";
+  }
+}
+
+// What a job is doing, for people waiting: "loading the models", "making 3/8, about 20 s left".
+function describeProgress(worker: any, progress: any): string {
+  if (!progress) return worker?.state === "ready" || !worker ? "starting" : worker.state === "working" ? "working" : `${worker.state}${worker.state === "loading" ? " the models" : ""}`;
+  const step = progress.step && progress.total ? ` ${progress.step}/${progress.total}` : "";
+  const left = progress.eta ? `, about ${formatSeconds(progress.eta)} left` : "";
+  return `${progress.phase ?? "working"}${step}${left}`;
+}
+const formatSeconds = (seconds: number) => (seconds >= 90 ? `${Math.round(seconds / 60)} min` : `${Math.round(seconds)} s`);
+
+// Run a job in a pack (its run.py arguments) and return its JSON result. Packs run offline: their models are in .packs/.
+// While it works, progress is printed to stderr every few seconds (and saved for `jobs` when this is a background job).
+export async function runPack(name: string, args: string[]): Promise<any> {
+  packRecipe(name);
+  if (!isPackInstalled(name)) throw new Error(`The "${name}" pack is not installed (or its models are missing). Run: node joedit.ts install ${name}`);
+  mkdirSync(QUEUE, { recursive: true });
+  const id = `${Date.now().toString(36)}-${process.pid}-${Math.random().toString(36).slice(2, 6)}`;
+  const base = join(QUEUE, id);
+  writeJsonFile(`${base}.json`, { pack: name, args });
+  // Ctrl+C (or `jobs cancel`) stops the pack's job too, not only this command.
+  const stop = () => {
+    if (existsSync(`${base}.json`)) rmSync(`${base}.json`, { force: true }); // not taken yet: never start it
+    else writeFileSync(`${base}.cancel`, ""); // taken: the worker stops at its next progress report
+    process.exit(130);
+  };
+  process.once("SIGINT", stop).once("SIGTERM", stop);
+  let starts = 0;
+  let said = "";
+  let saidAt = 0;
+  try {
+    for (;;) {
+      const outcome = readJsonQuietly(`${base}.result.json`);
+      if (outcome) {
+        rmSync(`${base}.result.json`, { force: true });
+        if (!outcome.ok) throw new Error(`The ${name} pack: ${outcome.error}`);
+        return outcome.result;
+      }
+      const worker = packWorker(name);
+      if (!worker) {
+        const waiting = existsSync(`${base}.json`);
+        // The job was taken and its worker stopped (crashed, or ran out of memory) without an answer.
+        if (!waiting && !existsSync(`${base}.result.json`)) throw new Error(`The ${name} pack stopped while working.\n${workerLog(name)}`);
+        if (waiting && starts >= 2) throw new Error(`The ${name} pack could not start.\n${workerLog(name)}`);
+        if (waiting) {
+          startWorker(name);
+          starts++;
+        }
+      }
+      const now = describeProgress(worker, readJsonQuietly(`${base}.progress.json`));
+      jobProgress(`${name}: ${now}`);
+      if (now !== said && Date.now() - saidAt > 5000) {
+        process.stderr.write(`${name}: ${now}\n`);
+        [said, saidAt] = [now, Date.now()];
+      }
+      await sleep(250);
+    }
+  } finally {
+    process.off("SIGINT", stop).off("SIGTERM", stop);
+    for (const leftover of [`${base}.json`, `${base}.cancel`]) rmSync(leftover, { force: true });
+  }
+}
+
+// Stop every pack worker now (frees their memory), and say which were stopped.
+export function stopWorkers(): string[] {
+  const stopped: string[] = [];
+  for (const { name } of listPacks()) {
+    const worker = packWorker(name);
+    if (!worker) continue;
+    try {
+      process.kill(worker.pid ?? worker.starter);
+      stopped.push(name);
+    } catch {}
+    rmSync(join(PACK_ENVIRONMENTS, name, "worker.json"), { force: true });
+  }
+  return stopped;
 }
 
 // ---------- AI models ----------
@@ -952,9 +1228,12 @@ export type Asset = {
 export const ASSET_LIST: Asset[] = [
   {
     name: "instruments",
-    description: "GeneralUser GS: 259 instrument sounds (piano, strings, drums, synths …) for music compose. 32 MB.",
-    license: "GeneralUser GS License v2.0 (free for any use)",
-    files: [{ url: "https://raw.githubusercontent.com/mrbumpy409/GeneralUser-GS/main/GeneralUser-GS.sf2", path: "GeneralUser-GS.sf2" }],
+    description: "Instrument sounds for music compose: GeneralUser GS (259 instruments) and MuseScore General (fuller orchestra, piano and drums). 72 MB.",
+    license: "GeneralUser GS License v2.0 (free for any use); MuseScore General: MIT",
+    files: [
+      { url: "https://raw.githubusercontent.com/mrbumpy409/GeneralUser-GS/main/GeneralUser-GS.sf2", path: "GeneralUser-GS.sf2" },
+      { url: "https://ftp.osuosl.org/pub/musescore/soundfont/MuseScore_General/MuseScore_General.sf3", path: "MuseScore_General.sf3" },
+    ],
   },
   {
     name: "upscaler",
@@ -964,6 +1243,18 @@ export const ASSET_LIST: Asset[] = [
       {
         url: `https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesrgan-ncnn-vulkan-20220424-${process.platform === "darwin" ? "macos" : process.platform === "win32" ? "windows" : "ubuntu"}.zip`,
         path: "upscaler.zip",
+        unzip: true,
+      },
+    ],
+  },
+  {
+    name: "interpolator",
+    description: "RIFE: invents in-between video frames with AI (smooth slow motion, 24 → 48/60 fps; runs on the GPU via Vulkan/Metal). 440 MB.",
+    license: "MIT",
+    files: [
+      {
+        url: `https://github.com/nihui/rife-ncnn-vulkan/releases/download/20221029/rife-ncnn-vulkan-20221029-${process.platform === "darwin" ? "macos" : process.platform === "win32" ? "windows" : "ubuntu"}.zip`,
+        path: "interpolator.zip",
         unzip: true,
       },
     ],
@@ -1010,12 +1301,20 @@ export async function installAsset(name: string): Promise<{ asset: string; insta
   }
   for (const file of asset.files ?? []) {
     const target = join(folder, file.path); // paths may include sub-folders
+    if (!file.unzip && existsSync(target)) continue; // already here (installing again only adds what is new)
     await download(file.url, target);
     if (file.unzip) {
       // Windows 10+ has tar (it unpacks zips too); macOS and Linux have unzip.
       if (process.platform === "win32") run("tar", ["-xf", target, "-C", folder]);
       else run("unzip", ["-o", "-q", target, "-d", folder]);
       rmSync(target);
+      // A zip that holds one folder: move what is inside it up, so the programs are always at .assets/<name>/.
+      const inside = readdirSync(folder);
+      if (inside.length === 1 && statSync(join(folder, inside[0])).isDirectory()) {
+        const top = join(folder, inside[0]);
+        for (const item of readdirSync(top)) renameSync(join(top, item), join(folder, item));
+        rmSync(top, { recursive: true });
+      }
       // Zips do not always keep the "can run" flag, so set it on the programs inside.
       for (const name of readdirSync(folder)) {
         const path = join(folder, name);
@@ -1027,7 +1326,7 @@ export async function installAsset(name: string): Promise<{ asset: string; insta
 }
 
 // Install an AI model, an asset or a pack by name.
-export async function install(name: string): Promise<Result> {
+export async function install(name: string, extra = ""): Promise<Result> {
   if (AI_MODELS[name]) return installModel(name);
   if (ASSET_LIST.some((a) => a.name === name)) return installAsset(name);
   if (!existsSync(join(PACK_RECIPES, name, "pyproject.toml"))) {
@@ -1036,7 +1335,7 @@ export async function install(name: string): Promise<Result> {
         `Assets: ${ASSET_LIST.map((a) => a.name).join(", ")}. Packs: ${listPacks().map((p) => p.name).join(", ")}`,
     );
   }
-  return installPack(name);
+  return installPack(name, extra);
 }
 
 // ---------- Brand kit ----------

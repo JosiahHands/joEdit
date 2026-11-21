@@ -1,7 +1,7 @@
 // Graphics: turn HTML pages into video and pictures, rendered frame by frame by Chrome.
 // Write any HTML/CSS/JS animation. joEdit controls the page's clock, so every frame is exact and repeatable.
 // CLI:     node joedit.ts graphics <command> ...
-// Library: import { render } from "./joEdit/graphics.ts"
+// Library: import { render } from "./joEdit/areas/graphics.ts"
 import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
@@ -37,7 +37,7 @@ import {
   type Brand,
   type Command,
   type TextStyle,
-} from "./shared.ts";
+} from "../core/shared.ts";
 import * as listen from "./listen.ts";
 
 // ---------- Chrome ----------
@@ -807,5 +807,5 @@ export const commands: Record<string, Command> = {
 
 // Only run the CLI when this file is executed directly (not when imported).
 if (import.meta.main) {
-  runCli("joEdit graphics: node graphics.ts <command> ...", commands, process.argv.slice(2));
+  runCli("joEdit graphics: node joedit.ts graphics <command> ...", commands, process.argv.slice(2));
 }

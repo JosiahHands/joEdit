@@ -9,6 +9,16 @@ node joedit.ts doctor                    shows what this computer has and how to
 ```
 Paths here are written as if you are in this folder. From elsewhere, use `node joEdit/joedit.ts ...`.
 
+The folders follow who calls whom, top to bottom:
+```
+joedit.ts        every command starts here, and passes it to its area
+areas/           one file per area (picture.ts, video.ts, music.ts …); movie.ts combines the others into films
+core/shared.ts   what every area uses: ffmpeg, frames, text, installs, hardware, pack workers, jobs
+packs/           the Python side of the AI packs (run by shared.ts as workers; joedit_pack.py is their plumbing)
+libs/            the bundled libraries (npm packages, raylib, fonts)
+```
+To change how a command works, edit its area file; to change something every area shares, edit core/shared.ts.
+
 ## How it works
 - **Output:** every command prints one line of JSON, often with extra facts (times, sizes, scores). Commands that make a file also describe it under `made`, e.g. `{"ok":true,"output":"out.mp4","made":{"duration":8,"width":1920,"height":1080,"hasAudio":true,"size":"4.1 MB"}}`, so you know what came out without another command. Errors exit with code 1 and print `Error: ...` and the correct usage to stderr.
 - **Files:** each edit reads an input and writes an output file. The output's extension picks the format (`.mp4 .mov .webm .gif .png .jpg .webp .mp3 .wav`, …). Missing folders in the output path are created. The output can be the input itself (`video trim a.mp4 a.mp4 ...`): the edit is made safely on a copy that then replaces it.
@@ -18,8 +28,10 @@ Paths here are written as if you are in this folder. From elsewhere, use `node j
 - **Engines:** joEdit brings its own FFmpeg 8, sharp (pictures), Skia (text and drawing), Web Audio (mixing and sound design), raylib (GPU effects), AI models that run in Node, fonts and Three.js. `npm install` in this folder is the whole setup.
 - **Adding more:** `packs` lists the optional extras and `install <name>` adds one; it is the only time joEdit downloads anything. Once installed, everything runs offline. Install an extra when a task needs it:
   - **AI models** (run in Node): `whisper` (speech to text; `whisper-tiny/small/turbo` for other speeds), `kokoro` (voices), `cutout`, `depth`, `vision` (search pictures by meaning), `objects`, `faces`, `read` (text in pictures), `sounds` (search sounds by meaning), `speakers` (who speaks when).
-  - **Assets**: `instruments` (sounds for music compose), `upscaler` (Real-ESRGAN), `browser` (a headless Chrome, only if Chrome is not installed and you render HTML pages).
-  - **Packs** (Python, need `uv`): `image` (picture generate), `song` (AI songs), `clone` (voice cloning), `stems` (split music), `videogen` (video generate, big GPU).
+  - **Assets**: `instruments` (sounds for music compose), `upscaler` (Real-ESRGAN), `interpolator` (RIFE, AI in-between frames), `browser` (a headless Chrome, only if Chrome is not installed and you render HTML pages).
+  - **Packs** (Python, need `uv`): `image` (picture generate), `song` (AI songs), `clone` (voice cloning), `stems` (split music), `videogen` (video generate, 8 GB+ GPU).
+- **Packs stay loaded:** the first command that uses a pack loads its models, then the pack keeps them for 10 minutes (2 when they hold over 40% of the RAM or of the GPU's memory), so the next song, picture or cloned line starts at once. Only one pack holds the GPU at a time; asking for another pack frees it. Results include `seconds` (the work), `loadSeconds` (when it had to load), `ramGb` and `vramGb` (GPU memory; on Apple Silicon the most seen while it worked). While a pack works, progress and the time left are printed to stderr. `jobs stop` frees the memory now.
+- **Background:** add `--background` to any command to get `{"job": id}` back at once and keep working; `jobs wait <id>` returns the command's normal result when it is done, `jobs list` shows every job with its progress, `jobs cancel <id>` stops one. Long work (songs, video generate, movie render) can run while you write the next part.
   - **Programs**: Chrome (HTML pages), Blender (3d). `doctor` gives the install command.
 - **Brand:** commands with `--brand brand.json` (titles, captions, templates, canvas, compose) take their colors and fonts from that file. Any part can be left out and gets a default:
   `{"colors": {"background": "#0B0B0F", "text": "#FFFFFF", "primary": "#7C5CFF", "accent": "#FFD166"}, "fonts": {"heading": "Montserrat", "body": "Inter"}}`
@@ -107,8 +119,9 @@ blur-faces <in> <out> [--every 0.2] [--strength 1] [--pad 0.3]   follows and blu
 reframe <in> <out> --aspect 9:16|1:1|4:5|16:9 [--x 0..1] [--y 0..1]   crop to a new shape; --x 0 = keep left, 1 = keep right
 reframe <in> <out> --aspect 9:16 --follow [--smooth 2] [--every 0.5]   the crop follows the main subject as it moves
 pip <main> <small> <out> [--corner bottom-right] [--size 0.3]   picture-in-picture (sound from main)
-interpolate <in> <out> [--fps 60]           invents in-between frames: smoother motion, or slow motion with `speed`
-generate <out.mp4> --prompt "..." [--image start.png] [--seconds 5] [--steps 50] [--seed N]   AI video clip
+interpolate <in> <out> [--fps 60] [--method auto|ai|motion]   invents in-between frames: smoother motion, or slow motion with `speed`
+upscale <in> <out> [--scale 2|3|4] [--width 1920] [--style photo|art|fast]   bigger, with AI-restored detail
+generate <out.mp4> --prompt "..." [--image start.png] [--seconds 5] [--width 1280] [--height 720] [--seed N] [--upscale fast|photo|art|none]   AI video clip
 ```
 - `captions` makes its own transcript (`install whisper`) when none is given. A transcript is any JSON with `{"words": [{"word", "start", "end"}]}`, so you can fix spellings in it, or write one by hand, before burning it in. Styles: `karaoke` lights each word as it is spoken, `pop` puts the spoken word on a colored tag, `bold` is big outlined capitals, `minimal` is plain subtitles on a dark box. `--speakers` gives each speaker their own color; use a transcript from `listen speakers` (its words carry a `speaker`).
 - `remove-fillers` and `remove-silence` together make a talk tight in two commands.
@@ -116,7 +129,8 @@ generate <out.mp4> --prompt "..." [--image start.png] [--seconds 5] [--steps 50]
 - `concat` keeps the sound even when some clips have none (they get silence).
 - `blur-faces` (`install faces`) is for privacy: bystanders, kids, people who did not agree to be shown.
 - `reframe --follow` (`install cutout`) finds the subject every `--every` seconds and glides the crop along its path like a camera operator; `--smooth` is seconds of smoothing (bigger = calmer). The result includes the crop `path`. Where the subject is found is cached per clip (`.joedit-cache/follow/` next to it), so a second reframe of the same clip, or of part of it, takes a moment, and a longer range only looks at the times not seen yet. Each sample is one run of the cutout model (about 2 seconds on a laptop), so `--every 1` halves the time for slow-moving subjects. The subject is the cutout model's main subject; for another thing, use `look track` and steer the crop yourself.
-- `generate` (`install videogen`, Wan 2.2 TI2V-5B) makes a clip from a description, or animates `--image`. It needs a big GPU (24 GB+ of video memory, ~30 GB of models) and takes minutes per clip; on smaller machines, `picture parallax`, `picture animate` and `fx` bring stills to life instead.
+- `generate` (`install videogen`, FastWan 2.2 TI2V-5B, ~24 GB of models) makes a clip from a description, or animates `--image`, in 3 steps. It runs on NVIDIA GPUs from 8 GB and on Apple Silicon: it picks a memory plan from the hardware (`--memory`: `full` 24 GB+, `gpu` 14–24 GB, `offload` 10–14 GB streams the model onto the GPU layer by layer, `small` under 10 GB uses 4-bit models; the result reports the plan as `memory`). Each plan renders as big as it does well (480p on small GPUs, `rendered` in the result), then the clip is upscaled to `--width`x`--height` (`--upscale fast` by default with `install upscaler`; `photo` is slower and sharper; `none` keeps the rendered size). Clips longer than 5 seconds are made in 5-second pieces, each continuing from the last frame of the one before with matched colours; `--prompt "a dog runs to the door | the door opens | it runs outside"` gives each piece its own direction. The same prompt again is quicker (it is remembered), so try several `--seed`s and keep the best. Describe motion and camera (`"slow push in"`, `"handheld follow"`), not only the scene. A subject that rushes into close-up can come back looking different, so keep it at a steady distance, or start the next piece from a picture of it (`--image`). Measured on an M5 Pro Mac with 24 GB: about 4 minutes for a 5 s 720p clip, 7 minutes for 8 s; run it with `--background` and keep working.
+- `upscale` (`install upscaler`) works on any video: `photo` for real footage, `art` for drawn and animated, `fast` for a quick pass. `interpolate` uses AI (`install interpolator`, RIFE) when it is installed: smooth 24 → 60 fps, or slow motion when followed by `speed`; `--method motion` uses ffmpeg's motion interpolation instead.
 
 **sound** (FFmpeg and Web Audio; also reads the sound of video files)
 ```
@@ -296,9 +310,14 @@ stems <music> <folder> [--only vocals|drums|bass|other]   → vocals.wav drums.w
 **music**: write music as a score, or generate whole songs
 ```
 compose <score.json> <out.wav|.mp3|.mid> [--stems folder]   play a score with real instruments (install instruments)
-instruments                                 → the 128 instrument names, short names, drum sounds, drum styles, rhythms, chords, amps
-song <out.wav> --prompt "style, mood, instruments, voice" [--lyrics lyrics.txt] [--duration 30] [--bpm N] [--seed N] [--steps 8]
+instruments                                 → the 128 instrument names, short names, drum sounds, drum styles, rhythms, chords, amps, feels, master presets
+starters / starter <genre> <score.json>     a finished score to start from: pop, lofi, rock, cinematic, edm, hiphop, jazz, folk, orchestral, ambient
+song <out.wav> --prompt "style, mood, instruments, voice" [--lyrics lyrics.txt] [--duration 30] [--bpm N] [--seed N] [--model turbo|sft|base|xl] [--takes 1]
+sing <instrumental> <out.wav> --lyrics lyrics.txt --prompt "the voice" [--vocals voice.wav] [--language en] [--takes 1]   vocals over your own music
+repaint <song> <out.wav> --start S --end S --prompt "..." [--lyrics lyrics.txt]   remake one part of a song, keep the rest
+review <song> [--reference track.mp3]       → score 0-10 and what a mixing engineer would fix, with the command for each fix
 ```
+`review` listens to any song (composed, generated or your own) for loudness, squashed dynamics, a thin/boomy/muddy/dull/harsh balance, mono or too-wide stereo, no build between quiet and loud parts, a silent start and an abrupt end. With `--reference` it compares the tonal balance with a track you like instead of a typical mix. Use it to pick the best of several takes.
 A score is JSON. You decide every note, so the music fits the film exactly (length, tempo, mood, where it builds):
 ```json
 {
@@ -318,8 +337,19 @@ A score is JSON. You decide every note, so the music fits the film exactly (leng
 - `instrument`: any General MIDI name (`acoustic grand piano`, `cello`, `warm pad`, `steel drums` …) or short names: piano, electric piano, organ, guitar, electric guitar, bass, synth bass, strings, violin, cello, harp, choir, trumpet, brass, sax, flute, lead, pad, bells, music box, marimba. `pluck` is a real plucked string (each note a little different, short notes palm-muted): with an amp it is the best rock and metal guitar here.
 - Each part can have its own `fx`: `{"amp": "clean|crunch|metal", "drive": 0..1, "eq": {"low": dB, "mid": dB, "high": dB}, "reverb": "room|hall|...", "mix": 0.2}`. `"double": true` plays the part twice, hard left and right (the wide wall of rock guitars). Example rhythm guitar: `{"instrument": "pluck", "chords": "E5 E5 G5 A5", "rhythm": "chug", "octave": 2, "double": true, "fx": {"amp": "metal", "eq": {"mid": -3}}}`. `--stems folder` also saves each part and the drums as its own `.wav` for mixing.
 - `drums`: a `style` (`four-on-floor`, `hiphop`, `rock`, `halftime`, `trap`, `bossa`, `waltz`) or your own `pattern`: `{"kick": "x...x...x...x...", "snare": "....x.......x...", "hat": "x.x.x.x.x.x.x.x."}`. Each character is a 16th note: `x` hit, `X` accent, `o` soft, `.` rest. Drums: kick, snare, rim, clap, hat, openhat, pedalhat, crash, ride, hightom, midtom, lowtom, tambourine, cowbell, shaker, conga, bongo.
+- **Sections** give a song its form. With `"sections": [{"name": "intro", "bars": 4, "drums": false, "energy": 2}, {"name": "verse", "bars": 8, "drums": "halftime"}, {"name": "drop", "bars": 8, "energy": 5, "into": "build"}]`, each part loops to fill the sections it plays in (`"sections": ["drop"]` on a part; default all), and `bars` is their total. A section can have its own `drums` (a style, a pattern, or `false`) and `energy` (1 quiet to 5 full out, default 3). `into` says how the section before leads into it: `fill` (default when drums play on both sides: four snare 16ths, or a tom fill when the energy goes up), `build` (a snare roll and a noise riser over the last bar), `riser` (just the riser), `stop` (the whole mix drops out for the last beat, the gap before a drop) or `none`. Every new section with drums starts on a crash. The result lists each section's `start` in seconds, to cut picture on.
+- **Feel**: the parts are played like people play, not on a rigid grid. Timing drifts a few milliseconds (drums tighter, the kick tightest), velocities vary, hi-hats lean on the beat, the snare sits a hair late, and soft ghost snares appear now and then. `"feel"`: `natural` (default), `tight`, `loose` or `exact` (the grid as written); a part can have its own. `"swing"`: 0.5 straight, 0.55–0.58 a light swing, 0.6–0.62 a groove, 0.66 a triplet shuffle (jazz, blues, lo-fi), with `"swingNote": 16` to swing 16ths (hip-hop, funk). `"seed"` changes the performance; the same seed plays it the same way again.
+- **Master** is the last step of every compose: the music ducks under the kick, a compressor glues the mix, shelves set the tone, and a limiter brings it to loudness with peaks under -1 dB. `"master"`: `balanced` (default), `pop`, `edm` (deep pumping), `hiphop`, `rock`, `lofi` (warm, pumping), `acoustic`, `jazz`, `cinematic`, `ambient` (the last four keep more dynamics, at -16 LUFS), a preset with tweaks such as `{"preset": "edm", "duck": 8, "high": 2}` (`duck` dB, `ratio`, `threshold` dB, `low`/`high` shelf dB, `lufs`), or `false` for just standard loudness.
+- `"sounds"` picks the instruments: `generaluser` (default) or `musescore` (MuseScore General: a fuller orchestra, piano and drums; both come with `install instruments`), or the path of any SoundFont (`.sf2`/`.sf3`) you have.
+- **Starters** are finished arrangements, one per genre (`starter lofi score.json`): sections, groove, feel, master and sounds already set. Change the chords, melody, tempo and sections to make it yours; it is quicker and sounds better than starting from nothing.
 - Ideas: start sparse and add parts every 8 bars to build energy; set `tempo` so that 1 bar = a scene length; make the score exactly as long as the film (`bars` = seconds × tempo / 60 / 4). `.mid` output opens in any music app.
-- `song` (`install song`, ACE-Step 1.5, ~10 GB of models) makes a full produced song: describe genre, mood, instruments and voice in `--prompt`; lyrics use section tags like `[verse]`, `[chorus]`, `[bridge]`. Without lyrics it is instrumental. Same `--seed` = same song. It is strongest at pop, electronic, hip-hop, ambient, cinematic and singer-songwriter; heavy rock and metal come out soft (little 1–5 kHz bite), and its beat grid is its own. For rock or metal, or music that must hit exact times, `compose` a score (pluck + amp) instead, or check the song with `listen bands` and `listen beats`. The model is ACE-Step's turbo model: `--steps` (1–20) is tuned for the default 8, and it follows the prompt at a fixed strength. For more control, change the prompt, lyrics or seed. On an Apple Silicon laptop a 10-second song takes about 70 seconds and a 60-second one about 85 (most of it is loading the models); the result reports `seconds`, the memory `tier` and the language model (`lm`) it used. To check the singing (or time lyric captions), split it first: `voice stems song.wav stems --only vocals`, then `listen transcribe stems/vocals.wav words.json`.
+- `song` (`install song`, ACE-Step 1.5, ~10 GB of models) makes a full produced song: describe genre, mood, instruments and voice in `--prompt`; lyrics use section tags like `[verse]`, `[chorus]`, `[bridge]`. Without lyrics it is instrumental. Same `--seed` = same song. It is strongest at pop, electronic, hip-hop, ambient, cinematic and singer-songwriter; heavy rock and metal come out soft (little 1–5 kHz bite), and its beat grid is its own. For rock or metal, or music that must hit exact times, `compose` a score (pluck + amp) instead, or check the song with `listen bands` and `listen beats`. `--model`: `turbo` (default, fast: 8 steps, follows the prompt at a fixed strength), `sft` (guided: follows the prompt more closely, `--guidance` 7 by default, 32 steps), `xl` (the bigger sft, best detail) or `base`; add them with `install song --extra sft,xl,base`. Measured on a 24 GB Apple Silicon laptop, 30 s with lyrics: turbo 75 s from cold, sft 155 s (both sang the lyrics almost word for word and reviewed the same); xl needs about 20 GB on its own on Apple Silicon (it runs in 32-bit there, about 10 GB on NVIDIA), so it does not fit a 24 GB Mac and says so. `--takes 3` makes three versions, listens to each with `review` and keeps the best (the result lists every take's seed and score). On a 24 GB Apple Silicon laptop a 30-second song takes about 100 seconds when the pack has to load and about 45 once it is loaded; the result reports `seconds`, the memory `tier` and the language model (`lm`) it used. `sing` (`install song --extra base`) writes a lead vocal over music you made, such as a composed score, so the beat, chords, length and section times stay exactly yours: describe the voice in `--prompt` (`"warm female pop vocal, breathy, close mic"`); `--vocals` also saves the voice alone; `--language` (en, es, ja …) tells it the lyrics' language, which it cannot detect. `sing` follows the lyrics loosely (lines get reordered or changed), while `song` follows them closely: when the exact words matter, use `song`, or make a few `sing` takes and check each with `listen transcribe`. `repaint` remakes `--start`..`--end` seconds of any song to a new description or lyrics (a weak chorus, a wrong word, a better ending) and keeps the rest. To check the singing (or time lyric captions), split it first: `voice stems song.wav stems --only vocals`, then `listen transcribe stems/vocals.wav words.json`.
+
+**Songwriting: what the tools give you**
+- **Ways to make it:** `compose` gives exact control (every note, beat and section time), so it suits music cut to picture and any style you can write down. `song` gives a fully produced, sung track from words. Mixing them works too: compose an instrumental and `sing` over it, `repaint` part of a generated song, or use `voice stems` to take a generated song apart and rebuild it in a score.
+- **Things that often make music feel alive** (use, bend or ignore them as the piece needs): change something every few bars (a part enters or drops out, the drums switch, the `energy` moves); contrast between sections (sparse against full, low against high, talk-like against sung); a short idea that comes back; a moment of space before a big arrival (`into: "stop"` or `"build"`). Plenty of great music breaks every one of these: a single drone, a through-composed score, a loop that never changes.
+- **Lyrics and prompts:** section tags (`[verse] [chorus] [bridge] [break]` …) steer the shape of a `song`; lines of similar length sing more naturally. The `--prompt` takes any description: genre or blend of genres, era, mood, voice, instruments, production ("lo-fi tape hiss", "huge stadium reverb").
+- **Listening:** `review` scores a mix and gives the command for each fix. Its targets fit mainstream releases, so a quiet ambient or raw punk track can score lower on purpose. `listen bands --reference` compares the tone with any track you choose. `--takes` and different seeds give you options to choose from.
 
 **3d**: real 3D scenes rendered by Blender (free; `doctor` shows how to install it)
 ```
@@ -361,11 +391,14 @@ orbit_camera(radius=7, height=2.5, turns=0.25)
 
 **top level**
 ```
-doctor                                      tools, libraries, machine, and what can be added
+doctor                                      tools, libraries, machine (RAM, GPU memory, free disk), and what can be added
 check <file>                                quality report with fix commands
 packs                                       AI models, assets and packs, and which are installed
 install <name>                              add one (the only command that downloads)
+bench [--only image,song] [--save bench.json]   time, RAM and GPU memory of each installed pack, cold and warm
+jobs list | wait <id> [--timeout 3600] | cancel <id> | stop   background jobs (--background) and loaded packs
 ```
+- `bench` runs one fixed job per pack twice: cold (loading the models) and warm. Use it to see what this computer can do before planning heavy work, and to compare computers. On a 24 GB Apple Silicon laptop: a 768×768 picture 28 s, a 30 s song 98 s cold and 47 s warm, a cloned sentence 30 s cold and 5 s warm.
 
 ## Examples
 Ideas for combining commands, not fixed recipes.
@@ -485,11 +518,11 @@ node joedit.ts look read safe.mp4 --every 2               (any names, plates or 
 ## Use from code
 Every command is also an exported TypeScript function (`extract-audio` → `extractAudio`). Functions throw an `Error` on failure. Good for loops and bigger jobs.
 ```ts
-import { trim } from "./joEdit/video.ts";
-import { sheet } from "./joEdit/look.ts";
+import { trim } from "./joEdit/areas/video.ts";
+import { sheet } from "./joEdit/areas/look.ts";
 import { check } from "./joEdit/joedit.ts";
 trim("in.mp4", "out.mp4", 1, 4);
 await sheet("out.mp4", "sheet.png");
 console.log(check("out.mp4"));
 ```
-Lower-level building blocks live in `shared.ts` (`readFrames`/`writeVideo` for raw RGBA frames, `skia`, `drawText`) and `fx.ts` (`prepareEffects` + `effectFrame`, `prepareTransition` + `transitionFrame`), for frame-by-frame work of your own.
+Lower-level building blocks live in `core/shared.ts` (`readFrames`/`writeVideo` for raw RGBA frames, `skia`, `drawText`) and `areas/fx.ts` (`prepareEffects` + `effectFrame`, `prepareTransition` + `transitionFrame`), for frame-by-frame work of your own.

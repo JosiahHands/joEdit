@@ -1,7 +1,7 @@
 // Movies from one JSON file: scenes, transitions, text, music, sound effects, captions and a look.
 // Each scene is rendered once and cached, so changing one scene only re-renders that scene.
 // CLI:     node joedit.ts movie <command> ...
-// Library: import { renderMovie } from "./joEdit/movie.ts"
+// Library: import { renderMovie } from "./joEdit/areas/movie.ts"
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { cpus } from "node:os";
@@ -27,7 +27,7 @@ import {
   type Brand,
   type Command,
   type TextStyle,
-} from "./shared.ts";
+} from "../core/shared.ts";
 import * as fx from "./fx.ts";
 import * as graphics from "./graphics.ts";
 import * as listen from "./listen.ts";
@@ -916,7 +916,7 @@ async function makeMusic(spec: MusicSpec, ctx: Context): Promise<{ file: string;
   }
   const key = createHash("sha256").update(JSON.stringify(spec.song)).digest("hex").slice(0, 16);
   const file = join(ctx.cache, `song-${key}.wav`);
-  if (!existsSync(file)) music.song(file, spec.song!.prompt, spec.song!);
+  if (!existsSync(file)) await music.song(file, spec.song!.prompt, spec.song!);
   return { file };
 }
 
@@ -1025,7 +1025,7 @@ export async function renderMovie(file: string, output: string, draft = false, s
     // 5. Quality check (loaded here because joedit.ts also loads this file). A picture that holds still inside a
     // title, canvas, page, color or unmoving picture scene, or is black inside a color scene, is how it was designed.
     // The picture's part of the check (every frame read) is saved with the cached picture, so a sound-only change skips it.
-    const { check, pictureMoments } = await import("./joedit.ts");
+    const { check, pictureMoments } = await import("../joedit.ts");
     const momentsFile = pictureFile.replace(/\.mp4$/, ".json");
     let moments = existsSync(momentsFile) ? readJson(momentsFile) : undefined;
     if (!moments) {

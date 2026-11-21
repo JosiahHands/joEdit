@@ -2,7 +2,7 @@
 // raylib (kept in libs/raylib) runs GLSL shaders off-screen; frames go in and out as RGBA pixels.
 // The agent can also write its own effect: a .glsl file with `vec4 effect(vec2 uv)`.
 // CLI:     node joedit.ts fx <command> ...
-// Library: import { effectFrame, transitionFrame } from "./fx.ts"
+// Library: import { effectFrame, transitionFrame } from "./joEdit/areas/fx.ts"
 import { existsSync, readFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import {
@@ -22,7 +22,7 @@ import {
   writeVideo,
   type Command,
   type Frame,
-} from "./shared.ts";
+} from "../core/shared.ts";
 import { board, type Tile } from "./look.ts";
 import * as video from "./video.ts";
 
@@ -1413,5 +1413,5 @@ export const commands: Record<string, Command> = {
 
 // Only run the CLI when this file is executed directly (not when imported).
 if (import.meta.main) {
-  runCli("joEdit fx: node fx.ts <command> ...", commands, process.argv.slice(2));
+  runCli("joEdit fx: node joedit.ts fx <command> ...", commands, process.argv.slice(2));
 }

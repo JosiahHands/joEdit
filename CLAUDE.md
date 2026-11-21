@@ -15,8 +15,10 @@ Universal: every change must work on macOS, Windows and Linux (Windows: `where`,
 * voice.ts speaks text (kokoro model, or macOS say), clones voices with required --consent (clone pack: Chatterbox), and splits stems (stems pack: Demucs). Movies use it for "voiceover".
 * music.ts composes score JSON → MIDI (own writer) → spessasynth with the instruments asset (GeneralUser GS); parts with fx (amps, EQ, reverb), double or the Karplus-Strong "pluck" render as stems. It generates songs with the song pack (ACE-Step 1.5). Movies use it for "music".
 * 3d.ts renders Python scene scripts with headless Blender: packs/blender/run.py and packs/blender/kit.py. Plus title and turntable. Not a uv pack.
-* shared.ts holds the plumbing used by all files: bundled ffmpeg, probe, frame I/O (readFrames/writeVideo), Skia text, the model/asset/pack installers, and the brand kit (brand.json).
+* shared.ts holds the plumbing used by all files: bundled ffmpeg, probe, frame I/O (readFrames/writeVideo), Skia text, the model/asset/pack installers, hardware() (RAM, GPU memory), pack workers (async runPack), background jobs (--background, .jobs/), and the brand kit (brand.json).
+* packs/joedit_pack.py is the Python side of every pack: each run.py defines parser, download(), load(), make(models, args, progress) and calls joedit_pack.main. Workers keep models loaded (10 min idle; 2 min when they hold over 40% of RAM or of GPU memory, both counted), one pack holds the GPU at a time (.packs/gpu.lock), jobs go through .packs/queue/. joedit.ts has bench and jobs.
 * Structure rule: one file per CLI area, no extra modularity. Optimize for the AI making the fastest and best edits.
+* Layout follows who calls whom: lib/joedit.ts (entry) → lib/areas/*.ts (the area files above; movie.ts combines the others) → lib/core/shared.ts → lib/packs/ (Python) and lib/libs/ (vendored). Areas import each other as "./x.ts" and shared as "../core/shared.ts"; LIB in shared.ts is lib/.
 
 lib/ is a fully self-contained library (own package.json, tsconfig.json, .gitignore, LICENSE: GPL-3.0-or-later). It must never import from outside lib/.
 Setup: `cd lib && npm install` (installs @types/node, then the pinned libraries into lib/libs).

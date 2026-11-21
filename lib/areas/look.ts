@@ -1,7 +1,7 @@
 // Sight for AI agents: turn videos into pictures you can look at.
 // An agent cannot watch a video, but it can read a contact sheet.
 // CLI:     node joedit.ts look <command> ...
-// Library: import { sheet } from "./joEdit/look.ts"
+// Library: import { sheet } from "./joEdit/areas/look.ts"
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
@@ -33,7 +33,7 @@ import {
   skia,
   type Command,
   type Frame,
-} from "./shared.ts";
+} from "../core/shared.ts";
 import * as listen from "./listen.ts";
 import * as video from "./video.ts";
 
@@ -979,5 +979,5 @@ export const commands: Record<string, Command> = {
 
 // Only run the CLI when this file is executed directly (not when imported).
 if (import.meta.main) {
-  runCli("joEdit look: node look.ts <command> ...", commands, process.argv.slice(2));
+  runCli("joEdit look: node joedit.ts look <command> ...", commands, process.argv.slice(2));
 }

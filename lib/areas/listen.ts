@@ -1,7 +1,7 @@
 // Hearing for AI agents: turn sound into numbers, text and pictures.
 // Works on audio files and on the sound of video files.
 // CLI:     node joedit.ts listen <command> ...
-// Library: import { beats } from "./joEdit/listen.ts"
+// Library: import { beats } from "./joEdit/areas/listen.ts"
 import { execFileSync } from "node:child_process";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -26,7 +26,7 @@ import {
   requireModel,
   transformers,
   type Command,
-} from "./shared.ts";
+} from "../core/shared.ts";
 import * as sound from "./sound.ts";
 
 // ---------- Pictures of sound ----------
@@ -818,5 +818,5 @@ export const commands: Record<string, Command> = {
 
 // Only run the CLI when this file is executed directly (not when imported).
 if (import.meta.main) {
-  runCli("joEdit listen: node listen.ts <command> ...", commands, process.argv.slice(2));
+  runCli("joEdit listen: node joedit.ts listen <command> ...", commands, process.argv.slice(2));
 }

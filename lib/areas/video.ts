@@ -1,10 +1,13 @@
 // Video editing, built on ffmpeg / ffprobe.
-// CLI:     node video.ts <command> <input> <output> [--flags]
-// Library: import { trim } from "./joEdit/video.ts"
+// CLI:     node joedit.ts video <command> <input> <output> [--flags]
+// Library: import { trim } from "./joEdit/areas/video.ts"
 import { createHash } from "node:crypto";
-import { mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import {
+  ASSETS,
+  isAssetInstalled,
+  run,
   concatLine,
   drawText,
   even,
@@ -31,7 +34,7 @@ import {
   loadBrand,
   type Args,
   type Command,
-} from "./shared.ts";
+} from "../core/shared.ts";
 import * as graphics from "./graphics.ts";
 import * as listen from "./listen.ts";
 
@@ -671,20 +674,44 @@ export async function followFilter(input: string, aspect: string, folder: string
   };
 }
 
-// Make a short clip from a description, or bring a picture to life (videogen pack: Wan 2.2 TI2V-5B).
-// Needs a big GPU (24 GB+ of video memory) and takes minutes per clip; fewer steps = faster, rougher.
-export function generate(output: string, prompt: string, options: { image?: string; seconds?: number; width?: number; height?: number; steps?: number; seed?: number } = {}) {
+// Make a clip from a description, or bring a picture to life (videogen pack: FastWan 2.2 TI2V-5B, 3 steps).
+// It runs on GPUs from 8 GB up: the pack renders as big as this computer does well (480p on small GPUs), then the clip
+// is upscaled to width x height (upscale: "fast", "photo", "art" with the upscaler asset, or "none" to keep it as rendered).
+// Longer than 5 seconds: made in 5-second pieces that continue from each other; "a | b | c" gives each piece its own prompt.
+export function generate(
+  output: string,
+  prompt: string,
+  options: { image?: string; seconds?: number; width?: number; height?: number; steps?: number; seed?: number; upscale?: string; memory?: string } = {},
+) {
   if (!prompt.trim()) throw new Error('Describe the clip with --prompt, e.g. --prompt "waves rolling onto a beach at sunset, slow camera push".');
   if (options.image) requireFile(options.image);
-  return withTempDir((folder) => {
+  const width = even(options.width ?? 1280);
+  const height = even(options.height ?? 720);
+  const style = options.upscale ?? "fast";
+  if (!["fast", "photo", "art", "none"].includes(style)) throw new Error("--upscale must be fast, photo, art or none.");
+  return withTempDir(async (folder) => {
     const frames = join(folder, "frames");
-    const args = [frames, "--prompt", prompt, "--seconds", String(options.seconds ?? 5), "--width", String(options.width ?? 1280),
-      "--height", String(options.height ?? 704), "--steps", String(options.steps ?? 50)];
+    const args = [frames, "--prompt", prompt, "--seconds", String(options.seconds ?? 5), "--width", String(width), "--height", String(height),
+      "--steps", String(options.steps ?? 3), "--memory", options.memory ?? "auto"];
     if (options.image) args.push("--image", options.image);
     if (options.seed !== undefined) args.push("--seed", String(options.seed));
-    const result = runPack("videogen", args);
-    ffmpeg(["-framerate", String(result.fps), "-i", join(frames, "%05d.png"), "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18", output]);
-    return { ...result, seconds: round(result.frames / result.fps) };
+    const result = await runPack("videogen", args);
+    const rendered = { width: result.width, height: result.height };
+    const raw = join(folder, "raw.mp4");
+    ffmpeg(["-framerate", String(result.fps), "-i", join(frames, "%05d.png"), "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "16", raw]);
+    let upscaled = "no";
+    if (style === "none" || (rendered.width >= width && rendered.height >= height)) {
+      ffmpeg(["-i", raw, "-c", "copy", output]);
+    } else if (isAssetInstalled("upscaler")) {
+      await upscale(raw, join(folder, "big.mp4"), { width: Math.min(width, rendered.width * 4), style });
+      // The model's shape (e.g. 832x480) can differ a little from the one asked for: fill the frame, cropping the edges.
+      ffmpeg(["-i", join(folder, "big.mp4"), "-vf", `scale=${width}:${height}:force_original_aspect_ratio=increase,crop=${width}:${height}`, "-c:v", "libx264", "-crf", "17", "-pix_fmt", "yuv420p", output]);
+      upscaled = style;
+    } else {
+      ffmpeg(["-i", raw, "-vf", `scale=${width}:${height}:force_original_aspect_ratio=increase:flags=lanczos,crop=${width}:${height}`, "-c:v", "libx264", "-crf", "17", "-pix_fmt", "yuv420p", output]);
+      upscaled = "resized (node joedit.ts install upscaler for AI detail)";
+    }
+    return { ...result, rendered, width: style === "none" ? rendered.width : width, height: style === "none" ? rendered.height : height, upscaled, duration: round(result.frames / result.fps) };
   });
 }
 
@@ -707,9 +734,77 @@ export function pip(main: string, small: string, output: string, corner = "botto
   ffmpeg(["-i", main, "-i", small, "-filter_complex", graph, "-map", "[v]", "-map", "0:a:0?", "-c:a", "copy", "-pix_fmt", "yuv420p", output]);
 }
 
-// Smooth slow motion or higher frame rates by inventing in-between frames (motion interpolation).
-export function interpolate(input: string, output: string, fps = 60): void {
-  ffmpeg(["-i", input, "-vf", `minterpolate=fps=${fps}:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1`, "-c:a", "copy", output]);
+// A program inside an installed asset (.exe on Windows), or an error that says how to install it.
+function assetProgram(asset: string, program: string, purpose: string): string {
+  const path = join(ASSETS, asset, process.platform === "win32" ? `${program}.exe` : program);
+  if (!existsSync(path)) throw new Error(`${purpose} needs the ${asset}. Run: node joedit.ts install ${asset}`);
+  return path;
+}
+
+// Every frame of a video as numbered PNGs (00000001.png …) in a folder. Returns how many.
+function framesTo(input: string, folder: string): number {
+  mkdirSync(folder, { recursive: true });
+  ffmpeg(["-i", input, "-map", "0:v:0", "-fps_mode", "passthrough", join(folder, "%08d.png")]);
+  return readdirSync(folder).length;
+}
+
+// Numbered PNGs back into a video at `fps`, with the sound of `soundFrom` (if it has any).
+function framesFrom(folder: string, fps: number, soundFrom: string, output: string, filter?: string) {
+  ffmpeg(["-framerate", String(fps), "-i", join(folder, "%08d.png"), "-i", soundFrom, "-map", "0:v", "-map", "1:a:0?",
+    ...(filter ? ["-vf", filter] : []), "-c:v", "libx264", "-crf", "16", "-pix_fmt", "yuv420p", "-c:a", "copy", "-shortest", output]);
+}
+
+// Make a video bigger with AI-restored detail, frame by frame (upscaler asset, Real-ESRGAN on the GPU).
+// Give scale (2-4) or the final width. style: "photo" (real footage, best), "art" (drawn, anime, graphics) or
+// "fast" (a small video model: about 10x quicker, a little softer).
+export async function upscale(input: string, output: string, options: { scale?: number; width?: number; style?: string } = {}) {
+  requireFile(input);
+  const program = assetProgram("upscaler", "realesrgan-ncnn-vulkan", "Upscaling");
+  const { width, height, fps } = info(input);
+  const targetWidth = even(options.width ?? width * (options.scale ?? 2));
+  const targetHeight = even((height * targetWidth) / width);
+  if (targetWidth <= width) throw new Error(`The video is already ${width}x${height}; ask for a bigger --width or a --scale of 2-4.`);
+  if (targetWidth > width * 4) throw new Error(`At most 4 times bigger (${width * 4} wide) in one go.`);
+  const style = options.style ?? "photo";
+  const models: Record<string, string> = { photo: "realesrgan-x4plus", art: "realesrgan-x4plus-anime", fast: "realesr-animevideov3" };
+  if (!models[style]) throw new Error(`--style must be one of: ${Object.keys(models).join(", ")}`);
+  // The photo and art models only make 4x; the fast one makes 2, 3 or 4x. The result is resized to the exact size.
+  const factor = style === "fast" ? Math.min(4, Math.max(2, Math.ceil(targetWidth / width))) : 4;
+  const started = Date.now();
+  await withTempDir(async (folder) => {
+    const small = join(folder, "small");
+    const big = join(folder, "big");
+    const frames = framesTo(input, small);
+    mkdirSync(big);
+    run(program, ["-i", small, "-o", big, "-n", models[style], "-s", String(factor), "-f", "png", "-m", join(ASSETS, "upscaler", "models")]);
+    if (readdirSync(big).length !== frames) throw new Error("The upscaler did not make every frame (is the GPU driver up to date? Vulkan is needed on Windows and Linux).");
+    framesFrom(big, fps, input, output, `scale=${targetWidth}:${targetHeight}:flags=lanczos`);
+  });
+  return { width: targetWidth, height: targetHeight, style, seconds: round((Date.now() - started) / 1000) };
+}
+
+// Smooth slow motion or higher frame rates by inventing in-between frames. With the interpolator asset (RIFE, AI)
+// the new frames follow real motion; without it, ffmpeg's motion interpolation is used (quicker, can smear).
+export function interpolate(input: string, output: string, fps = 60, method = "auto"): { method: string; fps: number } {
+  requireFile(input);
+  if (!["auto", "ai", "motion"].includes(method)) throw new Error("--method must be auto, ai or motion.");
+  const ai = method === "ai" || (method === "auto" && isAssetInstalled("interpolator"));
+  if (!ai) {
+    ffmpeg(["-i", input, "-vf", `minterpolate=fps=${fps}:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1`, "-c:a", "copy", output]);
+    return { method: "motion", fps };
+  }
+  const program = assetProgram("interpolator", "rife-ncnn-vulkan", "AI interpolation");
+  const source = info(input);
+  if (fps <= source.fps) throw new Error(`The video is already ${source.fps} fps; ask for more with --fps.`);
+  withTempDir((folder) => {
+    const frames = framesTo(input, join(folder, "in"));
+    const wanted = Math.round((frames * fps) / source.fps);
+    mkdirSync(join(folder, "out"));
+    // rife-v4.6 can put in any number of frames between two (not just doubling).
+    run(program, ["-i", join(folder, "in"), "-o", join(folder, "out"), "-m", join(ASSETS, "interpolator", "rife-v4.6"), "-n", String(wanted), "-f", "%08d.png"]);
+    framesFrom(join(folder, "out"), fps, input, output);
+  });
+  return { method: "ai", fps };
 }
 
 // Change format based on the output file extension (e.g. .mov -> .mp4).
@@ -934,16 +1029,19 @@ export const commands: Record<string, Command> = {
     },
   },
   generate: {
-    usage: 'generate <output.mp4> --prompt "what happens, camera move, style" [--image start.png] [--seconds 5] [--width 1280] [--height 704] [--steps 50] [--seed N]  (needs: install videogen, a big GPU)',
+    usage:
+      'generate <output.mp4> --prompt "what happens, camera move, style" [--image start.png] [--seconds 5] [--width 1280] [--height 720] [--steps 3] [--seed N] [--upscale fast|photo|art|none] [--memory auto|full|gpu|offload|small]  (needs: install videogen, a GPU with 8 GB+)',
     run: (a) => {
       if (!a.positional[0]) throw new Error("Missing output path.");
       return generate(a.positional[0], a.flags.prompt ?? "", {
         image: a.flags.image,
         seconds: optionalNumberFlag(a, "seconds", 5),
         width: optionalNumberFlag(a, "width", 1280),
-        height: optionalNumberFlag(a, "height", 704),
-        steps: optionalNumberFlag(a, "steps", 50),
+        height: optionalNumberFlag(a, "height", 720),
+        steps: optionalNumberFlag(a, "steps", 3),
         seed: a.flags.seed === undefined ? undefined : numberFlag(a, "seed"),
+        upscale: a.flags.upscale,
+        memory: a.flags.memory,
       });
     },
   },
@@ -956,10 +1054,21 @@ export const commands: Record<string, Command> = {
     },
   },
   interpolate: {
-    usage: "interpolate <input> <output> [--fps 60]  (smooth motion by inventing in-between frames)",
+    usage: "interpolate <input> <output> [--fps 60] [--method auto|ai|motion]  (smooth motion by inventing in-between frames; ai = install interpolator)",
     run: (a) => {
       const { input, output } = inOut(a);
-      interpolate(input, output, optionalNumberFlag(a, "fps", 60));
+      return interpolate(input, output, optionalNumberFlag(a, "fps", 60), a.flags.method ?? "auto");
+    },
+  },
+  upscale: {
+    usage: "upscale <input> <output> [--scale 2|3|4] [--width 1920] [--style photo|art|fast]  (AI detail, needs: install upscaler)",
+    run: (a) => {
+      const { input, output } = inOut(a);
+      return upscale(input, output, {
+        scale: a.flags.scale === undefined ? undefined : numberFlag(a, "scale"),
+        width: a.flags.width === undefined ? undefined : numberFlag(a, "width"),
+        style: a.flags.style,
+      });
     },
   },
   convert: {
@@ -973,5 +1082,5 @@ export const commands: Record<string, Command> = {
 
 // Only run the CLI when this file is executed directly (not when imported).
 if (import.meta.main) {
-  runCli("Video editor: node video.ts <command> ...", commands, process.argv.slice(2));
+  runCli("Video editor: node joedit.ts video <command> ...", commands, process.argv.slice(2));
 }

@@ -1,7 +1,7 @@
 // 3D: real 3D scenes rendered by Blender (free, runs headless), from short Python scene scripts.
 // A scene script uses joEdit's kit (packs/blender/kit.py): shapes, 3D text, models, materials, lights, cameras, keyframes.
 // CLI:     node joedit.ts 3d <command> ...
-// Library: import { render } from "./joEdit/3d.ts"
+// Library: import { render } from "./joEdit/areas/3d.ts"
 import { spawnSync } from "node:child_process";
 import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
@@ -20,7 +20,7 @@ import {
   videoEncoder,
   withTempDir,
   type Command,
-} from "./shared.ts";
+} from "../core/shared.ts";
 
 // The Windows installer puts Blender in a folder per version ("Blender 4.5", "Blender 5.0"): newest first.
 // `root` is a parameter so tests can point it at a made-up folder.
@@ -237,5 +237,5 @@ export const commands: Record<string, Command> = {
 
 // Only run the CLI when this file is executed directly (not when imported).
 if (import.meta.main) {
-  runCli("joEdit 3d: node 3d.ts <command> ...", commands, process.argv.slice(2));
+  runCli("joEdit 3d: node joedit.ts 3d <command> ...", commands, process.argv.slice(2));
 }

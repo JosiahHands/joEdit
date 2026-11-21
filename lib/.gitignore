@@ -3,4 +3,5 @@ node_modules/
 .assets/
 .models/
 .joedit-cache/
+.jobs/
 __pycache__/

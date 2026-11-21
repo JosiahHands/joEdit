@@ -1,6 +1,6 @@
 // Picture editing, built on sharp (libvips: fast, any format) and Skia (text and design).
 // CLI:     node joedit.ts picture <command> <input> <output> [--flags]
-// Library: import { resize } from "./joEdit/picture.ts"
+// Library: import { resize } from "./joEdit/areas/picture.ts"
 import { existsSync, mkdirSync, readdirSync } from "node:fs";
 import { dirname, join, parse, resolve } from "node:path";
 import {
@@ -38,7 +38,7 @@ import {
   type Brand,
   type Command,
   type TextStyle,
-} from "./shared.ts";
+} from "../core/shared.ts";
 import * as fx from "./fx.ts";
 import * as video from "./video.ts";
 
@@ -409,7 +409,7 @@ export function generate(output: string, prompt: string, options: { width?: numb
     const made = join(folder, "made.png");
     const args = [made, "--prompt", prompt, "--width", String(options.width ?? 1024), "--height", String(options.height ?? 1024), "--steps", String(options.steps ?? 9)];
     if (options.seed !== undefined) args.push("--seed", String(options.seed));
-    const result = runPack("image", args);
+    const result = await runPack("image", args);
     await convert(made, output);
     return result;
   });
@@ -774,5 +774,5 @@ export const commands: Record<string, Command> = {
 
 // Only run the CLI when this file is executed directly (not when imported).
 if (import.meta.main) {
-  runCli("Picture editor: node picture.ts <command> ...", commands, process.argv.slice(2));
+  runCli("Picture editor: node joedit.ts picture <command> ...", commands, process.argv.slice(2));
 }
