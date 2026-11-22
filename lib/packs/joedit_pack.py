@@ -173,35 +173,49 @@ def alive(pid):
 # ---------- The GPU lock ----------
 
 
+# The lock is the operating system's lock on gpu.lock (flock on macOS and Linux, msvcrt.locking on Windows).
+# The system lets it go when the worker ends, even after a crash, so there is never a stale lock to clear up
+# (clearing one by hand let two workers both take the GPU). The file stays; it only holds the holder's id, for reading.
+_gpu_file = None
+
+
+def _lock(file, take=True):
+    """Take (without waiting) or let go of the system lock on an open file. True if it worked."""
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+
+            file.seek(0)
+            msvcrt.locking(file.fileno(), msvcrt.LK_NBLCK if take else msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(file.fileno(), (fcntl.LOCK_EX | fcntl.LOCK_NB) if take else fcntl.LOCK_UN)
+        return True
+    except OSError:
+        return False
+
+
 def _take_gpu(status):
     """Wait until no other pack has its models loaded, then hold the GPU."""
-    while True:
-        try:
-            handle = os.open(GPU_LOCK, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            os.write(handle, str(os.getpid()).encode())
-            os.close(handle)
-            return
-        except FileExistsError:
-            try:
-                with open(GPU_LOCK) as file:
-                    holder = int(file.read().strip() or 0)
-                age = time.time() - os.path.getmtime(GPU_LOCK)
-            except (OSError, ValueError):
-                holder, age = 0, 0
-            if not alive(holder) and (holder or age > 5):  # the holder is gone (a lock with no id yet is just being made)
-                _remove(GPU_LOCK)
-                continue
-            status("waiting for the GPU")
-            time.sleep(0.5)
+    global _gpu_file
+    file = open(GPU_LOCK, "a+")
+    while not _lock(file):
+        status("waiting for the GPU")
+        time.sleep(0.5)
+    file.seek(0)
+    file.truncate()
+    file.write(str(os.getpid()))
+    file.flush()
+    _gpu_file = file
 
 
 def _free_gpu():
-    try:
-        with open(GPU_LOCK) as file:
-            if file.read().strip() == str(os.getpid()):
-                _remove(GPU_LOCK)
-    except OSError:
-        pass
+    global _gpu_file
+    if _gpu_file:
+        _lock(_gpu_file, take=False)
+        _gpu_file.close()
+        _gpu_file = None
 
 
 # ---------- Progress ----------

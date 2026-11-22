@@ -700,15 +700,19 @@ export function generate(
     const raw = join(folder, "raw.mp4");
     ffmpeg(["-framerate", String(result.fps), "-i", join(frames, "%05d.png"), "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "16", raw]);
     let upscaled = "no";
-    if (style === "none" || (rendered.width >= width && rendered.height >= height)) {
+    // The model works in blocks of 32 pixels (960x540 renders as 960x544), so any other size is fitted to exactly the one asked for.
+    const fit = `scale=${width}:${height}:force_original_aspect_ratio=increase:flags=lanczos,crop=${width}:${height}`;
+    if (style === "none" || (rendered.width === width && rendered.height === height)) {
       ffmpeg(["-i", raw, "-c", "copy", output]);
+    } else if (rendered.width >= width && rendered.height >= height) {
+      ffmpeg(["-i", raw, "-vf", fit, "-c:v", "libx264", "-crf", "17", "-pix_fmt", "yuv420p", output]);
     } else if (isAssetInstalled("upscaler")) {
       await upscale(raw, join(folder, "big.mp4"), { width: Math.min(width, rendered.width * 4), style });
       // The model's shape (e.g. 832x480) can differ a little from the one asked for: fill the frame, cropping the edges.
       ffmpeg(["-i", join(folder, "big.mp4"), "-vf", `scale=${width}:${height}:force_original_aspect_ratio=increase,crop=${width}:${height}`, "-c:v", "libx264", "-crf", "17", "-pix_fmt", "yuv420p", output]);
       upscaled = style;
     } else {
-      ffmpeg(["-i", raw, "-vf", `scale=${width}:${height}:force_original_aspect_ratio=increase:flags=lanczos,crop=${width}:${height}`, "-c:v", "libx264", "-crf", "17", "-pix_fmt", "yuv420p", output]);
+      ffmpeg(["-i", raw, "-vf", fit, "-c:v", "libx264", "-crf", "17", "-pix_fmt", "yuv420p", output]);
       upscaled = "resized (node joedit.ts install upscaler for AI detail)";
     }
     return { ...result, rendered, width: style === "none" ? rendered.width : width, height: style === "none" ? rendered.height : height, upscaled, duration: round(result.frames / result.fps) };

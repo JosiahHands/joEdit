@@ -1063,7 +1063,8 @@ export async function compose(scoreFile: string, output: string, options: { stem
   const master = masterSettings(score.master);
   const bars = Math.ceil(beats / (score.beatsPerBar ?? 4));
   const kicks = playedDrums(score, bars).filter((e) => e.pitch === DRUM_SOUNDS.kick).map((e) => (e.beat * 60) / tempo);
-  const duck = master && master.duck > 0 && kicks.length > 0; // the music ducks under the kick, so it needs the drums on their own
+  // The music ducks under the kick, so it needs the drums on their own (a drums-only score has nothing to duck).
+  const duck = master && master.duck > 0 && kicks.length > 0 && (score.tracks ?? []).length > 0;
   const separate = options.stems || (score.tracks ?? []).some((p) => p.fx || p.double || isPluck(p));
   let music: Float32Array[]; // everything but the drums (or everything, when it does not duck)
   let drums: Float32Array[] | undefined;

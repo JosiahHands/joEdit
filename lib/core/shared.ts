@@ -1276,9 +1276,16 @@ export const FONT_FAMILIES: Record<string, string> = {
   "JetBrainsMono.ttf": "JetBrains Mono",
 };
 
+// An asset is installed when its install finished: installAsset writes .installed as its very last step,
+// so a download that was stopped part way (a <file>.part, or only some of the files) does not count.
 export function isAssetInstalled(name: string): boolean {
   const folder = join(ASSETS, name);
-  return existsSync(folder) && readdirSync(folder).length > 0;
+  if (existsSync(join(folder, ".installed"))) return true;
+  // Installed by joEdit 2.2.0 or older (no .installed yet): complete when nothing is half-downloaded and every plain file is there.
+  if (!existsSync(folder)) return false;
+  const items = readdirSync(folder);
+  const files = ASSET_LIST.find((a) => a.name === name)?.files ?? [];
+  return items.length > 0 && !items.some((item) => item.endsWith(".part")) && files.every((f) => f.unzip || existsSync(join(folder, f.path)));
 }
 
 export function listAssets() {
@@ -1290,7 +1297,9 @@ export async function installAsset(name: string): Promise<{ asset: string; insta
   const asset = ASSET_LIST.find((a) => a.name === name);
   if (!asset) throw new Error(`Unknown asset "${name}".`);
   const folder = join(ASSETS, name);
+  const done = join(folder, ".installed");
   mkdirSync(folder, { recursive: true });
+  rmSync(done, { force: true }); // not installed again until this install finishes
   if (asset.command) {
     const [program, ...args] = asset.command;
     try {
@@ -1322,6 +1331,7 @@ export async function installAsset(name: string): Promise<{ asset: string; insta
       }
     }
   }
+  writeFileSync(done, new Date().toISOString());
   return { asset: name, installed: true };
 }
 

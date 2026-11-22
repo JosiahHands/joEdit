@@ -114,15 +114,21 @@ def use_model(models, name):
     models["model"] = name
 
 
-# `node joedit.ts install song` runs this once: loading the models downloads them; after that every run is offline.
+# `node joedit.ts install song` runs this once: it downloads the models, then loads them to check; after that every run is offline.
 # JOEDIT_EXTRA (from `install song --extra sft,xl`) adds the bigger music models.
 def download():
+    from acestep.model_downloader import ensure_main_model
     from huggingface_hub import snapshot_download
 
     extra = [name.strip() for name in os.environ.get("JOEDIT_EXTRA", "").split(",") if name.strip()]
     for name in extra:
         if name not in MODELS:
             raise SystemExit(f"Unknown song model {name}. Models: {', '.join(MODELS)}")
+    # The main download first: turbo, the VAE, the text encoder and the 1.7B language model, which load() needs.
+    ok, status = ensure_main_model(CHECKPOINTS)
+    if not ok:
+        raise SystemExit(f"ACE-Step download failed: {status}")
+    for name in extra:
         snapshot_download("ACE-Step/" + MODELS[name], local_dir=os.path.join(CHECKPOINTS, MODELS[name]))
     load(downloading=True)
     return {"downloaded": "ACE-Step 1.5", "extra": extra}

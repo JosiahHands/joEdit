@@ -50,7 +50,13 @@ def make(models, args, progress):
     data, rate = sf.read(args.input, dtype="float32", always_2d=True)
     wav = torch.from_numpy(data.T.copy())  # channels first, as Demucs expects
     progress(phase="separating")
+    # Demucs calls this at each chunk: it reports how far it is, and progress() stops the job there if it was cancelled.
+    def chunk(info):
+        length = info.get("audio_length") or 1
+        progress(min(99, round(100 * info.get("segment_offset", 0) / length)), 100, phase="separating")
+    separator.update_parameter(callback=chunk)
     _, stems = separator.separate_tensor(wav, rate)
+    progress(phase="saving")  # a last check: a job cancelled at the very end writes nothing
 
     os.makedirs(args.folder, exist_ok=True)
     paths = {}

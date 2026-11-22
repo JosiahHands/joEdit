@@ -14,7 +14,7 @@ import * as graphics from "./lib/areas/graphics.ts";
 import * as threeD from "./lib/areas/3d.ts";
 import * as fx from "./lib/areas/fx.ts";
 import * as music from "./lib/areas/music.ts";
-import { FFMPEG, concatLine, isModelInstalled, need, probe, readFrames, readJson, writeVideo } from "./lib/core/shared.ts";
+import { ASSETS, FFMPEG, concatLine, isAssetInstalled, isModelInstalled, need, probe, readFrames, readJson, writeVideo } from "./lib/core/shared.ts";
 
 type Tool = "picture" | "video" | "sound" | "look" | "listen" | "graphics" | "fx" | "movie" | "voice" | "music" | "3d" | "joedit";
 
@@ -37,7 +37,22 @@ function hasPack(name: string): boolean {
 }
 const hasModel = (name: string) => isModelInstalled(name);
 const hasWhisper = () => hasModel("whisper");
-const hasAsset = (name: string) => existsSync(join("lib", ".assets", name));
+const hasAsset = (name: string) => isAssetInstalled(name);
+// The Python inside an installed pack, to test its run.py directly (undefined when the pack is not installed).
+function packPython(name: string): string | undefined {
+  const path = join("lib", ".packs", name, process.platform === "win32" ? "Scripts/python.exe" : "bin/python");
+  return existsSync(path) ? path : undefined;
+}
+// Run a Python script (written to the test folder) with a pack's Python; returns its exit code and output.
+function python(pythonPath: string, name: string, code: string) {
+  writeFileSync(file(name), code);
+  // Offline, with the pack's models in its own folder, as joEdit runs packs (shared.ts).
+  const home = join(pythonPath, "..", "..");
+  const env = { ...process.env, JOEDIT_LIB: process.env.JOEDIT_LIB ?? join(process.cwd(), "lib"), HF_HOME: join(home, "models"), TORCH_HOME: join(home, "models"),
+    HF_HUB_OFFLINE: "1", TRANSFORMERS_OFFLINE: "1", HF_DATASETS_OFFLINE: "1" };
+  const result = spawnSync(pythonPath, [file(name)], { encoding: "utf8", timeout: 300_000, env });
+  return { code: result.status, out: result.stdout + result.stderr };
+}
 
 // 3D tests need Blender; they are skipped on machines without it.
 const hasBlender = (() => {
@@ -699,10 +714,13 @@ describe("video", () => {
 
   test("generate makes a clip from a description on this GPU (needs the videogen pack)", (t) => {
     if (!hasPack("videogen")) return t.skip("videogen pack not installed");
-    const result = JSON.parse(ok("video", ["generate", file("gen.mp4"), "--prompt", "waves rolling onto a beach at sunset", "--seconds", "1", "--width", "256", "--height", "256", "--seed", "1", "--upscale", "none"]));
-    assert.deepEqual([result.frames, result.width, result.height], [25, 256, 256]);
+    // 256x240 renders as 256x256 (blocks of 32): the file must still be exactly the size asked for, as reported.
+    const result = JSON.parse(ok("video", ["generate", file("gen.mp4"), "--prompt", "waves rolling onto a beach at sunset", "--seconds", "1", "--width", "256", "--height", "240", "--seed", "1"]));
+    assert.deepEqual([result.frames, result.rendered.width, result.rendered.height, result.width, result.height], [25, 256, 256, 256, 240]);
     assert.ok(["full", "gpu", "offload", "small", "mps", "cpu"].includes(result.memory));
-    near(video.info(file("gen.mp4")).duration, 1.04, 0.05);
+    const made = video.info(file("gen.mp4"));
+    assert.deepEqual([made.width, made.height], [256, 240]);
+    near(made.duration, 1.04, 0.05);
   });
 
   test("captions from a transcript appear at the bottom", () => {
@@ -2221,5 +2239,111 @@ describe("joedit", () => {
         assert.ok(help.includes(`  ${area} ${command.usage}`), `${area} ${name} is missing from node joedit.ts`);
       }
     }
+  });
+});
+
+describe("packs and installs", () => {
+  const anyPython = () => ["song", "stems", "image", "clone", "videogen"].map(packPython).find(Boolean);
+
+  test("a drums-only score exports to audio with the default master", (t) => {
+    if (!hasAsset("instruments")) return t.skip("instruments asset missing");
+    writeFileSync(file("drums-only.json"), JSON.stringify({ tempo: 120, bars: 2, drums: { style: "rock" } }));
+    ok("music", ["compose", file("drums-only.json"), file("drums-only.wav")]);
+    near(sound.info(file("drums-only.wav")).duration, 5.5, 0.6);
+  });
+
+  test("an asset counts as installed only when its install finished", () => {
+    const folder = join(ASSETS, "test-unfinished");
+    rmSync(folder, { recursive: true, force: true });
+    mkdirSync(folder, { recursive: true });
+    try {
+      writeFileSync(join(folder, "big.zip.part"), "half a download");
+      assert.equal(isAssetInstalled("test-unfinished"), false);
+      writeFileSync(join(folder, ".installed"), "done");
+      assert.equal(isAssetInstalled("test-unfinished"), true);
+    } finally {
+      rmSync(folder, { recursive: true, force: true });
+    }
+  });
+
+  test("only one worker holds the GPU, even when the last holder crashed", (t) => {
+    const py = anyPython();
+    if (!py) return t.skip("no pack installed (needs a pack's Python)");
+    writeFileSync(file("gpu-worker.py"), `
+import os, sys, time
+sys.path.insert(0, os.path.join(os.environ["JOEDIT_LIB"], "packs"))
+import joedit_pack
+joedit_pack.GPU_LOCK = sys.argv[1]
+joedit_pack._take_gpu(lambda *a, **k: None)
+with open(sys.argv[2], "a") as log: log.write("start\\n")
+time.sleep(0.3)
+with open(sys.argv[2], "a") as log: log.write("end\\n")
+if sys.argv[3] == "crash": os._exit(1)  # ends without letting go, like a crash
+joedit_pack._free_gpu()
+`);
+    // Four workers at once, after a crash left a lock naming a program that is gone; two of them crash too.
+    const { code, out } = python(py, "gpu-race.py", `
+import os, subprocess, sys
+lock, log = ${JSON.stringify(file("gpu-test.lock"))}, ${JSON.stringify(file("gpu-test.log"))}
+open(lock, "w").write("999999")
+workers = [subprocess.Popen([sys.executable, ${JSON.stringify(file("gpu-worker.py"))}, lock, log, how]) for how in ["crash", "ok", "crash", "ok"]]
+try:
+    for w in workers: w.wait(timeout=60)
+except subprocess.TimeoutExpired:
+    for w in workers: w.kill()
+    sys.exit("the workers waited for the GPU for ever")
+lines = open(log).read().split()
+print(lines)
+sys.exit(0 if lines == ["start", "end"] * 4 else 1)
+`);
+    assert.equal(code, 0, out);
+  });
+
+  test("a cancelled stem separation stops and writes nothing (needs the stems pack)", (t) => {
+    const py = packPython("stems");
+    if (!py || !hasPack("stems")) return t.skip("stems pack not installed");
+    execFileSync(FFMPEG, ["-loglevel", "error", "-y", "-f", "lavfi", "-i", "sine=frequency=220:duration=12", "-ac", "2", "-ar", "44100", file("stems-in.wav")]);
+    const { code, out } = python(py, "stems-cancel.py", `
+import os, sys
+sys.path.insert(0, os.path.join(os.environ["JOEDIT_LIB"], "packs", "stems"))
+import run, joedit_pack
+folder = ${JSON.stringify(file("stems-cancelled"))}
+args = run.parser.parse_args([${JSON.stringify(file("stems-in.wav"))}, folder])
+def progress(step=None, total=None, phase=None):
+    if step is not None:  # cancelled while Demucs is working through the song
+        raise joedit_pack.Cancelled()
+try:
+    run.make({}, args, progress)
+    print("finished anyway")
+except joedit_pack.Cancelled:
+    print("cancelled; wrote files:", os.path.exists(folder))
+`);
+    assert.equal(code, 0, out);
+    assert.match(out, /cancelled; wrote files: False/);
+  });
+
+  test("install song downloads the main models before loading them (needs the song pack)", (t) => {
+    const py = packPython("song");
+    if (!py) return t.skip("song pack not installed");
+    // No network, no models: the downloader and the loading are stood in for, to see what install does in which order.
+    const { code, out } = python(py, "song-install.py", `
+import os, sys
+sys.path.insert(0, os.path.join(os.environ["JOEDIT_LIB"], "packs", "song"))
+import run
+import acestep.model_downloader as downloader
+calls = []
+for found in [False, True]:
+    calls.clear()
+    downloader.ensure_main_model = lambda folder, found=found: (calls.append("main"), (found, "offline"))[1]
+    run.load = lambda downloading=False: calls.append("load")
+    try:
+        run.download()
+    except SystemExit as error:
+        calls.append("stopped")
+    print(found, calls)
+`);
+    assert.equal(code, 0, out);
+    assert.match(out, /False \['main', 'stopped'\]/);
+    assert.match(out, /True \['main', 'load'\]/);
   });
 });
